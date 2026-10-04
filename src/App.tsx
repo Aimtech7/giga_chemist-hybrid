@@ -22,6 +22,7 @@ import { SupplierList } from './components/suppliers/SupplierList';
 import { CustomerList } from './components/customers/CustomerList';
 import { ExpenseList } from './components/expenses/ExpenseList';
 import { SalesHistory } from './components/sales/SalesHistory';
+import { ReturnsManager } from './components/returns/ReturnsManager';
 import { ReportsDashboard } from './components/reports/ReportsDashboard';
 import { UserManagement } from './components/users/UserManagement';
 import { AuditLogViewer } from './components/audit/AuditLogViewer';
@@ -335,7 +336,7 @@ export default function App() {
 
       {/* RETURNS */}
       {currentModule === 'returns' && canAccessModule(currentUser, 'returns') && (
-        <SalesHistory currentUser={currentUser} settings={settings} />
+        <ReturnsManager currentUser={currentUser} settings={settings} />
       )}
 
       {/* REPORTS - Restricted to Admin/Manager */}

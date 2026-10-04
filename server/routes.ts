@@ -24,7 +24,9 @@ import {
   getAllPurchases,
   receivePurchaseOrder,
   getAllReturns,
-  processCustomerReturn,
+  requestReturn,
+  approveReturn,
+  rejectReturn,
   getAllExpenses,
   recordExpense,
   getAllAuditLogs,
@@ -770,22 +772,51 @@ async function handleReceivePurchase(req: AuthenticatedRequest, res: Response) {
 apiRouter.post('/purchases', requireRole('ADMIN'), handleReceivePurchase);
 apiRouter.post('/purchases/receive', requireRole('ADMIN'), handleReceivePurchase);
 
-// --- 12. RETURNS ---
+// --- 12. RETURNS (Cashier/Admin request -> Admin approve/reject) ---
+// Cashiers see only their own requests. ?status=PENDING|APPROVED|REJECTED filters.
 apiRouter.get('/returns', requirePermission('returns.create'), async (req: AuthenticatedRequest, res: Response) => {
   try {
-    res.json(await getAllReturns({ userId: req.userRole === 'CASHIER' ? req.userId : undefined }));
+    const status = typeof req.query.status === 'string' && req.query.status ? req.query.status.toUpperCase() : undefined;
+    res.json(await getAllReturns({ userId: req.userRole === 'CASHIER' ? req.userId : undefined, status }));
   } catch (err: any) {
     sendError(res, err, 'Failed to fetch returns.', 'GET /returns');
   }
 });
 
+// Creates a PENDING request only: no stock, refund, movement or reporting effect.
 apiRouter.post('/returns', requirePermission('returns.create'), async (req: AuthenticatedRequest, res: Response) => {
   try {
-    res.status(201).json(await processCustomerReturn(req.body || {}, saleActor(req)));
+    const { sale_id, medicine_id, batch_id, quantity, reason } = req.body || {};
+    res.status(201).json(await requestReturn({ sale_id, medicine_id, batch_id, quantity, reason }, saleActor(req)));
   } catch (err: any) {
-    sendError(res, err, 'Failed to process return.', 'POST /returns');
+    sendError(res, err, 'Failed to submit return request.', 'POST /returns');
   }
 });
+
+// ADMIN ONLY: the single place where return effects (refund, restock, movement) are applied.
+apiRouter.post('/returns/:id/approve', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { restock, disposition, notes } = req.body || {};
+    res.json(await approveReturn(req.params.id, { restock, disposition, notes }, saleActor(req)));
+  } catch (err: any) {
+    sendError(res, err, 'Failed to approve return.', 'POST /returns/:id/approve');
+  }
+});
+
+apiRouter.post('/returns/:id/reject', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    res.json(await rejectReturn(req.params.id, req.body?.notes ?? req.body?.reason, saleActor(req)));
+  } catch (err: any) {
+    sendError(res, err, 'Failed to reject return.', 'POST /returns/:id/reject');
+  }
+});
+
+// No direct status editing: status changes only through approve / reject above.
+const noDirectReturnEdit = (req: AuthenticatedRequest, res: Response) =>
+  res.status(405).json({ error: 'Return status cannot be edited directly. Use approve or reject.' });
+apiRouter.put('/returns/:id', requireRole('ADMIN'), noDirectReturnEdit);
+apiRouter.patch('/returns/:id', requireRole('ADMIN'), noDirectReturnEdit);
+apiRouter.patch('/returns/:id/status', requireRole('ADMIN'), noDirectReturnEdit);
 
 // --- 13. EXPENSES (ADMIN) ---
 apiRouter.get('/expenses', requirePermission('expenses.manage'), async (req: AuthenticatedRequest, res: Response) => {

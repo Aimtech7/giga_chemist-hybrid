@@ -18,7 +18,7 @@ import { isExpired, normalizeExpiryDate } from '../../utils/expiry';
 import { downloadCSV } from '../../services/exportUtils';
 import { ReceiptModal } from '../pos/ReceiptModal';
 import { canViewCostData, isCashier, isAdmin, isManager } from '../../services/permissions';
-import type { Sale, CustomerReturn, ReturnAction, PharmacySettings, User, SaleItem } from '../../types';
+import type { Sale, CustomerReturn, PharmacySettings, User, SaleItem } from '../../types';
 import { apiFetch } from '../../services/http';
 import { applyServerStockResult, refreshCacheAfterCommit } from '../../services/stockCache';
 
@@ -61,7 +61,6 @@ export const SalesHistory: React.FC<SalesHistoryProps> = ({ currentUser, setting
   const [isCurrentBatchExpired, setIsCurrentBatchExpired] = useState(false);
   const [returnQty, setReturnQty] = useState<number>(1);
   const [returnReason, setReturnReason] = useState<string>('');
-  const [returnAction, setReturnAction] = useState<ReturnAction>('return_to_stock');
   const [isProcessingReturn, setIsProcessingReturn] = useState(false);
   const [returnSuccess, setReturnSuccess] = useState<string | null>(null);
   const [returnError, setReturnError] = useState<string | null>(null);
@@ -108,7 +107,8 @@ export const SalesHistory: React.FC<SalesHistoryProps> = ({ currentUser, setting
     const qtyMap: Record<string, number> = {};
     for (const ret of s.returned_items || []) {
       const key = `${ret.medicine_id}_${ret.batch_id}`;
-      qtyMap[key] = (qtyMap[key] || 0) + ret.quantity;
+      // Approved AND pending-approval quantities are no longer requestable.
+      qtyMap[key] = (qtyMap[key] || 0) + ret.quantity + (ret.pending || 0);
     }
     setItemReturnedQtyMap(qtyMap);
 
@@ -127,13 +127,12 @@ export const SalesHistory: React.FC<SalesHistoryProps> = ({ currentUser, setting
     const batch = await db.medicine_batches.get(item.batch_id);
     const expired = batch ? isExpired(batch.expiry_date) : isExpired(item.expiry_date);
     setIsCurrentBatchExpired(expired);
-    setReturnAction(expired ? 'quarantine' : 'return_to_stock');
   };
 
   const handleItemSelect = (item: SaleItem) => handleItemSelectFor(item, itemReturnedQtyMap);
 
-  // Returns are processed by the server in ONE PostgreSQL transaction: refund = discounted amount
-  // actually paid, stock restored only for sellable (unexpired) batches, movement + audit written.
+  // Submits a RETURN REQUEST (status PENDING). The server applies nothing until an Administrator
+  // approves it in Returns: no stock, refund, movement or report change happens here.
   const handleProcessReturn = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!returnSale || !selectedItemToReturn || !currentUser) return;
@@ -152,38 +151,28 @@ export const SalesHistory: React.FC<SalesHistoryProps> = ({ currentUser, setting
 
     setIsProcessingReturn(true);
     try {
-      const result = await apiFetch<{
-        return: CustomerReturn;
-        refund_amount: number;
-        sale: Sale;
-        medicine: any;
-        batch: any;
-      }>('/api/returns', {
+      const result = await apiFetch<{ return: CustomerReturn; sale: Sale }>('/api/returns', {
         body: {
           sale_id: returnSale.id,
           medicine_id: selectedItemToReturn.medicine_id,
           batch_id: selectedItemToReturn.batch_id,
           quantity: returnQty,
           reason: returnReason.trim(),
-          action: returnAction,
         },
       });
 
-      // Committed: refresh the cache from the confirmed server state.
-      const cacheWarning = await refreshCacheAfterCommit(async () => {
+      // Cache the request and the sale (now showing the pending quantity); stock is untouched.
+      await refreshCacheAfterCommit(async () => {
         await db.customer_returns.put(result.return);
         await db.sales.put(result.sale);
-        await applyServerStockResult({ medicine: result.medicine, batch: result.batch });
       });
 
       setReturnSale(null);
-      const restocked = result.return.action === 'return_to_stock';
       setReturnSuccess(
-        `Return of ${returnQty}x ${selectedItemToReturn.medicine_name} recorded. Refund: ${settings.currency} ${result.refund_amount.toFixed(2)}` +
-          (restocked ? ' (returned to stock).' : ` (${result.return.action} — not added to sellable stock).`) +
-          (cacheWarning ? ` ${cacheWarning}` : '')
+        `Return request submitted (${returnQty}x ${selectedItemToReturn.medicine_name}) — PENDING ADMIN APPROVAL. ` +
+          'Stock will not be adjusted and no refund is final until an administrator approves the return.'
       );
-      setTimeout(() => setReturnSuccess(null), 6000);
+      setTimeout(() => setReturnSuccess(null), 8000);
       await loadSales();
     } catch (err: any) {
       setReturnError(err?.message || 'Failed to process return.');
@@ -564,7 +553,7 @@ export const SalesHistory: React.FC<SalesHistoryProps> = ({ currentUser, setting
           <div className="w-full max-w-md bg-white rounded border border-slate-300 shadow-lg overflow-hidden text-slate-800">
             <div className="bg-slate-900 px-4 py-3 text-white flex justify-between items-center">
               <span className="font-bold text-xs">
-                Customer Return: Receipt {returnSale.receipt_number}
+                Request Return: Receipt {returnSale.receipt_number}
               </span>
               <button onClick={() => setReturnSale(null)} className="text-slate-400 hover:text-white p-1 rounded cursor-pointer">
                 &times;
@@ -602,7 +591,7 @@ export const SalesHistory: React.FC<SalesHistoryProps> = ({ currentUser, setting
                 <div className="p-2 rounded bg-amber-50 border border-amber-200 text-amber-800 text-[11px] flex items-center gap-1.5">
                   <AlertTriangle className="w-3.5 h-3.5 text-amber-600 shrink-0" />
                   <span>
-                    Batch {selectedItemToReturn.batch_number} has expired. Returned stock will be quarantined rather than returned to sellable stock.
+                    Batch {selectedItemToReturn.batch_number} has expired. The administrator will not be able to return it to sellable stock.
                   </span>
                 </div>
               )}
@@ -632,7 +621,7 @@ export const SalesHistory: React.FC<SalesHistoryProps> = ({ currentUser, setting
                   })()}
                 </div>
                 <div>
-                  <label className="block font-semibold text-slate-700 mb-1">Refund Due (paid price, after discount)</label>
+                  <label className="block font-semibold text-slate-700 mb-1">Requested Refund (price paid, after discount)</label>
                   <div className="p-2 border border-slate-200 bg-slate-50 rounded font-mono font-bold text-slate-900">
                     {settings.currency}{' '}
                     {((selectedItemToReturn.total / selectedItemToReturn.quantity) * returnQty).toFixed(2)}
@@ -640,20 +629,8 @@ export const SalesHistory: React.FC<SalesHistoryProps> = ({ currentUser, setting
                 </div>
               </div>
 
-              <div>
-                <label className="block font-semibold text-slate-700 mb-1">Inventory Destination *</label>
-                <select
-                  value={returnAction}
-                  onChange={(e) => setReturnAction(e.target.value as ReturnAction)}
-                  className="w-full p-2 border border-slate-300 rounded bg-white focus:ring-1 focus:ring-teal-700 focus:border-teal-700 focus:outline-hidden"
-                >
-                  <option value="return_to_stock" disabled={isCurrentBatchExpired}>
-                    {isCurrentBatchExpired ? 'Return to Sellable Stock (Disabled - Expired)' : 'Return to Sellable Stock (Untampered seal)'}
-                  </option>
-                  <option value="quarantine">Quarantine for Inspection</option>
-                  <option value="damaged">Mark as Damaged</option>
-                  <option value="dispose">Dispose / Destroy</option>
-                </select>
+              <div className="p-2 rounded bg-sky-50 border border-sky-200 text-sky-900 text-[11px]">
+                This creates a <strong>return request</strong> for administrator approval. Nothing is returned to stock and no refund is final until an administrator approves it.
               </div>
 
               <div>
@@ -688,7 +665,7 @@ export const SalesHistory: React.FC<SalesHistoryProps> = ({ currentUser, setting
                   disabled={isProcessingReturn}
                   className="px-4 py-1.5 rounded bg-teal-700 hover:bg-teal-800 text-white font-semibold transition cursor-pointer"
                 >
-                  {isProcessingReturn ? 'Processing...' : 'Authorize Return'}
+                  {isProcessingReturn ? 'Submitting...' : 'Submit Return Request'}
                 </button>
               </div>
             </form>

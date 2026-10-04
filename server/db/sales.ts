@@ -75,7 +75,10 @@ async function hydrateSales(q: Queryable, rows: any[]): Promise<Sale[]> {
       [ids]
     ),
     q.query(
-      `SELECT sale_id, medicine_id, batch_id, SUM(quantity)::int AS qty, SUM(refund_amount)::float AS refunded
+      `SELECT sale_id, medicine_id, batch_id,
+              COALESCE(SUM(approved_quantity) FILTER (WHERE status = 'APPROVED'), 0)::int AS qty,
+              COALESCE(SUM(quantity) FILTER (WHERE status = 'PENDING'), 0)::int AS pending,
+              COALESCE(SUM(refund_amount) FILTER (WHERE status = 'APPROVED'), 0)::float AS refunded
        FROM returns WHERE sale_id = ANY($1::uuid[]) GROUP BY sale_id, medicine_id, batch_id`,
       [ids]
     ),
@@ -107,10 +110,10 @@ async function hydrateSales(q: Queryable, rows: any[]): Promise<Sale[]> {
     list.push({ method: p.method, amount: Number(p.amount) || 0, reference: p.reference || undefined });
     paymentsBySale.set(p.sale_id, list);
   }
-  const returnedBySale = new Map<string, { medicine_id: string; batch_id: string; quantity: number; refunded: number }[]>();
+  const returnedBySale = new Map<string, { medicine_id: string; batch_id: string; quantity: number; pending: number; refunded: number }[]>();
   for (const r of returned.rows) {
     const list = returnedBySale.get(r.sale_id) || [];
-    list.push({ medicine_id: r.medicine_id, batch_id: r.batch_id, quantity: Number(r.qty) || 0, refunded: Number(r.refunded) || 0 });
+    list.push({ medicine_id: r.medicine_id, batch_id: r.batch_id, quantity: Number(r.qty) || 0, pending: Number(r.pending) || 0, refunded: Number(r.refunded) || 0 });
     returnedBySale.set(r.sale_id, list);
   }
 
@@ -614,8 +617,8 @@ export async function voidSale(saleIdRaw: string, reasonRaw: unknown, actor: Sal
     if (String(sale.idempotency_key).startsWith('LEGACY-')) {
       throw new HttpError(409, 'Imported legacy sales cannot be voided. Record a return instead.');
     }
-    const hasReturns = await client.query('SELECT 1 FROM returns WHERE sale_id = $1 LIMIT 1', [saleId]);
-    if (hasReturns.rows[0]) throw new HttpError(409, 'This sale already has returns; process the remaining items as returns instead of a void.');
+    const hasReturns = await client.query(`SELECT 1 FROM returns WHERE sale_id = $1 AND status <> 'REJECTED' LIMIT 1`, [saleId]);
+    if (hasReturns.rows[0]) throw new HttpError(409, 'This sale has approved or pending returns; resolve them instead of voiding the sale.');
 
     const deviceId = await ensureDevice(client, actor.device_id, actor.user_id);
     const items = await client.query(
@@ -743,8 +746,9 @@ export async function getTodaySalesSummary(options: { cashierId?: string }): Pro
   );
   const refundFilter = cashierId ? `AND r.user_id = $2` : '';
   const refunds = await pgPool.query(
+    // Only APPROVED returns are refunds; counted on the day the Administrator approved them.
     `SELECT COALESCE(SUM(r.refund_amount), 0)::numeric AS refunds
-     FROM returns r WHERE (r.created_at AT TIME ZONE 'Africa/Nairobi')::date = $1::date ${refundFilter}`,
+     FROM returns r WHERE r.status = 'APPROVED' AND (r.reviewed_at AT TIME ZONE 'Africa/Nairobi')::date = $1::date ${refundFilter}`,
     params
   );
 

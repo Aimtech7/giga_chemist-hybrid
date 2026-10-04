@@ -221,45 +221,160 @@ export async function commerceTests(ctx: Ctx) {
   persisted.voidedSale = sale2.data.sale.id;
 
   // ------------------------------------------------------------------ RETURNS
-  section('RETURNS');
-  const rs = await sale(ctx.cashierToken, med, 3, 1000, { discount_percent: 10 }); // 3 x 1000 - 10% = 2700
+  section('RETURNS — REQUEST / APPROVE / REJECT');
+  const request = (token: string, s: any, qty: number, reason = 'ITEST return') =>
+    api('POST', '/api/returns', token, { sale_id: s.id, medicine_id: s.items[0].medicine_id, batch_id: s.items[0].batch_id, quantity: qty, reason });
+  const approve = (token: string, id: string, restock: boolean, extra: Record<string, unknown> = {}) =>
+    api('POST', `/api/returns/${id}/approve`, token, { restock, ...extra });
+  const reject = (token: string, id: string, notes = 'ITEST rejected') => api('POST', `/api/returns/${id}/reject`, token, { notes });
+
+  const rs = await sale(ctx.cashierToken, med, 3, 1000, { discount_percent: 10 }); // 3 x 1000 - 10% = 2700 paid
   const rsale = rs.data.sale;
-  const item = rsale.items[0];
-  const stockBeforeRet = await stock(med);
-  const sumBeforeRet = await sum(ctx.cashierToken);
-  const ret1 = await api('POST', '/api/returns', ctx.cashierToken, { sale_id: rsale.id, medicine_id: med, batch_id: item.batch_id, quantity: 1, reason: 'ITEST partial', action: 'return_to_stock' });
-  check(ret1.status === 201 && UUID_RE.test(ret1.data?.return?.id) && ret1.data?.refund_amount === 900, 'partial return refunds discounted price (900, not 1000)', ret1.data);
-  check((await stock(med)) === stockBeforeRet + 1 && ret1.data?.sale?.status === 'partially_returned', 'restocked 1 unit; sale partially_returned');
-  const over = await api('POST', '/api/returns', ctx.cashierToken, { sale_id: rsale.id, medicine_id: med, batch_id: item.batch_id, quantity: 3, reason: 'too many', action: 'return_to_stock' });
-  check(over.status === 409, 'returning more than remaining rejected (409)', over.data?.error);
-  const zero = await api('POST', '/api/returns', ctx.cashierToken, { sale_id: rsale.id, medicine_id: med, batch_id: item.batch_id, quantity: 0, reason: 'x', action: 'return_to_stock' });
-  check(zero.status === 400, 'invalid quantity rejected (400)');
-  const noReasonRet = await api('POST', '/api/returns', ctx.cashierToken, { sale_id: rsale.id, medicine_id: med, batch_id: item.batch_id, quantity: 1, action: 'return_to_stock' });
-  check(noReasonRet.status === 400, 'return without reason rejected (400)');
-  const otherCashier = await api('POST', '/api/returns', ctx.cashier2Token, { sale_id: rsale.id, medicine_id: med, batch_id: item.batch_id, quantity: 1, reason: 'x', action: 'return_to_stock' });
-  check(otherCashier.status === 403, "Cashier cannot return another cashier's sale (403)");
-  const quarantine = await api('POST', '/api/returns', ctx.cashierToken, { sale_id: rsale.id, medicine_id: med, batch_id: item.batch_id, quantity: 1, reason: 'damaged pack', action: 'damaged' });
-  check(quarantine.status === 201 && quarantine.data?.refund_amount === 900 && (await stock(med)) === stockBeforeRet + 1, 'non-restock return records refund without adding sellable stock');
-  const final = await api('POST', '/api/returns', ctx.cashierToken, { sale_id: rsale.id, medicine_id: med, batch_id: item.batch_id, quantity: 1, reason: 'ITEST full', action: 'return_to_stock' });
-  check(final.status === 201 && final.data?.refund_amount === 900 && final.data?.sale?.status === 'returned', 'final unit returned; sale fully returned', final.data?.sale?.status);
-  const totalRefund = await pool.query('SELECT SUM(refund_amount)::float AS s FROM returns WHERE sale_id = $1', [rsale.id]);
-  check(totalRefund.rows[0].s === 2700, 'total refunds equal exactly what was paid (2700)', totalRefund.rows[0].s);
-  const dupRet = await api('POST', '/api/returns', ctx.cashierToken, { sale_id: rsale.id, medicine_id: med, batch_id: item.batch_id, quantity: 1, reason: 'dup', action: 'return_to_stock' });
-  check(dupRet.status === 409, 'duplicate return after full return rejected (409)');
-  const sumAfterRet = await sum(ctx.cashierToken);
-  check(Math.round((sumAfterRet.refundsTotal - sumBeforeRet.refundsTotal) * 100) / 100 === 2700, 'daily summary refunds +2700');
-  const voidReturned = await api('POST', `/api/sales/${rsale.id}/void`, ctx.adminToken, { void_reason: 'x' });
-  check(voidReturned.status === 409, 'sale with returns cannot be voided (409)');
+  const movementsFor = async () => count(`SELECT COUNT(*) n FROM inventory_movements WHERE reference_id = $1 AND movement_type LIKE 'RETURN%'`, [rsale.receipt_number]);
+
+  // TEST A — Cashier request: PENDING, nothing else changes
+  const stockA = await stock(med);
+  const sumA = await sum(ctx.cashierToken);
+  const reqA = await request(ctx.cashierToken, rsale, 1, 'ITEST A');
+  check(reqA.status === 201 && UUID_RE.test(reqA.data?.return?.id) && reqA.data?.return?.status === 'PENDING', 'A: Cashier request -> PENDING (UUID)', reqA.data);
+  check(reqA.data?.return?.refund_amount === 0 && reqA.data?.return?.requested_refund === 900, 'A: no refund finalised; requested refund 900 (discounted price)', reqA.data?.return);
+  check((await stock(med)) === stockA && (await movementsFor()) === 0, 'A: stock unchanged and no return movement while PENDING');
+  const sumAfterA = await sum(ctx.cashierToken);
+  check(sumAfterA.refundsTotal === sumA.refundsTotal && sumAfterA.totalSales === sumA.totalSales, 'A: daily totals unchanged while PENDING');
+  check(reqA.data?.sale?.status === 'completed', 'A: sale status unchanged while PENDING');
+  const auditReq = await count(`SELECT COUNT(*) n FROM audit_logs WHERE action = 'RETURN_REQUESTED' AND entity_id = $1`, [reqA.data?.return?.id]);
+  check(auditReq === 1, 'A: RETURN_REQUESTED audited');
+
+  // RBAC — D / E / stock bypass / unauthenticated
+  const cashierApprove = await approve(ctx.cashierToken, reqA.data.return.id, true);
+  check(cashierApprove.status === 403, 'D: Cashier approve -> 403', cashierApprove.status);
+  const cashierReject = await reject(ctx.cashierToken, reqA.data.return.id);
+  check(cashierReject.status === 403, 'D: Cashier reject -> 403', cashierReject.status);
+  for (const [method, path] of [['PATCH', `/api/returns/${reqA.data.return.id}`], ['PUT', `/api/returns/${reqA.data.return.id}`], ['PATCH', `/api/returns/${reqA.data.return.id}/status`]] as const) {
+    const r = await api(method, path, ctx.cashierToken, { status: 'APPROVED' });
+    check(r.status === 403, `E: Cashier ${method} ${path.replace(reqA.data.return.id, ':id')} -> 403`, r.status);
+  }
+  const adminDirect = await api('PATCH', `/api/returns/${reqA.data.return.id}`, ctx.adminToken, { status: 'APPROVED' });
+  check(adminDirect.status === 405, 'E: even Admin cannot edit status directly (405)', adminDirect.status);
+  const bypass = await api('POST', '/api/inventory/add-stock', ctx.cashierToken, { medicine_id: med, quantity: 1, batch_number: 'ITEST-BATCH-1' });
+  check(bypass.status === 403, 'Cashier direct stock-restoration endpoint -> 403', bypass.status);
+  const anonReq = await api('POST', '/api/returns', null, { sale_id: rsale.id });
+  const anonApprove = await api('POST', `/api/returns/${reqA.data.return.id}/approve`, null, { restock: true });
+  check(anonReq.status === 401 && anonApprove.status === 401, 'unauthenticated request/approve -> 401');
+  const spoofRole = await api('POST', `/api/returns/${reqA.data.return.id}/approve`, ctx.cashierToken, { restock: true }, { 'x-user-role': 'ADMIN' });
+  check(spoofRole.status === 403, 'x-user-role: ADMIN header does not grant approval (403)');
+  check(await count(`SELECT COUNT(*) n FROM returns WHERE id = $1 AND status = 'PENDING'`, [reqA.data.return.id]) === 1, 'still PENDING after all rejected attempts');
+
+  // TEST B — Admin approves with restock
+  const stockB = await stock(med);
+  const sumB = await sum(ctx.cashierToken);
+  const apB = await approve(ctx.adminToken, reqA.data.return.id, true, { notes: 'sealed pack' });
+  check(apB.status === 200 && apB.data?.return?.status === 'APPROVED' && apB.data?.refund_amount === 900, 'B: Admin approve -> APPROVED, refund 900', apB.data?.error || apB.data?.return?.status);
+  check((await stock(med)) === stockB + 1, 'B: stock +1 after approval (restock YES)');
+  const mvB = await pool.query(`SELECT movement_type, adjustment_quantity, user_id, notes FROM inventory_movements WHERE reference_id = $1 AND movement_type LIKE 'RETURN%'`, [rsale.receipt_number]);
+  check(mvB.rows.length === 1 && mvB.rows[0].movement_type === 'RETURN_APPROVED' && mvB.rows[0].adjustment_quantity === 1 && mvB.rows[0].user_id === ctx.admin.id && mvB.rows[0].notes.includes(reqA.data.return.id),
+    'B: RETURN_APPROVED movement +1 by the Admin, referencing the return id', mvB.rows[0]);
+  check(apB.data?.return?.reviewed_by_name === 'ITest Admin' && apB.data?.return?.reviewed_at && apB.data?.return?.review_notes === 'sealed pack', 'B: reviewer, time and notes recorded');
+  check(await count(`SELECT COUNT(*) n FROM audit_logs WHERE action = 'RETURN_APPROVED' AND entity_id = $1`, [reqA.data.return.id]) === 1, 'B: RETURN_APPROVED audited');
+  const sumAfterB = await sum(ctx.cashierToken);
+  check(Math.round((sumAfterB.refundsTotal - sumB.refundsTotal) * 100) / 100 === 900 && sumAfterB.totalSales === sumB.totalSales, 'B: daily refunds +900 only after approval; sales total unchanged');
+  check(apB.data?.sale?.status === 'partially_returned', 'B: sale partially_returned after approval');
+
+  // TEST F — approve twice / reject after approve
+  const twice = await approve(ctx.adminToken, reqA.data.return.id, true);
+  const rejectAfter = await reject(ctx.adminToken, reqA.data.return.id);
+  check(twice.status === 409 && rejectAfter.status === 409 && (await stock(med)) === stockB + 1, 'F: second approval and later rejection refused (409); no duplicate stock');
+
+  // TEST C — another request, rejected
+  const stockC = await stock(med);
+  const sumC = await sum(ctx.cashierToken);
+  const reqC = await request(ctx.cashierToken, rsale, 1, 'ITEST C');
+  const rejC = await reject(ctx.adminToken, reqC.data?.return?.id, 'customer opened the pack');
+  check(reqC.status === 201 && rejC.status === 200 && rejC.data?.return?.status === 'REJECTED' && rejC.data?.return?.review_notes === 'customer opened the pack', 'C: Admin rejects with reason -> REJECTED');
+  const sumAfterC = await sum(ctx.cashierToken);
+  check((await stock(med)) === stockC && sumAfterC.refundsTotal === sumC.refundsTotal && sumAfterC.totalSales === sumC.totalSales, 'C: rejection changes no stock, refunds or revenue');
+  check(await count(`SELECT COUNT(*) n FROM inventory_movements WHERE notes LIKE $1`, [`%${reqC.data?.return?.id}%`]) === 0, 'C: no movement for the rejected return');
+  const approveRejected = await approve(ctx.adminToken, reqC.data?.return?.id, true);
+  check(approveRejected.status === 409, 'F: approval after rejection refused (409)');
+  check(await count(`SELECT COUNT(*) n FROM audit_logs WHERE action = 'RETURN_REJECTED' AND entity_id = $1`, [reqC.data?.return?.id]) === 1, 'C: RETURN_REJECTED audited');
+  const mine = await api('GET', '/api/returns', ctx.cashierToken);
+  check(mine.data?.some?.((r: any) => r.id === reqC.data?.return?.id && r.status === 'REJECTED' && r.review_notes === 'customer opened the pack'), 'C: Cashier sees REJECTED with the Admin reason');
+  const others = await api('GET', '/api/returns', ctx.cashier2Token);
+  check(Array.isArray(others.data) && !others.data.some((r: any) => r.id === reqC.data?.return?.id), "another Cashier cannot see my requests");
+
+  // TEST G / H — quantity limits (sold 3: 1 approved, 1 rejected -> 2 still returnable)
+  const retTooMany = await request(ctx.cashierToken, rsale, 3);
+  check(retTooMany.status === 409, 'G: requesting more than remaining (3 > 2) rejected (409)', retTooMany.data?.error);
+  const reqH1 = await request(ctx.cashierToken, rsale, 1, 'ITEST H1');
+  const dupPending = await request(ctx.cashierToken, rsale, 2, 'ITEST H dup');
+  check(reqH1.status === 201 && dupPending.status === 409, 'H: pending requests count against the remaining quantity (no duplicate over-claim)', dupPending.data?.error);
+  const reqH2 = await request(ctx.cashierToken, rsale, 1, 'ITEST H2');
+  check(reqH2.status === 201, 'H: second valid partial request accepted');
+  const zeroLeft = await request(ctx.cashierToken, rsale, 1);
+  check(zeroLeft.status === 409, 'H: nothing left to request once approved + pending = sold (409)');
+  // TEST K — non-restockable approval: refund finalised, stock unchanged
+  const stockK = await stock(med);
+  const apK = await approve(ctx.adminToken, reqH1.data?.return?.id, false, { disposition: 'damaged' });
+  check(apK.status === 200 && apK.data?.refund_amount === 900 && apK.data?.return?.restocked === false && (await stock(med)) === stockK, 'K: approved without restock -> refund 900, stock unchanged', apK.data?.error);
+  const mvK = await pool.query(`SELECT movement_type, adjustment_quantity FROM inventory_movements WHERE notes LIKE $1`, [`%${reqH1.data?.return?.id}%`]);
+  check(mvK.rows[0]?.movement_type === 'RETURN_APPROVED_NOT_RESTOCKED' && mvK.rows[0]?.adjustment_quantity === 0, 'K: zero-quantity RETURN_APPROVED_NOT_RESTOCKED movement records the decision');
+  const apH2 = await approve(ctx.adminToken, reqH2.data?.return?.id, true);
+  check(apH2.status === 200 && apH2.data?.refund_amount === 900 && apH2.data?.sale?.status === 'returned', 'H: final unit approved; sale fully returned');
+  const refunded = await pool.query(`SELECT COALESCE(SUM(refund_amount), 0)::float s, COALESCE(SUM(approved_quantity), 0)::int q FROM returns WHERE sale_id = $1 AND status = 'APPROVED'`, [rsale.id]);
+  check(refunded.rows[0].q === 3 && refunded.rows[0].s === 2700, 'H: cumulative approved quantity = sold (3), refunds = paid (2700)', refunded.rows[0]);
+  const retZeroQty = await request(ctx.cashierToken, rsale, 0);
+  check(retZeroQty.status === 400, 'invalid quantity (0) rejected (400)');
+  const retNoReason = await api('POST', '/api/returns', ctx.cashierToken, { sale_id: rsale.id, medicine_id: med, batch_id: rsale.items[0].batch_id, quantity: 1 });
+  check(retNoReason.status === 400, 'request without reason rejected (400)');
+  const otherCashierSale = await request(ctx.cashier2Token, rsale, 1);
+  check(otherCashierSale.status === 403, "Cashier cannot request a return on another cashier's sale (403)");
+
+  // TEST I — discount (covered above: 10% -> 900 per unit). TEST J — wholesale sale
+  await api('PATCH', `/api/medicines/${med}/pricing`, ctx.adminToken, { wholesale_price: 800 });
+  const ws = await api('POST', '/api/sales/checkout', ctx.cashierToken, {
+    idempotency_key: key(), price_mode: 'WHOLESALE', items: [{ medicine_id: med, quantity: 2, unit_price: 800 }], payment: cash(),
+  });
+  const reqJ = await request(ctx.cashierToken, ws.data?.sale, 1, 'ITEST J');
+  await api('PATCH', `/api/medicines/${med}/pricing`, ctx.adminToken, { selling_price: 1200, wholesale_price: 950 }); // price changes after the sale
+  const apJ = await approve(ctx.adminToken, reqJ.data?.return?.id, true);
+  check(ws.status === 201 && apJ.status === 200 && apJ.data?.refund_amount === 800, 'J: wholesale return refunds the wholesale price charged (800), not today\'s price', apJ.data?.refund_amount);
+  await api('PATCH', `/api/medicines/${med}/pricing`, ctx.adminToken, { selling_price: 1000, wholesale_price: null });
+
+  // Expired batch cannot be restocked; refund-only approval still allowed
   const exSale = await (async () => {
     await physical(ctx, expMed, 3, '2029-01-31', 'ITEST-GOOD-BATCH');
     return (await sale(ctx.cashierToken, expMed, 1, 50)).data?.sale;
   })();
   await pool.query(`UPDATE medicine_batches SET expiry_date = '2020-01-31' WHERE id = $1`, [exSale?.items?.[0]?.batch_id]);
-  const restockExpired = await api('POST', '/api/returns', ctx.cashierToken, { sale_id: exSale?.id, medicine_id: expMed, batch_id: exSale?.items?.[0]?.batch_id, quantity: 1, reason: 'x', action: 'return_to_stock' });
-  check(restockExpired.status === 400 && /expired/i.test(restockExpired.data?.error || ''), 'restocking into an expired batch rejected (400)', restockExpired.data?.error);
-  persisted.returnId = ret1.data?.return?.id;
+  const reqEx = await request(ctx.cashierToken, exSale, 1, 'expired item');
+  const apExRestock = await approve(ctx.adminToken, reqEx.data?.return?.id, true);
+  check(apExRestock.status === 400 && /expired/i.test(apExRestock.data?.error || ''), 'restocking an expired batch refused at approval (400)');
+  check(await count(`SELECT COUNT(*) n FROM returns WHERE id = $1 AND status = 'PENDING'`, [reqEx.data?.return?.id]) === 1, 'failed approval rolled back: request still PENDING');
+  const apExNo = await approve(ctx.adminToken, reqEx.data?.return?.id, false, { disposition: 'dispose' });
+  check(apExNo.status === 200 && apExNo.data?.return?.restocked === false, 'expired item: refund-only approval succeeds');
 
-  // ------------------------------------------------------------------ SUPPLIERS / PURCHASES
+  // Races: two simultaneous approvals of one request -> exactly one succeeds
+  const raceSale = (await sale(ctx.cashierToken, med, 1, 1000)).data?.sale;
+  const raceReq = await request(ctx.cashierToken, raceSale, 1, 'race');
+  const stockRace = await stock(med);
+  const [r1, r2] = await Promise.all([approve(ctx.adminToken, raceReq.data?.return?.id, true), approve(ctx.adminToken, raceReq.data?.return?.id, true)]);
+  check([r1.status, r2.status].sort().join(',') === '200,409' && (await stock(med)) === stockRace + 1, 'concurrent approvals: one 200, one 409, stock +1 once', [r1.status, r2.status]);
+
+  // Void rules interact with returns
+  const voidWithReturns = await api('POST', `/api/sales/${rsale.id}/void`, ctx.adminToken, { void_reason: 'x' });
+  check(voidWithReturns.status === 409, 'sale with approved returns cannot be voided (409)');
+  const pendSale = (await sale(ctx.cashierToken, med, 1, 1000)).data?.sale;
+  await request(ctx.cashierToken, pendSale, 1, 'pending then void');
+  const voidPending = await api('POST', `/api/sales/${pendSale.id}/void`, ctx.adminToken, { void_reason: 'x' });
+  check(voidPending.status === 409, 'sale with a pending return cannot be voided (409)');
+  const voidedSale = (await sale(ctx.cashierToken, med, 1, 1000)).data?.sale;
+  await api('POST', `/api/sales/${voidedSale.id}/void`, ctx.adminToken, { void_reason: 'void first' });
+  const reqOnVoided = await request(ctx.cashierToken, voidedSale, 1);
+  check(reqOnVoided.status === 409, 'no return request on a voided sale (409)');
+
+  persisted.returnId = reqA.data?.return?.id;
+  persisted.rejectedReturnId = reqC.data?.return?.id;
+
   section('SUPPLIERS & PURCHASES');
   const sup = await api('POST', '/api/suppliers', ctx.adminToken, { name: 'ZZ ITEST Supplier', phone: '0700000000' });
   check(sup.status === 200 && UUID_RE.test(sup.data?.supplier?.id), 'Admin creates supplier (UUID)', sup.data);
@@ -351,6 +466,7 @@ export async function commerceTests(ctx: Ctx) {
 
   // ------------------------------------------------------------------ RESTART PERSISTENCE
   section('RESTART PERSISTENCE');
+  persisted.returnStockAfter = String(await stock(med));
   await stopServer();
   await startServer();
   ctx.adminToken = await login(ctx.admin.email, ctx.admin.password);
@@ -359,7 +475,8 @@ export async function commerceTests(ctx: Ctx) {
   const salesAfter = await api('GET', '/api/sales?limit=200', ctx.adminToken);
   check(salesAfter.data?.sales?.some((s: any) => s.id === persisted.voidedSale && s.status === 'voided'), 'voided sale persists after restart');
   const retAfter = await api('GET', '/api/returns', ctx.adminToken);
-  check(retAfter.data?.some?.((x: any) => x.id === persisted.returnId), 'return persists after restart');
+  check(retAfter.data?.some?.((x: any) => x.id === persisted.returnId && x.status === 'APPROVED') && retAfter.data?.some?.((x: any) => x.id === persisted.rejectedReturnId && x.status === 'REJECTED'), 'L: return statuses persist after restart (APPROVED / REJECTED)');
+  check(String(await stock(med)) === persisted.returnStockAfter, 'L: stock after returns unchanged by restart');
   const purAfter = await api('GET', '/api/purchases', ctx.adminToken);
   check(purAfter.data?.some?.((x: any) => x.id === persisted.purchaseId), 'purchase persists after restart');
   const expAfter = await api('GET', '/api/expenses', ctx.adminToken);

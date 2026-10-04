@@ -264,7 +264,7 @@ export interface Sale {
   last_sync_attempt?: number;
   idempotency_key: string;
   /** Quantities/amounts already returned per medicine+batch (server). */
-  returned_items?: { medicine_id: string; batch_id: string; quantity: number; refunded: number }[];
+  returned_items?: { medicine_id: string; batch_id: string; quantity: number; pending?: number; refunded: number }[];
 }
 
 export type ReturnAction = 'return_to_stock' | 'damaged' | 'quarantine' | 'dispose';
