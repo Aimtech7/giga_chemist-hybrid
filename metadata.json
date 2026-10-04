@@ -1,0 +1,6 @@
+{
+  "name": "GIGA CHEMIST",
+  "description": "Production-grade offline-first Pharmacy Point of Sale and inventory management system with batch tracking, FEFO dispensing, expiry alerts, thermal receipt printing, and seamless offline-to-online synchronization.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

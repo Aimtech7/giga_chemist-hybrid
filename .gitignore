@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Environment / secrets (keep the sanitized template)
+.env
+.env.*
+!.env.example
+
+# Build output & caches
+dist/
+build/
+coverage/
+.cache/
+.vite/
+
+# Runtime data, logs, backups
+data/
+logs/
+backups/
+*.log
+*.dump
+*.backup
+
+# Large legacy dumps & archives (migrations/*.sql stay tracked)
+chemist_pos.sql
+deployment/postgresql/giga_chemist_full.sql
+pos.zip
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,382 @@
+import React, { useState, useEffect } from 'react';
+import { db, getSettings } from './db/dexie';
+import { getCachedUser, setCachedUser, INITIAL_USERS, logoutUser } from './services/auth';
+import { getOrRegisterDevice } from './services/device';
+import { refreshNetworkStatus } from './services/network';
+import { syncFromLocalApiToDexie, syncFromSupabaseToDexie } from './services/syncEngine';
+import { canAccessModule, isCashier } from './services/permissions';
+import { AppShell, type AppModule } from './components/layout/AppShell';
+import { LoginModal } from './components/common/LoginModal';
+import { LandingPage } from './components/public/LandingPage';
+import { LoginPage } from './components/auth/LoginPage';
+import { Dashboard } from './components/dashboard/Dashboard';
+import { PosScreen } from './components/pos/PosScreen';
+import { MedicineList } from './components/inventory/MedicineList';
+import { InventoryManager } from './components/inventory/InventoryManager';
+import { PhysicalStockCount } from './components/stocktake/PhysicalStockCount';
+import { BatchList } from './components/inventory/BatchList';
+import { ExpiryManager } from './components/expiry/ExpiryManager';
+import { PurchaseList } from './components/purchases/PurchaseList';
+import { SupplierList } from './components/suppliers/SupplierList';
+import { CustomerList } from './components/customers/CustomerList';
+import { ExpenseList } from './components/expenses/ExpenseList';
+import { SalesHistory } from './components/sales/SalesHistory';
+import { ReportsDashboard } from './components/reports/ReportsDashboard';
+import { UserManagement } from './components/users/UserManagement';
+import { AuditLogViewer } from './components/audit/AuditLogViewer';
+import { SettingsView } from './components/settings/SettingsView';
+import type { PharmacySettings, User } from './types';
+
+export default function App() {
+  const [viewMode, setViewMode] = useState<'landing' | 'login' | 'app'>('landing');
+  const [currentModule, setCurrentModule] = useState<AppModule>('pos');
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [settings, setSettings] = useState<PharmacySettings | null>(null);
+  const [isLoginOpen, setIsLoginOpen] = useState(false);
+  const [isInitialized, setIsInitialized] = useState(false);
+
+  useEffect(() => {
+    // Check initial route from hash or path with strict protection
+    const checkRoute = () => {
+      const hash = window.location.hash.toLowerCase();
+      const path = window.location.pathname.toLowerCase();
+      const cached = getCachedUser();
+
+      const isProtected =
+        path === '/app' ||
+        path === '/dashboard' ||
+        path === '/pos' ||
+        path === '/inventory' ||
+        path === '/stocktake' ||
+        path === '/batches' ||
+        path === '/expiry' ||
+        path === '/purchases' ||
+        path === '/suppliers' ||
+        path === '/expenses' ||
+        path === '/reports' ||
+        path === '/settings' ||
+        path === '/users' ||
+        path === '/audit-logs' ||
+        hash.startsWith('#app') ||
+        hash.startsWith('#dashboard') ||
+        hash.startsWith('#pos') ||
+        hash.startsWith('#inventory') ||
+        hash.startsWith('#stocktake') ||
+        hash.startsWith('#reports') ||
+        hash.startsWith('#settings');
+
+      const isLogin = path === '/login' || hash === '#login';
+
+      if (isProtected) {
+        if (cached) {
+          // Check if specific module in hash or path is allowed for this user
+          const rawModule = hash.replace('#', '').replace('/app/', '') as AppModule;
+          if (rawModule && canAccessModule(cached, rawModule)) {
+            setCurrentModule(rawModule);
+          } else if (isCashier(cached)) {
+            // Cashier defaults to POS register
+            setCurrentModule('pos');
+          }
+          setViewMode('app');
+        } else {
+          // Redirect unauthenticated user to login
+          window.location.hash = '#login';
+          setViewMode('login');
+        }
+      } else if (isLogin) {
+        if (cached) {
+          // Logged-in user visiting /login -> redirect to protected app
+          window.location.hash = '#app';
+          if (isCashier(cached)) {
+            setCurrentModule('pos');
+          }
+          setViewMode('app');
+        } else {
+          setViewMode('login');
+        }
+      } else {
+        // Landing page (path === '/' or anchor tags like #features, #offline, #how-it-works)
+        setViewMode('landing');
+      }
+    };
+
+    checkRoute();
+    window.addEventListener('popstate', checkRoute);
+    window.addEventListener('hashchange', checkRoute);
+
+    return () => {
+      window.removeEventListener('popstate', checkRoute);
+      window.removeEventListener('hashchange', checkRoute);
+    };
+  }, []);
+
+  const navigateToLanding = () => {
+    setViewMode('landing');
+    if (window.location.hash === '#login' || window.location.hash === '#app') {
+      window.history.pushState(null, '', window.location.pathname);
+    }
+  };
+
+  const navigateToLogin = () => {
+    const cached = getCachedUser();
+    if (cached) {
+      setViewMode('app');
+      window.location.hash = '#app';
+      return;
+    }
+    setViewMode('login');
+    window.location.hash = '#login';
+  };
+
+  const handleSelectModule = (module: AppModule) => {
+    if (!canAccessModule(currentUser, module)) {
+      // Forbidden: redirect to POS
+      setCurrentModule('pos');
+      return;
+    }
+    setCurrentModule(module);
+  };
+
+  const navigateToApp = (module: AppModule = 'pos') => {
+    const cached = getCachedUser();
+    if (!cached && !currentUser) {
+      navigateToLogin();
+      return;
+    }
+    const userToEvaluate = currentUser || cached;
+    const targetModule = canAccessModule(userToEvaluate, module) ? module : 'pos';
+    setCurrentModule(targetModule);
+    setViewMode('app');
+    window.location.hash = '#app';
+  };
+
+  useEffect(() => {
+    async function init() {
+      try {
+        // Register device ID
+        await getOrRegisterDevice();
+
+        // Load settings
+        const loadedSettings = await getSettings();
+        setSettings(loadedSettings);
+
+        // Load cached user session
+        const cached = getCachedUser();
+        if (cached) {
+          setCurrentUser(cached);
+          if (isCashier(cached) && !canAccessModule(cached, currentModule)) {
+            setCurrentModule('pos');
+          }
+          // Hydrate Dexie in background for cached session
+          syncFromLocalApiToDexie().catch((e) => console.warn('[App] Local sync notice:', e));
+        } else {
+          setCurrentUser(null);
+          // Initial catalog hydration for guest / public lookup
+          syncFromLocalApiToDexie().catch((e) => console.warn('[App] Local initial sync notice:', e));
+        }
+
+        // Initialize network and sync monitoring
+        await refreshNetworkStatus();
+
+        setIsInitialized(true);
+      } catch (err) {
+        console.error('Initialization error:', err);
+        setIsInitialized(true);
+      }
+    }
+
+    init();
+  }, []);
+
+  const handleLogout = async () => {
+    await logoutUser(currentUser || undefined);
+    setCachedUser(null);
+    setCurrentUser(null);
+    navigateToLanding();
+  };
+
+  const handleRoleQuickSwitch = (role: 'ADMIN' | 'MANAGER' | 'CASHIER') => {
+    const targetUser = INITIAL_USERS.find((u) => u.role === role) || INITIAL_USERS[0];
+    setCachedUser(targetUser);
+    setCurrentUser(targetUser);
+
+    // If switching to a role that cannot access current module, switch to POS
+    if (!canAccessModule(targetUser, currentModule)) {
+      setCurrentModule('pos');
+    }
+    syncFromLocalApiToDexie().catch((e) => console.warn('[App] Quick switch sync notice:', e));
+  };
+
+  if (!isInitialized || !settings) {
+    return (
+      <div className="h-screen w-screen flex flex-col items-center justify-center bg-slate-900 text-white">
+        <div className="w-12 h-12 rounded-lg bg-teal-600 flex items-center justify-center font-black text-xl mb-3 animate-pulse">
+          GC
+        </div>
+        <h1 className="text-base font-bold tracking-tight">GIGA CHEMIST</h1>
+        <p className="text-xs text-slate-400 mt-1">Bootstrapping Pharmacy Engine &amp; Local Storage...</p>
+      </div>
+    );
+  }
+
+  // 1. PUBLIC LANDING PAGE (Route: /)
+  if (viewMode === 'landing') {
+    return (
+      <LandingPage
+        onEnterApp={() => {
+          if (currentUser) {
+            navigateToApp('pos');
+          } else {
+            navigateToLogin();
+          }
+        }}
+        onOpenLogin={navigateToLogin}
+        currentUser={currentUser}
+      />
+    );
+  }
+
+  // 2. DEDICATED SIGN-IN PAGE (Route: /login)
+  if (viewMode === 'login') {
+    return (
+      <LoginPage
+        onSuccess={(user) => {
+          setCurrentUser(user);
+          syncFromLocalApiToDexie().catch((e) => console.warn('[App] Post-login sync notice:', e));
+          navigateToApp(user.role === 'CASHIER' ? 'pos' : 'dashboard');
+        }}
+        onBackToHome={navigateToLanding}
+      />
+    );
+  }
+
+  // 3. PRIVATE AUTHENTICATED PHARMACY WORKSTATION (Route: /app or /dashboard)
+  // Strict route protection: If user is not authenticated, display login
+  if (!currentUser) {
+    return (
+      <LoginPage
+        onSuccess={(user) => {
+          setCurrentUser(user);
+          syncFromLocalApiToDexie().catch((e) => console.warn('[App] Post-login sync notice:', e));
+          navigateToApp(user.role === 'CASHIER' ? 'pos' : 'dashboard');
+        }}
+        onBackToHome={navigateToLanding}
+      />
+    );
+  }
+
+  // 3. PRIVATE AUTHENTICATED PHARMACY WORKSTATION
+  return (
+    <AppShell
+      currentModule={currentModule}
+      onSelectModule={handleSelectModule}
+      currentUser={currentUser}
+      settings={settings}
+      onOpenLogin={() => setIsLoginOpen(true)}
+      onLogout={handleLogout}
+      onFastRoleSwitch={handleRoleQuickSwitch}
+      onViewLandingPage={navigateToLanding}
+    >
+      {/* EXECUTIVE & OPERATIONAL DASHBOARD */}
+      {currentModule === 'dashboard' && (
+        <Dashboard currentUser={currentUser} settings={settings} onNavigate={handleSelectModule} />
+      )}
+
+      {/* POS REGISTER */}
+      {currentModule === 'pos' && (
+        <PosScreen currentUser={currentUser} settings={settings} />
+      )}
+
+      {/* MEDICINES / MEDICINE LOOKUP */}
+      {currentModule === 'medicines' && (
+        <MedicineList currentUser={currentUser} settings={settings} />
+      )}
+
+      {/* INVENTORY - Restricted to Admin/Manager */}
+      {currentModule === 'inventory' && canAccessModule(currentUser, 'inventory') && (
+        <InventoryManager currentUser={currentUser} settings={settings} />
+      )}
+
+      {/* PHYSICAL STOCK COUNT (FAST STOCKTAKE) - Restricted to Admin */}
+      {currentModule === 'stocktake' && canAccessModule(currentUser, 'stocktake') && (
+        <PhysicalStockCount currentUser={currentUser} settings={settings} />
+      )}
+
+      {/* BATCHES - Restricted to Admin/Manager */}
+      {currentModule === 'batches' && canAccessModule(currentUser, 'batches') && (
+        <BatchList currentUser={currentUser} settings={settings} />
+      )}
+
+      {/* EXPIRY - Restricted to Admin/Manager */}
+      {currentModule === 'expiry' && canAccessModule(currentUser, 'expiry') && (
+        <ExpiryManager currentUser={currentUser} settings={settings} />
+      )}
+
+      {/* PURCHASES - Restricted to Admin/Manager */}
+      {currentModule === 'purchases' && canAccessModule(currentUser, 'purchases') && (
+        <PurchaseList currentUser={currentUser} settings={settings} />
+      )}
+
+      {/* SUPPLIERS - Restricted to Admin/Manager */}
+      {currentModule === 'suppliers' && canAccessModule(currentUser, 'suppliers') && (
+        <SupplierList currentUser={currentUser} settings={settings} />
+      )}
+
+      {/* CUSTOMERS */}
+      {currentModule === 'customers' && canAccessModule(currentUser, 'customers') && (
+        <CustomerList settings={settings} />
+      )}
+
+      {/* EXPENSES - Restricted to Admin/Manager */}
+      {currentModule === 'expenses' && canAccessModule(currentUser, 'expenses') && (
+        <ExpenseList currentUser={currentUser} settings={settings} />
+      )}
+
+      {/* SALES */}
+      {currentModule === 'sales' && canAccessModule(currentUser, 'sales') && (
+        <SalesHistory currentUser={currentUser} settings={settings} />
+      )}
+
+      {/* RETURNS */}
+      {currentModule === 'returns' && canAccessModule(currentUser, 'returns') && (
+        <SalesHistory currentUser={currentUser} settings={settings} />
+      )}
+
+      {/* REPORTS - Restricted to Admin/Manager */}
+      {currentModule === 'reports' && canAccessModule(currentUser, 'reports') && (
+        <ReportsDashboard currentUser={currentUser} settings={settings} />
+      )}
+
+      {/* USERS - Restricted to Admin */}
+      {currentModule === 'users' && canAccessModule(currentUser, 'users') && (
+        <UserManagement currentUser={currentUser} />
+      )}
+
+      {/* AUDIT LOGS - Restricted to Admin */}
+      {currentModule === 'audit' && canAccessModule(currentUser, 'audit') && (
+        <AuditLogViewer currentUser={currentUser} />
+      )}
+
+      {/* SETTINGS - Restricted to Admin */}
+      {currentModule === 'settings' && canAccessModule(currentUser, 'settings') && (
+        <SettingsView
+          currentUser={currentUser}
+          settings={settings}
+          onSettingsUpdated={(updated) => setSettings(updated)}
+        />
+      )}
+
+      {/* Login Modal */}
+      <LoginModal
+        isOpen={isLoginOpen}
+        onClose={() => setIsLoginOpen(false)}
+        onSuccess={(user) => {
+          setCurrentUser(user);
+          if (isCashier(user)) {
+            setCurrentModule('pos');
+          }
+        }}
+      />
+    </AppShell>
+  );
+}

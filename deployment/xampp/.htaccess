@@ -1,0 +1,48 @@
+# ====================================================================
+# GIGA CHEMIST - Apache .htaccess for XAMPP (Local Subfolder & SPA)
+# ====================================================================
+
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+
+  # Direct API calls to the PHP API router
+  RewriteRule ^api/(.*)$ api/index.php [QSA,L]
+  RewriteRule ^api$ api/index.php [QSA,L]
+
+  # Serve existing physical files directly if they exist in root
+  RewriteCond %{REQUEST_FILENAME} -f [OR]
+  RewriteCond %{REQUEST_FILENAME} -d
+  RewriteRule ^ - [L]
+
+  # Check if requested file/asset exists inside the app/ directory
+  RewriteCond %{REQUEST_URI} !^/api
+  RewriteCond %{DOCUMENT_ROOT}/%{REQUEST_URI} !-f
+  RewriteCond %{REQUEST_FILENAME} !-f
+  RewriteRule ^assets/(.*)$ app/assets/$1 [L]
+  RewriteRule ^sw\.js$ app/sw.js [L]
+  RewriteRule ^manifest\.webmanifest$ app/manifest.webmanifest [L]
+  RewriteRule ^registerSW\.js$ app/registerSW.js [L]
+  RewriteRule ^favicon\.ico$ app/favicon.ico [L]
+  RewriteRule ^icon\.svg$ app/icon.svg [L]
+  RewriteRule ^apple-touch-icon\.png$ app/apple-touch-icon.png [L]
+  RewriteRule ^pwa-(.*)$ app/pwa-$1 [L]
+  RewriteRule ^workbox-(.*)$ app/workbox-$1 [L]
+
+  # Client-side SPA routes fallback to app/index.html
+  RewriteCond %{REQUEST_URI} !^/api
+  RewriteRule ^(.*)$ app/index.html [L]
+</IfModule>
+
+# Disable Directory Browsing
+Options -Indexes
+
+# Protect Sensitive Configuration Files
+<FilesMatch "^(config\.php|\.env|schema\.sql|seed\.sql)">
+  <IfModule mod_authz_core.c>
+    Require all denied
+  </IfModule>
+  <IfModule !mod_authz_core.c>
+    Order allow,deny
+    Deny from all
+  </IfModule>
+</FilesMatch>
