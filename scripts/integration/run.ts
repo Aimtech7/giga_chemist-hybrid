@@ -1,5 +1,7 @@
-import { assertDevDatabase, login, pool, startServer, stopServer, summary, upsertFixtureUser, getServerLog } from './harness';
+import { assertDevDatabase, cleanupFixtures, login, pool, startServer, stopServer, summary, upsertFixtureUser, getServerLog } from './harness';
 import { authTests, userTests, type Ctx } from './auth-users.test';
+import { wholesaleTests } from './wholesale.test';
+import { commerceTests } from './commerce.test';
 
 /**
  * GIGA CHEMIST local integration suite.
@@ -12,6 +14,7 @@ import { authTests, userTests, type Ctx } from './auth-users.test';
  */
 async function main() {
   await assertDevDatabase();
+  console.log('[integration] pre-run fixture cleanup:', await cleanupFixtures());
   const admin = await upsertFixtureUser('itest-admin@gigachemist.local', 'ITest Admin', 'ADMIN');
   const cashier = await upsertFixtureUser('itest-cashier@gigachemist.local', 'ITest Cashier', 'CASHIER');
   const cashier2 = await upsertFixtureUser('itest-cashier2@gigachemist.local', 'ITest Cashier Two', 'CASHIER');
@@ -35,8 +38,12 @@ async function main() {
   try {
     await run('auth', authTests);
     await run('users', userTests);
+    await run('wholesale', wholesaleTests);
+    await run('commerce', commerceTests);
   } finally {
     await stopServer();
+    // Remove test transactions, zero/deactivate fixture medicines, deactivate test users.
+    console.log('[integration] post-run fixture cleanup:', await cleanupFixtures());
   }
   const failed = summary();
   if (failed && process.env.ITEST_SHOW_SERVER_LOG) console.log(getServerLog());

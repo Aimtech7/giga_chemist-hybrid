@@ -1,8 +1,169 @@
-import { pgPool, isLocalMode, supabaseAdmin, isSupabaseConfigured } from './client';
-import { serverDb } from '../db';
-import { recordInventoryMovement } from './inventory';
-import { isExpired } from '../../src/utils/expiry';
-import type { Sale, PaginatedSalesResponse } from '../../src/types';
+import crypto from 'crypto';
+import { pgPool, HttpError, requireUuid, withTransaction, businessNow, type Queryable } from './client';
+import { ensureDevice } from './devices';
+import { recordAuditLog } from './audit';
+import {
+  deriveBatchStatus,
+  insertMovement,
+  reconcileMedicineStock,
+  toBatchDto,
+  toMedicineStockDto,
+  type StockActor,
+} from './inventory';
+import type { Sale, PaginatedSalesResponse, PaymentMethod, PriceMode, UserRole } from '../../src/types';
+
+// =============================================================================
+// Money: all arithmetic in integer cents, converted only at the boundaries.
+// =============================================================================
+const toCents = (n: number) => Math.round(Number(n) * 100);
+const fromCents = (c: number) => c / 100;
+
+export const CASHIER_MAX_DISCOUNT_PERCENT = 10;
+export const ADMIN_MAX_DISCOUNT_PERCENT = 100;
+const PAYMENT_METHODS: PaymentMethod[] = ['Cash', 'M-Pesa', 'Card', 'Bank', 'Mixed'];
+const SPLIT_METHODS = ['Cash', 'M-Pesa', 'Card', 'Bank'] as const;
+const MPESA_REF = /^[A-Z0-9]{6,20}$/;
+const PRICE_MODES: PriceMode[] = ['RETAIL', 'WHOLESALE'];
+
+function requirePriceMode(value: unknown, field: string): PriceMode {
+  if (value === undefined || value === null || value === '') return 'RETAIL';
+  if (!PRICE_MODES.includes(value as PriceMode)) throw new HttpError(400, `${field} must be RETAIL or WHOLESALE.`);
+  return value as PriceMode;
+}
+
+export interface SaleActor extends StockActor {
+  role: UserRole;
+}
+
+// =============================================================================
+// Reads
+// =============================================================================
+const SALE_COLUMNS = `
+  s.id, s.branch_id, s.sale_number, s.receipt_number,
+  s.cashier_id, u.name AS cashier_name,
+  s.customer_id, c.name AS customer_name, c.phone AS customer_phone,
+  s.device_id, s.date, s.time,
+  COALESCE(s.subtotal, 0)::float AS subtotal,
+  COALESCE(s.discount_percent, 0)::float AS discount_percent,
+  COALESCE(s.discount_total, 0)::float AS discount_total,
+  COALESCE(s.tax_total, 0)::float AS tax_total,
+  COALESCE(s.total, 0)::float AS total,
+  COALESCE(s.cost_total, 0)::float AS cost_total,
+  COALESCE(s.gross_profit, 0)::float AS gross_profit,
+  s.payment_method, s.payment_reference,
+  COALESCE(s.amount_received, 0)::float AS amount_received,
+  COALESCE(s.change_given, 0)::float AS change_given,
+  s.status, s.void_reason, s.voided_by, s.idempotency_key, s.price_mode, s.created_at`;
+
+async function hydrateSales(q: Queryable, rows: any[]): Promise<Sale[]> {
+  if (rows.length === 0) return [];
+  const ids = rows.map((r) => r.id);
+  const [items, payments, returned] = await Promise.all([
+    q.query(
+      `SELECT si.id, si.sale_id, si.medicine_id, m.name AS medicine_name, m.generic_name,
+              si.batch_id, si.batch_number, si.expiry_date,
+              si.quantity::int AS quantity, si.unit_price::float AS unit_price, COALESCE(si.discount, 0)::float AS discount,
+              si.cost_price_snapshot::float AS cost_price_snapshot, si.total::float AS total, si.price_mode
+       FROM sale_items si LEFT JOIN medicines m ON si.medicine_id = m.id
+       WHERE si.sale_id = ANY($1::uuid[])
+       ORDER BY si.created_at, si.id`,
+      [ids]
+    ),
+    q.query(
+      `SELECT sale_id, method, amount::float AS amount, reference FROM payments
+       WHERE sale_id = ANY($1::uuid[]) ORDER BY created_at, id`,
+      [ids]
+    ),
+    q.query(
+      `SELECT sale_id, medicine_id, batch_id, SUM(quantity)::int AS qty, SUM(refund_amount)::float AS refunded
+       FROM returns WHERE sale_id = ANY($1::uuid[]) GROUP BY sale_id, medicine_id, batch_id`,
+      [ids]
+    ),
+  ]);
+
+  const itemsBySale = new Map<string, any[]>();
+  for (const it of items.rows) {
+    const list = itemsBySale.get(it.sale_id) || [];
+    list.push({
+      id: it.id,
+      medicine_id: it.medicine_id,
+      medicine_name: it.medicine_name || 'Pharmaceutical Item',
+      generic_name: it.generic_name || '',
+      batch_id: it.batch_id,
+      batch_number: it.batch_number,
+      expiry_date: it.expiry_date || '',
+      quantity: Number(it.quantity) || 0,
+      unit_price: Number(it.unit_price) || 0,
+      discount: Number(it.discount) || 0,
+      cost_price_snapshot: Number(it.cost_price_snapshot) || 0,
+      total: Number(it.total) || 0,
+      price_mode: it.price_mode || null,
+    });
+    itemsBySale.set(it.sale_id, list);
+  }
+  const paymentsBySale = new Map<string, any[]>();
+  for (const p of payments.rows) {
+    const list = paymentsBySale.get(p.sale_id) || [];
+    list.push({ method: p.method, amount: Number(p.amount) || 0, reference: p.reference || undefined });
+    paymentsBySale.set(p.sale_id, list);
+  }
+  const returnedBySale = new Map<string, { medicine_id: string; batch_id: string; quantity: number; refunded: number }[]>();
+  for (const r of returned.rows) {
+    const list = returnedBySale.get(r.sale_id) || [];
+    list.push({ medicine_id: r.medicine_id, batch_id: r.batch_id, quantity: Number(r.qty) || 0, refunded: Number(r.refunded) || 0 });
+    returnedBySale.set(r.sale_id, list);
+  }
+
+  return rows.map((r) => {
+    const pays = paymentsBySale.get(r.id) || [];
+    return {
+      id: r.id,
+      branch_id: r.branch_id || undefined,
+      sale_number: r.sale_number,
+      receipt_number: r.receipt_number,
+      date: r.date || '',
+      time: r.time || '',
+      timestamp: r.created_at ? new Date(r.created_at).getTime() : Date.now(),
+      cashier_id: r.cashier_id,
+      cashier_name: r.cashier_name || 'Cashier',
+      customer_id: r.customer_id || undefined,
+      customer_name: r.customer_name || 'Walk-in',
+      customer_phone: r.customer_phone || undefined,
+      device_id: r.device_id,
+      items: itemsBySale.get(r.id) || [],
+      price_mode: r.price_mode || null,
+      subtotal: Number(r.subtotal) || 0,
+      discount_percent: Number(r.discount_percent) || 0,
+      discount_total: Number(r.discount_total) || 0,
+      tax_total: Number(r.tax_total) || 0,
+      total: Number(r.total) || 0,
+      cost_total: Number(r.cost_total) || 0,
+      gross_profit: Number(r.gross_profit) || 0,
+      payment_method: r.payment_method || 'Cash',
+      payment_reference: r.payment_reference || undefined,
+      amount_received: Number(r.amount_received) || 0,
+      change_given: Number(r.change_given) || 0,
+      split_payments: r.payment_method === 'Mixed' ? pays : undefined,
+      status: r.status || 'completed',
+      void_reason: r.void_reason || undefined,
+      voided_by: r.voided_by || undefined,
+      sync_status: 'synced',
+      retry_count: 0,
+      idempotency_key: r.idempotency_key,
+      returned_items: returnedBySale.get(r.id) || [],
+    } as Sale;
+  });
+}
+
+export async function getSaleById(id: string, q: Queryable = pgPool): Promise<Sale | null> {
+  const res = await q.query(
+    `SELECT ${SALE_COLUMNS} FROM sales s
+     LEFT JOIN users u ON s.cashier_id = u.id LEFT JOIN customers c ON s.customer_id = c.id
+     WHERE s.id = $1`,
+    [requireUuid(id, 'sale id')]
+  );
+  return (await hydrateSales(q, res.rows))[0] || null;
+}
 
 export interface SalesQueryParams {
   page?: number;
@@ -13,534 +174,605 @@ export interface SalesQueryParams {
   cashierId?: string;
 }
 
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
 export async function getAllSales(params?: SalesQueryParams): Promise<Sale[] | PaginatedSalesResponse> {
   const page = Math.max(1, Number(params?.page) || 1);
-  const limit = Math.min(100, Math.max(1, Number(params?.limit) || 50));
+  const limit = Math.min(500, Math.max(1, Number(params?.limit) || 50));
   const offset = (page - 1) * limit;
 
-  try {
-    const conditions: string[] = [];
-    const values: any[] = [];
-    let valIndex = 1;
-
-    if (params?.search && params.search.trim()) {
-      const q = `%${params.search.trim()}%`;
-      conditions.push(`(s.receipt_number ILIKE $${valIndex} OR s.sale_number ILIKE $${valIndex} OR s.payment_reference ILIKE $${valIndex} OR c.name ILIKE $${valIndex})`);
-      values.push(q);
-      valIndex++;
-    }
-
-    if (params?.startDate) {
-      conditions.push(`s.date >= $${valIndex}`);
-      values.push(params.startDate);
-      valIndex++;
-    }
-
-    if (params?.endDate) {
-      conditions.push(`s.date <= $${valIndex}`);
-      values.push(params.endDate);
-      valIndex++;
-    }
-
-    if (params?.cashierId) {
-      conditions.push(`s.cashier_id::text = $${valIndex}`);
-      values.push(params.cashierId);
-      valIndex++;
-    }
-
-    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
-
-    // Total count for pagination
-    const countRes = await pgPool.query(`
-      SELECT COUNT(*) as count 
-      FROM sales s 
-      LEFT JOIN customers c ON s.customer_id = c.id 
-      ${whereClause}
-    `, values);
-    const total = parseInt(countRes.rows[0]?.count || '0', 10);
-
-    const salesRes = await pgPool.query(`
-      SELECT 
-        s.id, s.branch_id, s.sale_number, s.receipt_number,
-        s.cashier_id, u.name as cashier_name,
-        s.customer_id, c.name as customer_name, c.phone as customer_phone,
-        s.device_id, s.date, s.time,
-        COALESCE(s.subtotal, 0)::float as subtotal,
-        COALESCE(s.discount_percent, 0)::float as discount_percent,
-        COALESCE(s.discount_total, 0)::float as discount_total,
-        COALESCE(s.tax_total, 0)::float as tax_total,
-        COALESCE(s.total, 0)::float as total,
-        COALESCE(s.cost_total, 0)::float as cost_total,
-        COALESCE(s.gross_profit, 0)::float as gross_profit,
-        s.payment_method, s.payment_reference,
-        COALESCE(s.amount_received, 0)::float as amount_received,
-        COALESCE(s.change_given, 0)::float as change_given,
-        s.status, s.void_reason, s.idempotency_key, s.sync_status,
-        s.created_at
-      FROM sales s
-      LEFT JOIN users u ON s.cashier_id = u.id
-      LEFT JOIN customers c ON s.customer_id = c.id
-      ${whereClause}
-      ORDER BY s.created_at DESC
-      LIMIT $${valIndex} OFFSET $${valIndex + 1}
-    `, [...values, limit, offset]);
-
-    if (salesRes.rows && salesRes.rows.length > 0) {
-      const saleIds = salesRes.rows.map((r) => r.id);
-      
-      // Fetch line items for these sales
-      const itemsRes = await pgPool.query(`
-        SELECT 
-          si.id, si.sale_id, si.medicine_id, m.name as medicine_name, m.generic_name,
-          si.batch_id, si.batch_number, si.expiry_date,
-          COALESCE(si.quantity, 0)::int as quantity,
-          COALESCE(si.unit_price, 0)::float as unit_price,
-          COALESCE(si.discount, 0)::float as discount,
-          COALESCE(si.cost_price_snapshot, 0)::float as cost_price_snapshot,
-          COALESCE(si.total, 0)::float as total
-        FROM sale_items si
-        LEFT JOIN medicines m ON si.medicine_id = m.id
-        WHERE si.sale_id = ANY($1::uuid[])
-      `, [saleIds]);
-
-      const itemsBySale = new Map<string, any[]>();
-      for (const it of itemsRes.rows) {
-        const list = itemsBySale.get(it.sale_id) || [];
-        list.push({
-          medicine_id: it.medicine_id,
-          medicine_name: it.medicine_name || 'Pharmaceutical Item',
-          generic_name: it.generic_name || '',
-          batch_id: it.batch_id,
-          batch_number: it.batch_number,
-          expiry_date: it.expiry_date ? new Date(it.expiry_date).toISOString().split('T')[0] : '',
-          quantity: Number(it.quantity) || 0,
-          unit_price: Number(it.unit_price) || 0,
-          discount: Number(it.discount) || 0,
-          cost_price_snapshot: Number(it.cost_price_snapshot) || 0,
-          total: Number(it.total) || 0,
-        });
-        itemsBySale.set(it.sale_id, list);
-      }
-
-      const sales: Sale[] = salesRes.rows.map((r) => ({
-        id: r.id,
-        branch_id: r.branch_id,
-        sale_number: r.sale_number,
-        receipt_number: r.receipt_number,
-        date: r.date ? new Date(r.date).toISOString().split('T')[0] : '',
-        time: r.time || '',
-        timestamp: r.created_at ? new Date(r.created_at).getTime() : Date.now(),
-        cashier_id: r.cashier_id,
-        cashier_name: r.cashier_name || 'Cashier',
-        customer_id: r.customer_id || undefined,
-        customer_name: r.customer_name || 'Walk-in',
-        customer_phone: r.customer_phone || undefined,
-        device_id: r.device_id || 'SERVER-POS',
-        items: itemsBySale.get(r.id) || [],
-        subtotal: Number(r.subtotal) || 0,
-        discount_percent: Number(r.discount_percent) || 0,
-        discount_total: Number(r.discount_total) || 0,
-        tax_total: Number(r.tax_total) || 0,
-        total: Number(r.total) || 0,
-        cost_total: Number(r.cost_total) || 0,
-        gross_profit: Number(r.gross_profit) || 0,
-        payment_method: r.payment_method || 'Cash',
-        payment_reference: r.payment_reference || undefined,
-        amount_received: Number(r.amount_received) || 0,
-        change_given: Number(r.change_given) || 0,
-        status: r.status || 'completed',
-        void_reason: r.void_reason || undefined,
-        sync_status: 'synced',
-        retry_count: 0,
-        idempotency_key: r.idempotency_key || `key_${r.id}`,
-      }));
-
-      if (params?.page || params?.limit) {
-        return {
-          sales,
-          total,
-          page,
-          limit,
-          totalPages: Math.ceil(total / limit) || 1,
-        };
-      }
-      return sales;
-    }
-  } catch (err: any) {}
-
-  if (!isLocalMode && isSupabaseConfigured) {
-    try {
-      const { data, error } = await supabaseAdmin
-        .from('sales')
-        .select('*')
-        .order('created_at', { ascending: false })
-        .limit(100);
-      if (!error && data) return data as Sale[];
-    } catch (err) {}
+  const conditions: string[] = [];
+  const values: any[] = [];
+  if (params?.search?.trim()) {
+    values.push(`%${params.search.trim()}%`);
+    conditions.push(`(s.receipt_number ILIKE $${values.length} OR s.sale_number ILIKE $${values.length} OR s.payment_reference ILIKE $${values.length} OR c.name ILIKE $${values.length})`);
   }
+  if (params?.startDate) {
+    if (!DATE_RE.test(params.startDate)) throw new HttpError(400, 'startDate must be YYYY-MM-DD.');
+    values.push(params.startDate);
+    conditions.push(`s.date >= $${values.length}`);
+  }
+  if (params?.endDate) {
+    if (!DATE_RE.test(params.endDate)) throw new HttpError(400, 'endDate must be YYYY-MM-DD.');
+    values.push(params.endDate);
+    conditions.push(`s.date <= $${values.length}`);
+  }
+  if (params?.cashierId) {
+    values.push(requireUuid(params.cashierId, 'cashierId'));
+    conditions.push(`s.cashier_id = $${values.length}`);
+  }
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  const from = `FROM sales s LEFT JOIN users u ON s.cashier_id = u.id LEFT JOIN customers c ON s.customer_id = c.id`;
 
-  const inMemory = serverDb.get().sales;
+  const count = await pgPool.query(`SELECT COUNT(*)::int AS n ${from} ${where}`, values);
+  const rows = await pgPool.query(
+    `SELECT ${SALE_COLUMNS} ${from} ${where} ORDER BY s.created_at DESC, s.id DESC LIMIT $${values.length + 1} OFFSET $${values.length + 2}`,
+    [...values, limit, offset]
+  );
+  const sales = await hydrateSales(pgPool, rows.rows);
   if (params?.page || params?.limit) {
-    return {
-      sales: inMemory.slice(offset, offset + limit),
-      total: inMemory.length,
-      page,
-      limit,
-      totalPages: Math.ceil(inMemory.length / limit) || 1,
-    };
+    const total = count.rows[0].n;
+    return { sales, total, page, limit, totalPages: Math.ceil(total / limit) || 1 };
   }
-  return inMemory;
+  return sales;
 }
 
-export interface ProcessSaleOptions {
-  userRole?: string;
-  userId?: string;
+// =============================================================================
+// Checkout
+// =============================================================================
+export interface CheckoutItemInput {
+  medicine_id: string;
+  quantity: number;
+  /** Price list for this line; defaults to the sale's price_mode. */
+  price_mode?: PriceMode;
+  /** WHOLESALE sale, medicine without a wholesale price: cashier confirmed selling at retail. */
+  retail_fallback_confirmed?: boolean;
+  /** The price the cashier saw. Never used for charging; a mismatch is rejected (409). */
+  unit_price?: number;
 }
 
-export async function processSaleCheckout(
-  sale: Sale,
-  options?: ProcessSaleOptions
-): Promise<{ success: boolean; sale: Sale; duplicate?: boolean }> {
-  const store = serverDb.get();
-  const now = new Date();
-  const todayStr = now.toISOString().split('T')[0];
-  const timeStr = now.toLocaleTimeString();
+export interface CheckoutPaymentInput {
+  method: PaymentMethod;
+  amount_received?: number;
+  reference?: string;
+  split?: { method: string; amount: number; reference?: string }[];
+}
 
-  if (!Array.isArray(sale.items) || sale.items.length === 0) {
-    throw new Error('Sale must contain at least one item.');
+export interface CheckoutInput {
+  idempotency_key: string;
+  /** RETAIL (default) or WHOLESALE, chosen at the till. */
+  price_mode?: PriceMode;
+  items: CheckoutItemInput[];
+  discount_percent?: number;
+  customer_id?: string | null;
+  payment: CheckoutPaymentInput;
+}
+
+export function validateDiscount(value: unknown, role: UserRole): number {
+  if (value === undefined || value === null || value === '') return 0;
+  const d = Number(value);
+  if (typeof value === 'boolean' || !Number.isFinite(d)) throw new HttpError(400, 'Discount must be a number.');
+  if (d < 0) throw new HttpError(400, 'Discount cannot be negative.');
+  if (Math.round(d * 100) !== d * 100) throw new HttpError(400, 'Discount may have at most 2 decimal places.');
+  const max = role === 'ADMIN' ? ADMIN_MAX_DISCOUNT_PERCENT : CASHIER_MAX_DISCOUNT_PERCENT;
+  if (d > max) {
+    throw new HttpError(400, role === 'ADMIN' ? `Discount cannot exceed ${max}%.` : `Cashier discount cannot exceed ${max}%.`);
+  }
+  return d;
+}
+
+type NormalizedItem = { medicine_id: string; quantity: number; unit_price?: number; price_mode: PriceMode; retail_fallback_confirmed: boolean };
+
+function normalizeItems(items: unknown, saleMode: PriceMode): NormalizedItem[] {
+  if (!Array.isArray(items) || items.length === 0) throw new HttpError(400, 'A sale must contain at least one item.');
+  if (items.length > 200) throw new HttpError(400, 'Too many lines in one sale.');
+  const merged = new Map<string, NormalizedItem>();
+  for (const raw of items as any[]) {
+    const id = requireUuid(raw?.medicine_id, 'medicine_id');
+    const qty = Number(raw?.quantity);
+    if (!Number.isInteger(qty) || qty < 1 || qty > 100000) throw new HttpError(400, 'Each quantity must be a whole number of at least 1.');
+    const price = raw?.unit_price === undefined || raw?.unit_price === null ? undefined : Number(raw.unit_price);
+    if (price !== undefined && !Number.isFinite(price)) throw new HttpError(400, 'unit_price must be a number.');
+    const mode = raw?.price_mode === undefined ? saleMode : requirePriceMode(raw.price_mode, 'Item price_mode');
+    if (saleMode === 'RETAIL' && mode === 'WHOLESALE') throw new HttpError(400, 'A RETAIL sale cannot contain wholesale-priced lines.');
+    const fallback = raw?.retail_fallback_confirmed === true;
+    const existing = merged.get(id);
+    if (existing) {
+      if (existing.price_mode !== mode) throw new HttpError(400, 'The same medicine appears with two different price modes.');
+      existing.quantity += qty;
+      if (price !== undefined && existing.unit_price !== undefined && toCents(price) !== toCents(existing.unit_price)) {
+        throw new HttpError(400, 'The same medicine appears with two different prices.');
+      }
+    } else {
+      merged.set(id, { medicine_id: id, quantity: qty, unit_price: price, price_mode: mode, retail_fallback_confirmed: fallback });
+    }
+  }
+  return [...merged.values()];
+}
+
+interface PaymentPlan {
+  method: PaymentMethod;
+  reference: string | null;
+  amountReceivedCents: number;
+  changeCents: number;
+  rows: { method: string; amountCents: number; reference: string | null }[];
+}
+
+function planPayment(payment: CheckoutPaymentInput | undefined, totalCents: number): PaymentPlan {
+  const method = payment?.method;
+  if (!method || !PAYMENT_METHODS.includes(method)) {
+    throw new HttpError(400, `Payment method must be one of ${PAYMENT_METHODS.join(', ')}.`);
+  }
+  const ref = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim().toUpperCase().slice(0, 100) : null);
+
+  if (method === 'Cash') {
+    const received = toCents(Number(payment!.amount_received));
+    if (!Number.isFinite(received) || received < totalCents) {
+      throw new HttpError(400, `Cash received must be at least the sale total (${fromCents(totalCents).toFixed(2)}).`);
+    }
+    return { method, reference: null, amountReceivedCents: received, changeCents: received - totalCents, rows: [{ method: 'Cash', amountCents: totalCents, reference: null }] };
   }
 
-  // 1. Independent Server-Side Financial Calculations
-  // Calculate Subtotal from items
-  const calculatedSubtotal = sale.items.reduce((sum, item) => {
-    const qty = Number(item.quantity) || 0;
-    const price = Number(item.unit_price) || 0;
-    return sum + (qty * price);
-  }, 0);
-
-  const roundedSubtotal = Math.round(calculatedSubtotal * 100) / 100;
-
-  // Determine and Validate Discount Percentage
-  let discountPct = 0;
-  if (sale.discount_percent !== undefined && sale.discount_percent !== null) {
-    discountPct = Number(sale.discount_percent);
-  } else if (sale.discount_total && roundedSubtotal > 0) {
-    discountPct = Math.round((Number(sale.discount_total) / roundedSubtotal) * 10000) / 100;
+  if (method === 'Mixed') {
+    const split = payment!.split;
+    if (!Array.isArray(split) || split.length < 2) throw new HttpError(400, 'A split payment needs at least two parts.');
+    const rows = split.map((p) => {
+      if (!SPLIT_METHODS.includes(p?.method as any)) throw new HttpError(400, 'Split payment parts must be Cash, M-Pesa, Card or Bank.');
+      const amountCents = toCents(Number(p.amount));
+      if (!Number.isFinite(amountCents) || amountCents <= 0) throw new HttpError(400, 'Each split payment amount must be greater than zero.');
+      const reference = ref(p.reference);
+      if (p.method === 'M-Pesa' && (!reference || !MPESA_REF.test(reference))) {
+        throw new HttpError(400, 'The M-Pesa part of a split payment needs a valid transaction code.');
+      }
+      return { method: p.method, amountCents, reference };
+    });
+    const sum = rows.reduce((s, r) => s + r.amountCents, 0);
+    if (sum !== totalCents) {
+      throw new HttpError(400, `Split payments (${fromCents(sum).toFixed(2)}) must equal the sale total (${fromCents(totalCents).toFixed(2)}).`);
+    }
+    return { method, reference: null, amountReceivedCents: totalCents, changeCents: 0, rows };
   }
 
-  if (isNaN(discountPct) || discountPct < 0) {
-    throw new Error('Discount percentage cannot be negative.');
+  const reference = ref(payment!.reference);
+  if (method === 'M-Pesa' && (!reference || !MPESA_REF.test(reference))) {
+    throw new HttpError(400, 'A valid M-Pesa transaction code (6-20 letters/digits) is required.');
   }
+  return { method, reference, amountReceivedCents: totalCents, changeCents: 0, rows: [{ method, amountCents: totalCents, reference }] };
+}
 
-  // Strict RBAC Enforcement: Cashiers are strictly capped at 10% maximum discount
-  const userRole = options?.userRole || 'CASHIER';
-  if (userRole === 'CASHIER' && discountPct > 10) {
-    throw new Error('Cashier discount cannot exceed 10%.');
-  }
+/**
+ * Completes a sale in ONE PostgreSQL transaction. The browser only says what to sell; the server
+ * decides cashier (token), prices (medicines.selling_price), batches (FEFO, unexpired, active),
+ * discount limits, totals and payment validity. Any failure rolls everything back.
+ */
+export async function checkoutSale(
+  input: CheckoutInput,
+  actor: SaleActor
+): Promise<{ success: true; duplicate: boolean; sale: Sale; medicines: any[]; batches: any[] }> {
+  const key = typeof input?.idempotency_key === 'string' ? input.idempotency_key.trim() : '';
+  if (key.length < 8 || key.length > 255) throw new HttpError(400, 'idempotency_key (8-255 characters) is required.');
+  const saleMode = requirePriceMode(input?.price_mode, 'price_mode');
+  const items = normalizeItems(input?.items, saleMode);
+  const discountPct = validateDiscount(input?.discount_percent, actor.role);
+  const customerId = input?.customer_id ? requireUuid(input.customer_id, 'customer_id') : null;
 
-  if (discountPct > 100) {
-    throw new Error('Discount percentage cannot exceed 100%.');
-  }
+  return withTransaction(async (client) => {
+    // Serialize retries of the same checkout, then return the original sale if it already committed.
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [key]);
+    const existing = await client.query('SELECT id, cashier_id FROM sales WHERE idempotency_key = $1', [key]);
+    if (existing.rows[0]) {
+      if (existing.rows[0].cashier_id !== actor.user_id) throw new HttpError(409, 'This idempotency key belongs to another sale.');
+      const sale = (await getSaleById(existing.rows[0].id, client))!;
+      return { success: true as const, duplicate: true, sale, medicines: [], batches: [] };
+    }
 
-  // Calculate discount amount and final total with safe numeric precision
-  const discountAmount = Math.round((roundedSubtotal * discountPct) / 100 * 100) / 100;
-  const taxableSubtotal = Math.max(0, roundedSubtotal - discountAmount);
-  const taxTotal = sale.tax_total ? Math.round(Number(sale.tax_total) * 100) / 100 : 0;
-  const finalTotal = Math.round((taxableSubtotal + taxTotal) * 100) / 100;
+    const deviceId = await ensureDevice(client, actor.device_id, actor.user_id);
+    const { date: today, time: nowTime } = await businessNow(client);
 
-  // Validate amount received
-  const amountReceived = sale.payment_method === 'Cash'
-    ? (Number(sale.amount_received) >= finalTotal ? Number(sale.amount_received) : finalTotal)
-    : finalTotal;
-  const changeGiven = sale.payment_method === 'Cash' ? Math.max(0, Math.round((amountReceived - finalTotal) * 100) / 100) : 0;
+    if (customerId) {
+      const cust = await client.query('SELECT 1 FROM customers WHERE id = $1', [customerId]);
+      if (!cust.rows[0]) throw new HttpError(400, 'Customer not found.');
+    }
 
-  // Calculate cost and gross profit
-  let costTotal = 0;
-  for (const item of sale.items) {
-    const costPrice = Number(item.cost_price_snapshot) || Number(item.unit_price);
-    costTotal += (Number(item.quantity) || 0) * costPrice;
-  }
-  costTotal = Math.round(costTotal * 100) / 100;
-  const grossProfit = Math.round((finalTotal - costTotal) * 100) / 100;
+    // Lock medicines in a stable order (prevents deadlocks between concurrent checkouts).
+    const ids = items.map((i) => i.medicine_id).sort();
+    const medRes = await client.query(
+      `SELECT id, name, status, selling_price::float AS selling_price, wholesale_price::float AS wholesale_price,
+              purchase_price::float AS purchase_price
+       FROM medicines WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE`,
+      [ids]
+    );
+    const meds = new Map(medRes.rows.map((m) => [m.id, m]));
 
-  const processedSale: Sale = {
-    ...sale,
-    id: sale.id || `sal-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-    date: sale.date || todayStr,
-    time: sale.time || timeStr,
-    subtotal: roundedSubtotal,
-    discount_percent: discountPct,
-    discount_total: discountAmount,
-    tax_total: taxTotal,
-    total: finalTotal,
-    cost_total: costTotal,
-    gross_profit: grossProfit,
-    amount_received: amountReceived,
-    change_given: changeGiven,
-    sync_status: 'synced',
-  };
+    type Alloc = { medicine_id: string; batch: any; quantity: number; priceCents: number; costCents: number; priceMode: PriceMode };
+    const allocations: Alloc[] = [];
+    const priceChanges: { medicine_id: string; name: string; expected: number; current: number; price_mode: PriceMode }[] = [];
+    const missingWholesale: { medicine_id: string; name: string; retail_price: number }[] = [];
 
-  // 2. Check idempotency in PostgreSQL
-  try {
-    if (processedSale.idempotency_key) {
-      const existing = await pgPool.query(
-        `SELECT id, sale_number, receipt_number FROM sales WHERE idempotency_key = $1 LIMIT 1`,
-        [processedSale.idempotency_key]
+    for (const item of [...items].sort((a, b) => a.medicine_id.localeCompare(b.medicine_id))) {
+      const med = meds.get(item.medicine_id);
+      if (!med) throw new HttpError(404, `Medicine ${item.medicine_id} not found.`);
+      if (med.status !== 'active') throw new HttpError(409, `${med.name} is not active and cannot be sold.`);
+      // The price always comes from PostgreSQL, from the price list this line uses.
+      const hasWholesale = med.wholesale_price != null && Number(med.wholesale_price) > 0;
+      if (item.price_mode === 'WHOLESALE' && !hasWholesale) {
+        missingWholesale.push({ medicine_id: med.id, name: med.name, retail_price: med.selling_price });
+        continue;
+      }
+      if (saleMode === 'WHOLESALE' && item.price_mode === 'RETAIL') {
+        if (hasWholesale) throw new HttpError(400, `${med.name} has a wholesale price; a wholesale sale must use it.`);
+        if (!item.retail_fallback_confirmed) {
+          missingWholesale.push({ medicine_id: med.id, name: med.name, retail_price: med.selling_price });
+          continue;
+        }
+      }
+      const unitPrice = item.price_mode === 'WHOLESALE' ? Number(med.wholesale_price) : med.selling_price;
+      const priceCents = toCents(unitPrice);
+      if (priceCents <= 0) throw new HttpError(409, `${med.name} has no valid ${item.price_mode.toLowerCase()} price.`);
+      if (item.unit_price !== undefined && toCents(item.unit_price) !== priceCents) {
+        priceChanges.push({ medicine_id: med.id, name: med.name, expected: item.unit_price, current: unitPrice, price_mode: item.price_mode });
+        continue;
+      }
+
+      // FEFO over sellable stock: active, quantity > 0, not expired (expires ON its date). Unknown expiry last.
+      const batches = await client.query(
+        `SELECT * FROM medicine_batches
+         WHERE medicine_id = $1 AND status = 'active' AND quantity_available > 0
+           AND (expiry_date IS NULL OR expiry_date > $2::date)
+         ORDER BY expiry_date ASC NULLS LAST, created_at ASC, id ASC
+         FOR UPDATE`,
+        [med.id, today]
       );
-      if (existing.rows && existing.rows.length > 0) {
-        return { success: true, sale: { ...processedSale, id: existing.rows[0].id }, duplicate: true };
+      const sellable = batches.rows.reduce((s, b) => s + Number(b.quantity_available), 0);
+      if (sellable < item.quantity) {
+        const expired = await client.query(
+          `SELECT COALESCE(SUM(quantity_available), 0)::int AS qty FROM medicine_batches
+           WHERE medicine_id = $1 AND quantity_available > 0 AND expiry_date IS NOT NULL AND expiry_date <= $2::date`,
+          [med.id, today]
+        );
+        const expiredQty = Number(expired.rows[0].qty) || 0;
+        throw new HttpError(
+          409,
+          `Insufficient sellable stock for ${med.name}: requested ${item.quantity}, available ${sellable}` +
+            (expiredQty > 0 ? ` (${expiredQty} more units are EXPIRED and cannot be sold).` : '.')
+        );
+      }
+      let remaining = item.quantity;
+      for (const b of batches.rows) {
+        if (remaining === 0) break;
+        const take = Math.min(remaining, Number(b.quantity_available));
+        const cost = Number(b.purchase_price) > 0 ? Number(b.purchase_price) : Number(med.purchase_price) || 0;
+        allocations.push({ medicine_id: med.id, batch: b, quantity: take, priceCents, costCents: toCents(cost), priceMode: item.price_mode });
+        remaining -= take;
       }
     }
 
-    // 3. Perform ACID transaction on local PostgreSQL
-    const client = await pgPool.connect();
-    try {
-      await client.query('BEGIN');
-
-      // Insert Sale with discount_percent
-      await client.query(`
-        INSERT INTO sales (
-          id, sale_number, receipt_number, cashier_id, customer_id,
-          device_id, date, time, subtotal, discount_percent, discount_total, tax_total,
-          total, cost_total, gross_profit, payment_method, payment_reference,
-          amount_received, change_given, status, idempotency_key, sync_status
-        ) VALUES (
-          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22
-        )
-      `, [
-        processedSale.id, processedSale.sale_number, processedSale.receipt_number,
-        processedSale.cashier_id || '00000000-0000-0000-0000-000000000099',
-        processedSale.customer_id || null, processedSale.device_id || 'SERVER-POS',
-        processedSale.date, processedSale.time, processedSale.subtotal,
-        processedSale.discount_percent || 0, processedSale.discount_total || 0, processedSale.tax_total || 0,
-        processedSale.total, processedSale.cost_total || 0, processedSale.gross_profit || 0,
-        processedSale.payment_method, processedSale.payment_reference || null,
-        processedSale.amount_received, processedSale.change_given || 0,
-        processedSale.status || 'completed', processedSale.idempotency_key, 'synced'
-      ]);
-
-      // Insert Sale Items and Deduct FEFO Batch Stock
-      if (Array.isArray(processedSale.items)) {
-        for (const item of processedSale.items) {
-          const itemDiscount = (Number(item.unit_price) * (processedSale.discount_percent || 0)) / 100;
-          const itemTotal = Math.round((Number(item.quantity) * Number(item.unit_price) * (1 - (processedSale.discount_percent || 0) / 100)) * 100) / 100;
-
-          await client.query(`
-            INSERT INTO sale_items (
-              sale_id, medicine_id, batch_id, batch_number, expiry_date,
-              quantity, unit_price, discount, cost_price_snapshot, total
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-          `, [
-            processedSale.id, item.medicine_id, item.batch_id, item.batch_number,
-            item.expiry_date || null, item.quantity, item.unit_price,
-            itemDiscount, item.cost_price_snapshot || item.unit_price, itemTotal
-          ]);
-
-          // Deduct batch stock
-          await client.query(`
-            UPDATE medicine_batches 
-            SET quantity_available = GREATEST(0, quantity_available - $1),
-                status = CASE WHEN (quantity_available - $1) <= 0 THEN 'exhausted' ELSE status END,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = $2
-          `, [item.quantity, item.batch_id]);
-
-          // Record Inventory Movement
-          await client.query(`
-            INSERT INTO inventory_movements (
-              medicine_id, batch_id, previous_quantity, adjustment_quantity,
-              new_quantity, movement_type, reason, reference_id, user_id, device_id, date, timestamp
-            ) VALUES (
-              $1, $2, 0, -$3, 0, 'SALE', 'sale', $4, $5, $6, $7, $8
-            )
-          `, [
-            item.medicine_id, item.batch_id, item.quantity,
-            processedSale.receipt_number,
-            processedSale.cashier_id || '00000000-0000-0000-0000-000000000099',
-            processedSale.device_id || 'SERVER-POS',
-            processedSale.date, Date.now()
-          ]);
-        }
-      }
-
-      // Insert Payments (support single payment method or split payments)
-      if (processedSale.split_payments && processedSale.split_payments.length > 0) {
-        for (const sp of processedSale.split_payments) {
-          await client.query(`
-            INSERT INTO payments (sale_id, method, amount, reference)
-            VALUES ($1, $2, $3, $4)
-          `, [
-            processedSale.id, sp.method, sp.amount, sp.reference || null
-          ]);
-        }
-      } else {
-        await client.query(`
-          INSERT INTO payments (sale_id, method, amount, reference)
-          VALUES ($1, $2, $3, $4)
-        `, [
-          processedSale.id, processedSale.payment_method, processedSale.total,
-          processedSale.payment_reference || null
-        ]);
-      }
-
-      // Update Customer Total Spend
-      if (processedSale.customer_id) {
-        await client.query(`
-          UPDATE customers 
-          SET total_spent = total_spent + $1, last_visit = CURRENT_TIMESTAMP 
-          WHERE id = $2
-        `, [processedSale.total, processedSale.customer_id]);
-      }
-
-      await client.query('COMMIT');
-    } catch (txErr) {
-      await client.query('ROLLBACK');
-      throw txErr;
-    } finally {
-      client.release();
+    if (missingWholesale.length > 0) {
+      throw Object.assign(
+        new HttpError(
+          409,
+          `No wholesale price is set for ${missingWholesale.map((m) => m.name).join(', ')}. ` +
+            'Confirm selling at the retail price, or ask an Administrator to set a wholesale price.'
+        ),
+        { code: 'WHOLESALE_PRICE_MISSING', details: missingWholesale }
+      );
     }
-  } catch (pgErr: any) {
-    if (pgErr?.message?.includes('Cashier discount cannot exceed 10%')) {
-      throw pgErr;
+
+    if (priceChanges.length > 0) {
+      throw Object.assign(
+        new HttpError(409, `Price changed for ${priceChanges.map((p) => p.name).join(', ')}. Refresh the cart and confirm the current price.`),
+        { code: 'PRICE_CHANGED', details: priceChanges }
+      );
     }
-    // Fallback if PostgreSQL is offline
-  }
 
-  // Update in-memory fallback store
-  store.sales.unshift(processedSale);
-  if (processedSale.idempotency_key) {
-    store.processed_idempotency_keys[processedSale.idempotency_key] = processedSale.id;
-  }
-  serverDb.persist();
+    // Per-line discount derived from the single sale-level percentage, so line totals always add
+    // up exactly to the sale total that is charged.
+    let subtotalCents = 0;
+    let discountCents = 0;
+    let costCents = 0;
+    const lines = allocations.map((a) => {
+      const lineSubtotal = a.priceCents * a.quantity;
+      const lineDiscount = Math.round((lineSubtotal * discountPct) / 100);
+      subtotalCents += lineSubtotal;
+      discountCents += lineDiscount;
+      costCents += a.costCents * a.quantity;
+      return { ...a, lineSubtotal, lineDiscount, lineTotal: lineSubtotal - lineDiscount };
+    });
+    const netCents = subtotalCents - discountCents;
 
-  return { success: true, sale: processedSale };
+    const settings = await client.query('SELECT tax_enabled, tax_rate::float AS tax_rate FROM settings ORDER BY updated_at DESC NULLS LAST LIMIT 1');
+    const tax = settings.rows[0];
+    const taxCents = tax?.tax_enabled ? Math.round((netCents * (Number(tax.tax_rate) || 0)) / 100) : 0;
+    const totalCents = netCents + taxCents;
+    const payment = planPayment(input?.payment, totalCents);
+
+    const seq = await client.query(`SELECT nextval('sale_receipt_seq') AS n`);
+    const serial = String(seq.rows[0].n).padStart(6, '0');
+    const ymd = today.replace(/-/g, '');
+    const saleId = crypto.randomUUID();
+    const receiptNumber = `RCP-${ymd}-${serial}`;
+
+    await client.query(
+      `INSERT INTO sales (
+         id, sale_number, receipt_number, cashier_id, customer_id, device_id, date, time,
+         subtotal, discount_percent, discount_total, tax_total, total, cost_total, gross_profit,
+         payment_method, payment_reference, amount_received, change_given, status, idempotency_key, sync_status, price_mode
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,'completed',$20,'synced',$21)`,
+      [
+        saleId, `SALE-${ymd}-${serial}`, receiptNumber, actor.user_id, customerId, deviceId, today, nowTime,
+        fromCents(subtotalCents), discountPct, fromCents(discountCents), fromCents(taxCents), fromCents(totalCents),
+        fromCents(costCents), fromCents(netCents - costCents),
+        payment.method, payment.reference, fromCents(payment.amountReceivedCents), fromCents(payment.changeCents), key,
+        saleMode,
+      ]
+    );
+
+    const touchedBatches = new Map<string, any>();
+    for (const l of lines) {
+      await client.query(
+        `INSERT INTO sale_items (id, sale_id, medicine_id, batch_id, batch_number, expiry_date,
+           quantity, unit_price, discount, cost_price_snapshot, total, price_mode)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+        [
+          crypto.randomUUID(), saleId, l.medicine_id, l.batch.id, l.batch.batch_number, l.batch.expiry_date,
+          l.quantity, fromCents(l.priceCents), fromCents(l.lineDiscount), fromCents(l.costCents), fromCents(l.lineTotal),
+          l.priceMode,
+        ]
+      );
+      const prev = Number(l.batch.quantity_available);
+      const next = prev - l.quantity;
+      const upd = await client.query(
+        `UPDATE medicine_batches SET quantity_available = $1, status = $2, updated_at = CURRENT_TIMESTAMP
+         WHERE id = $3 RETURNING *`,
+        [next, deriveBatchStatus(next, l.batch.expiry_date, l.batch.status), l.batch.id]
+      );
+      l.batch.quantity_available = next;
+      touchedBatches.set(l.batch.id, upd.rows[0]);
+      await insertMovement(
+        client,
+        {
+          medicine_id: l.medicine_id,
+          batch_id: l.batch.id,
+          previous_quantity: prev,
+          new_quantity: next,
+          movement_type: 'SALE',
+          reason: 'SALE',
+          reference_id: receiptNumber,
+          notes: `Sold on receipt ${receiptNumber}`,
+        },
+        actor,
+        deviceId
+      );
+    }
+
+    for (const p of payment.rows) {
+      await client.query(
+        `INSERT INTO payments (id, sale_id, method, amount, reference) VALUES ($1, $2, $3, $4, $5)`,
+        [crypto.randomUUID(), saleId, p.method, fromCents(p.amountCents), p.reference]
+      );
+    }
+
+    if (customerId) {
+      await client.query(
+        `UPDATE customers SET total_spent = COALESCE(total_spent, 0) + $1, last_visit = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+        [fromCents(totalCents), customerId]
+      );
+    }
+
+    const medicines = [];
+    for (const id of ids) medicines.push(toMedicineStockDto(await reconcileMedicineStock(client, id)));
+
+    await recordAuditLog(
+      {
+        user_id: actor.user_id,
+        user_name: actor.user_name,
+        role: actor.role,
+        device_id: deviceId,
+        action: 'SALE_COMPLETED',
+        entity: 'sale',
+        entity_id: saleId,
+        new_value: {
+          receipt_number: receiptNumber,
+          price_mode: saleMode,
+          subtotal: fromCents(subtotalCents),
+          discount_percent: discountPct,
+          discount_total: fromCents(discountCents),
+          tax_total: fromCents(taxCents),
+          total: fromCents(totalCents),
+          payment_method: payment.method,
+          lines: lines.length,
+        },
+      },
+      client
+    );
+
+    const sale = (await getSaleById(saleId, client))!;
+    return {
+      success: true as const,
+      duplicate: false,
+      sale,
+      medicines,
+      batches: [...touchedBatches.values()].map((b) => toBatchDto(b)),
+    };
+  });
 }
 
+// =============================================================================
+// Void (explicit reversal; never re-runs checkout, never deletes history)
+// =============================================================================
+export async function voidSale(saleIdRaw: string, reasonRaw: unknown, actor: SaleActor) {
+  const saleId = requireUuid(saleIdRaw, 'sale id');
+  const reason = typeof reasonRaw === 'string' ? reasonRaw.trim().slice(0, 1000) : '';
+  if (!reason) throw new HttpError(400, 'A void reason is required.');
+
+  return withTransaction(async (client) => {
+    const found = await client.query('SELECT * FROM sales WHERE id = $1 FOR UPDATE', [saleId]);
+    const sale = found.rows[0];
+    if (!sale) throw new HttpError(404, 'Sale not found.');
+    if (sale.status === 'voided') throw new HttpError(409, 'This sale is already voided.');
+    if (sale.status !== 'completed') throw new HttpError(409, `A sale with status "${sale.status}" cannot be voided.`);
+    if (String(sale.idempotency_key).startsWith('LEGACY-')) {
+      throw new HttpError(409, 'Imported legacy sales cannot be voided. Record a return instead.');
+    }
+    const hasReturns = await client.query('SELECT 1 FROM returns WHERE sale_id = $1 LIMIT 1', [saleId]);
+    if (hasReturns.rows[0]) throw new HttpError(409, 'This sale already has returns; process the remaining items as returns instead of a void.');
+
+    const deviceId = await ensureDevice(client, actor.device_id, actor.user_id);
+    const items = await client.query(
+      'SELECT * FROM sale_items WHERE sale_id = $1 ORDER BY batch_id, id',
+      [saleId]
+    );
+
+    const touched = new Map<string, any>();
+    const medicineIds = new Set<string>();
+    for (const it of items.rows) {
+      const qty = Number(it.quantity);
+      if (qty <= 0) continue;
+      const b = await client.query('SELECT * FROM medicine_batches WHERE id = $1 FOR UPDATE', [it.batch_id]);
+      const batch = b.rows[0];
+      if (!batch) throw new HttpError(409, `Batch ${it.batch_number} of this sale no longer exists.`);
+      const prev = Number(batch.quantity_available);
+      const next = prev + qty;
+      // Status re-derived: stock returned to an expired batch stays quarantined (not sellable).
+      const status = deriveBatchStatus(next, batch.expiry_date, batch.status === 'exhausted' ? 'active' : batch.status);
+      const upd = await client.query(
+        'UPDATE medicine_batches SET quantity_available = $1, status = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3 RETURNING *',
+        [next, status, batch.id]
+      );
+      touched.set(batch.id, upd.rows[0]);
+      medicineIds.add(it.medicine_id);
+      await insertMovement(
+        client,
+        {
+          medicine_id: it.medicine_id,
+          batch_id: batch.id,
+          previous_quantity: prev,
+          new_quantity: next,
+          movement_type: 'VOID_REVERSAL',
+          reason: 'SALE_VOID',
+          reference_id: sale.receipt_number,
+          notes: `Void of receipt ${sale.receipt_number}: ${reason}`.slice(0, 1000),
+        },
+        actor,
+        deviceId
+      );
+    }
+
+    await client.query(
+      `UPDATE sales SET status = 'voided', void_reason = $1, voided_by = $2 WHERE id = $3`,
+      [reason, actor.user_id, saleId]
+    );
+    if (sale.customer_id) {
+      await client.query(
+        'UPDATE customers SET total_spent = GREATEST(0, COALESCE(total_spent, 0) - $1), updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+        [sale.total, sale.customer_id]
+      );
+    }
+    const medicines = [];
+    for (const id of medicineIds) medicines.push(toMedicineStockDto(await reconcileMedicineStock(client, id)));
+
+    await recordAuditLog(
+      {
+        user_id: actor.user_id,
+        user_name: actor.user_name,
+        role: actor.role,
+        device_id: deviceId,
+        action: 'SALE_VOIDED',
+        entity: 'sale',
+        entity_id: saleId,
+        previous_value: { status: sale.status, total: Number(sale.total) },
+        new_value: { status: 'voided', void_reason: reason, receipt_number: sale.receipt_number },
+      },
+      client
+    );
+
+    return {
+      success: true,
+      sale: (await getSaleById(saleId, client))!,
+      medicines,
+      batches: [...touched.values()].map((b) => toBatchDto(b)),
+    };
+  });
+}
+
+// =============================================================================
+// Daily summary (PostgreSQL aggregation, Africa/Nairobi business day)
+// =============================================================================
 export interface TodaySalesSummary {
+  date: string;
+  scope: 'cashier' | 'all';
   totalSales: number;
   cashTotal: number;
   mpesaTotal: number;
+  otherTotal: number;
   transactionCount: number;
+  discountTotal: number;
   refundsTotal: number;
-  date: string;
+  netSales: number;
+  voidedCount: number;
+  /** Gross profit of today's non-voided sales (ADMIN only; removed for Cashiers by the route). */
+  grossProfit?: number;
 }
 
-export async function getTodaySalesSummary(options?: {
-  cashierId?: string;
-  role?: string;
-}): Promise<TodaySalesSummary> {
-  const now = new Date();
-  const todayStr = now.toISOString().split('T')[0];
+/**
+ * totalSales = final (discounted) totals of today's non-voided sales. Cash/M-Pesa come from the
+ * payments table (split payments counted per part). Refunds are reported separately and netSales
+ * = totalSales - refundsTotal. Day boundaries are Africa/Nairobi via PostgreSQL.
+ */
+export async function getTodaySalesSummary(options: { cashierId?: string }): Promise<TodaySalesSummary> {
+  const cashierId = options.cashierId ? requireUuid(options.cashierId, 'cashierId') : null;
+  const { date: today } = await businessNow();
+  const params: any[] = [today];
+  const cashierFilter = cashierId ? (params.push(cashierId), `AND s.cashier_id = $2`) : '';
 
-  try {
-    const cashierFilter = options?.cashierId ? `AND s.cashier_id::text = $1` : '';
-    const params = options?.cashierId ? [options.cashierId] : [];
+  const totals = await pgPool.query(
+    `SELECT COALESCE(SUM(s.total) FILTER (WHERE s.status <> 'voided'), 0)::numeric AS total_sales,
+            COALESCE(SUM(s.discount_total) FILTER (WHERE s.status <> 'voided'), 0)::numeric AS discount_total,
+            COALESCE(SUM(s.gross_profit) FILTER (WHERE s.status <> 'voided'), 0)::numeric AS gross_profit,
+            COUNT(*) FILTER (WHERE s.status <> 'voided')::int AS txn,
+            COUNT(*) FILTER (WHERE s.status = 'voided')::int AS voided
+     FROM sales s WHERE s.date = $1::date ${cashierFilter}`,
+    params
+  );
+  const pays = await pgPool.query(
+    `SELECT p.method, COALESCE(SUM(p.amount), 0)::numeric AS amount
+     FROM payments p JOIN sales s ON p.sale_id = s.id
+     WHERE s.date = $1::date AND s.status <> 'voided' ${cashierFilter}
+     GROUP BY p.method`,
+    params
+  );
+  const refundFilter = cashierId ? `AND r.user_id = $2` : '';
+  const refunds = await pgPool.query(
+    `SELECT COALESCE(SUM(r.refund_amount), 0)::numeric AS refunds
+     FROM returns r WHERE (r.created_at AT TIME ZONE 'Africa/Nairobi')::date = $1::date ${refundFilter}`,
+    params
+  );
 
-    // 1. Overall Sales Aggregate for Today (excluding voided sales)
-    const salesAggRes = await pgPool.query(`
-      SELECT 
-        COALESCE(SUM(s.total), 0)::float as total_sales,
-        COUNT(s.id)::int as transaction_count
-      FROM sales s
-      WHERE s.date = CURRENT_DATE
-        AND s.status != 'voided'
-        ${cashierFilter}
-    `, params);
-
-    const totalSales = Number(salesAggRes.rows[0]?.total_sales) || 0;
-    const transactionCount = Number(salesAggRes.rows[0]?.transaction_count) || 0;
-
-    // 2. Payments Breakdown (Cash vs M-Pesa canonical recognition)
-    const paymentsRes = await pgPool.query(`
-      SELECT 
-        p.method,
-        COALESCE(SUM(p.amount), 0)::float as amount
-      FROM payments p
-      JOIN sales s ON p.sale_id = s.id
-      WHERE s.date = CURRENT_DATE
-        AND s.status != 'voided'
-        ${cashierFilter}
-      GROUP BY p.method
-    `, params);
-
-    let cashTotal = 0;
-    let mpesaTotal = 0;
-
-    for (const row of paymentsRes.rows) {
-      const method = (row.method || '').toLowerCase().trim();
-      const amount = Number(row.amount) || 0;
-
-      if (method.includes('cash')) {
-        cashTotal += amount;
-      } else if (method.includes('mpesa') || method.includes('m-pesa') || method.includes('m_pesa')) {
-        mpesaTotal += amount;
-      }
-    }
-
-    // 3. Refunds for Today
-    const refundCashierFilter = options?.cashierId ? `AND r.user_id::text = $1` : '';
-    const refundsRes = await pgPool.query(`
-      SELECT COALESCE(SUM(r.refund_amount), 0)::float as refunds_total
-      FROM returns r
-      WHERE r.created_at::date = CURRENT_DATE
-        ${refundCashierFilter}
-    `, params);
-
-    const refundsTotal = Number(refundsRes.rows[0]?.refunds_total) || 0;
-
-    return {
-      totalSales: Math.round(totalSales * 100) / 100,
-      cashTotal: Math.round(cashTotal * 100) / 100,
-      mpesaTotal: Math.round(mpesaTotal * 100) / 100,
-      transactionCount,
-      refundsTotal: Math.round(refundsTotal * 100) / 100,
-      date: todayStr,
-    };
-  } catch (err) {
-    // Fallback to in-memory calculations if PostgreSQL not available
-    const store = serverDb.get();
-    const todaySales = store.sales.filter((s) => {
-      if (s.date !== todayStr) return false;
-      if (s.status === 'voided') return false;
-      if (options?.cashierId && s.cashier_id !== options.cashierId) return false;
-      return true;
-    });
-
-    let totalSales = 0;
-    let cashTotal = 0;
-    let mpesaTotal = 0;
-
-    for (const s of todaySales) {
-      totalSales += s.total;
-      const method = (s.payment_method || '').toLowerCase().trim();
-      if (method.includes('cash')) {
-        cashTotal += s.total;
-      } else if (method.includes('mpesa') || method.includes('m-pesa') || method.includes('m_pesa')) {
-        mpesaTotal += s.total;
-      } else if (method === 'mixed' && s.split_payments) {
-        for (const sp of s.split_payments) {
-          const spMethod = (sp.method || '').toLowerCase().trim();
-          if (spMethod.includes('cash')) cashTotal += sp.amount;
-          else if (spMethod.includes('mpesa') || spMethod.includes('m-pesa')) mpesaTotal += sp.amount;
-        }
-      }
-    }
-
-    const todayReturns = store.customer_returns.filter((r) => {
-      if (r.date !== todayStr) return false;
-      if (options?.cashierId && r.user_id !== options.cashierId) return false;
-      return true;
-    });
-    const refundsTotal = todayReturns.reduce((sum, r) => sum + (r.refund_amount || 0), 0);
-
-    return {
-      totalSales: Math.round(totalSales * 100) / 100,
-      cashTotal: Math.round(cashTotal * 100) / 100,
-      mpesaTotal: Math.round(mpesaTotal * 100) / 100,
-      transactionCount: todaySales.length,
-      refundsTotal: Math.round(refundsTotal * 100) / 100,
-      date: todayStr,
-    };
+  let cash = 0;
+  let mpesa = 0;
+  let other = 0;
+  for (const row of pays.rows) {
+    const cents = toCents(row.amount);
+    const m = String(row.method || '').toLowerCase().replace(/[\s_-]/g, '');
+    if (m === 'cash') cash += cents;
+    else if (m === 'mpesa') mpesa += cents;
+    else other += cents;
   }
+  const totalSales = toCents(totals.rows[0].total_sales);
+  const refundCents = toCents(refunds.rows[0].refunds);
+  return {
+    date: today,
+    scope: cashierId ? 'cashier' : 'all',
+    totalSales: fromCents(totalSales),
+    cashTotal: fromCents(cash),
+    mpesaTotal: fromCents(mpesa),
+    otherTotal: fromCents(other),
+    transactionCount: Number(totals.rows[0].txn) || 0,
+    discountTotal: fromCents(toCents(totals.rows[0].discount_total)),
+    refundsTotal: fromCents(refundCents),
+    netSales: fromCents(totalSales - refundCents),
+    voidedCount: Number(totals.rows[0].voided) || 0,
+    grossProfit: fromCents(toCents(totals.rows[0].gross_profit)),
+  };
 }
 

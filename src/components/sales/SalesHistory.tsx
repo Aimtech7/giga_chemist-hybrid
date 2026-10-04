@@ -13,16 +13,14 @@ import {
   Lock,
   UserCheck,
 } from 'lucide-react';
-import { db, getDeviceId } from '../../db/dexie';
-import { executeStockMovement } from '../../services/inventoryEngine';
+import { db } from '../../db/dexie';
 import { isExpired, normalizeExpiryDate } from '../../utils/expiry';
 import { downloadCSV } from '../../services/exportUtils';
 import { ReceiptModal } from '../pos/ReceiptModal';
 import { canViewCostData, isCashier, isAdmin, isManager } from '../../services/permissions';
-import { enqueueSyncItem, runSync } from '../../services/syncEngine';
-import { apiUrl } from '../../services/api';
 import type { Sale, CustomerReturn, ReturnAction, PharmacySettings, User, SaleItem } from '../../types';
 import { apiFetch } from '../../services/http';
+import { applyServerStockResult, refreshCacheAfterCommit } from '../../services/stockCache';
 
 interface SalesHistoryProps {
   currentUser: User | null;
@@ -66,11 +64,11 @@ export const SalesHistory: React.FC<SalesHistoryProps> = ({ currentUser, setting
   const [returnAction, setReturnAction] = useState<ReturnAction>('return_to_stock');
   const [isProcessingReturn, setIsProcessingReturn] = useState(false);
   const [returnSuccess, setReturnSuccess] = useState<string | null>(null);
+  const [returnError, setReturnError] = useState<string | null>(null);
 
   // Void modal state with Supervisor Authorization
   const [voidingSale, setVoidingSale] = useState<Sale | null>(null);
   const [voidReason, setVoidReason] = useState<string>('');
-  const [supervisorPin, setSupervisorPin] = useState<string>('');
   const [supervisorError, setSupervisorError] = useState<string | null>(null);
 
   // Totals are aggregated by PostgreSQL (server decides Cashier vs Admin scope from the token).
@@ -104,38 +102,26 @@ export const SalesHistory: React.FC<SalesHistoryProps> = ({ currentUser, setting
 
   const handleOpenReturn = async (s: Sale) => {
     setReturnSale(s);
-    
-    // Query existing returns for this sale to enforce over-return protection
-    const existingReturns = await db.customer_returns.where('sale_id').equals(s.id).toArray();
+    setReturnError(null);
+
+    // Already-returned quantities come from the server (sale.returned_items); the server re-checks them.
     const qtyMap: Record<string, number> = {};
-    for (const ret of existingReturns) {
+    for (const ret of s.returned_items || []) {
       const key = `${ret.medicine_id}_${ret.batch_id}`;
       qtyMap[key] = (qtyMap[key] || 0) + ret.quantity;
     }
     setItemReturnedQtyMap(qtyMap);
 
     if (s.items.length > 0) {
-      const firstItem = s.items[0];
-      setSelectedItemToReturn(firstItem);
-      
-      const key = `${firstItem.medicine_id}_${firstItem.batch_id}`;
-      const alreadyReturned = qtyMap[key] || 0;
-      const maxAvailable = Math.max(1, firstItem.quantity - alreadyReturned);
-      setReturnQty(Math.min(1, maxAvailable));
-
-      const batch = await db.medicine_batches.get(firstItem.batch_id);
-      const expired = batch ? isExpired(batch.expiry_date) : isExpired(firstItem.expiry_date);
-      setIsCurrentBatchExpired(expired);
-      setReturnAction(expired ? 'quarantine' : 'return_to_stock');
+      await handleItemSelectFor(s.items[0], qtyMap);
     }
     setReturnReason('');
   };
 
-  const handleItemSelect = async (item: SaleItem) => {
+  const handleItemSelectFor = async (item: SaleItem, qtyMap: Record<string, number>) => {
     setSelectedItemToReturn(item);
     const key = `${item.medicine_id}_${item.batch_id}`;
-    const alreadyReturned = itemReturnedQtyMap[key] || 0;
-    const maxAvailable = Math.max(0, item.quantity - alreadyReturned);
+    const maxAvailable = Math.max(0, item.quantity - (qtyMap[key] || 0));
     setReturnQty(maxAvailable > 0 ? 1 : 0);
 
     const batch = await db.medicine_batches.get(item.batch_id);
@@ -144,218 +130,63 @@ export const SalesHistory: React.FC<SalesHistoryProps> = ({ currentUser, setting
     setReturnAction(expired ? 'quarantine' : 'return_to_stock');
   };
 
+  const handleItemSelect = (item: SaleItem) => handleItemSelectFor(item, itemReturnedQtyMap);
+
+  // Returns are processed by the server in ONE PostgreSQL transaction: refund = discounted amount
+  // actually paid, stock restored only for sellable (unexpired) batches, movement + audit written.
   const handleProcessReturn = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!returnSale || !selectedItemToReturn || !currentUser) return;
+    setReturnError(null);
 
     const key = `${selectedItemToReturn.medicine_id}_${selectedItemToReturn.batch_id}`;
-    const alreadyReturned = itemReturnedQtyMap[key] || 0;
-    const maxReturnable = selectedItemToReturn.quantity - alreadyReturned;
-
-    if (returnQty <= 0 || returnQty > maxReturnable) {
-      alert(`Invalid return quantity. Max returnable remaining for this item is ${maxReturnable}.`);
+    const maxReturnable = selectedItemToReturn.quantity - (itemReturnedQtyMap[key] || 0);
+    if (!Number.isInteger(returnQty) || returnQty <= 0 || returnQty > maxReturnable) {
+      setReturnError(`Invalid return quantity. At most ${maxReturnable} unit(s) of this item can still be returned.`);
       return;
     }
-
     if (!returnReason.trim()) {
-      alert('Return reason required.');
+      setReturnError('A return reason is required.');
       return;
     }
 
     setIsProcessingReturn(true);
     try {
-      const deviceId = await getDeviceId();
-      const now = new Date();
-      const todayStr = now.toISOString().split('T')[0];
+      const result = await apiFetch<{
+        return: CustomerReturn;
+        refund_amount: number;
+        sale: Sale;
+        medicine: any;
+        batch: any;
+      }>('/api/returns', {
+        body: {
+          sale_id: returnSale.id,
+          medicine_id: selectedItemToReturn.medicine_id,
+          batch_id: selectedItemToReturn.batch_id,
+          quantity: returnQty,
+          reason: returnReason.trim(),
+          action: returnAction,
+        },
+      });
 
-      // Accurate refund accounting for discounts:
-      // net unit price = total charged for line item / original quantity
-      const effectiveUnitPrice = selectedItemToReturn.total / selectedItemToReturn.quantity;
-      const refundAmount = returnQty * effectiveUnitPrice;
-      const discountProrated = (selectedItemToReturn.discount || 0) * (returnQty / selectedItemToReturn.quantity);
-
-      // Verify batch expiry state for return action safety
-      const targetBatch = await db.medicine_batches.get(selectedItemToReturn.batch_id);
-      const isBatchExpired = targetBatch ? isExpired(targetBatch.expiry_date, now) : isExpired(selectedItemToReturn.expiry_date, now);
-      
-      let finalAction: ReturnAction = returnAction;
-      if (returnAction === 'return_to_stock' && isBatchExpired) {
-        finalAction = 'quarantine';
-      }
-
-      const idempotencyKey = `RET-${deviceId}-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-      const customerReturn: CustomerReturn = {
-        id: `ret-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-        sale_id: returnSale.id,
-        receipt_number: returnSale.receipt_number,
-        medicine_id: selectedItemToReturn.medicine_id,
-        medicine_name: selectedItemToReturn.medicine_name,
-        batch_id: selectedItemToReturn.batch_id,
-        batch_number: selectedItemToReturn.batch_number,
-        quantity: returnQty,
-        unit_price: selectedItemToReturn.unit_price,
-        discount_amount: discountProrated,
-        effective_unit_price: effectiveUnitPrice,
-        refund_amount: refundAmount,
-        cost_price_snapshot: selectedItemToReturn.cost_price_snapshot,
-        payment_method: returnSale.payment_method,
-        reason: returnReason.trim(),
-        action: finalAction,
-        user_id: currentUser.id,
-        user_name: currentUser.name,
-        device_id: deviceId,
-        date: todayStr,
-        timestamp: Date.now(),
-        sync_status: 'pending',
-        idempotency_key: idempotencyKey,
-      };
-
-      // Atomic Dexie Transaction for Return Processing
-      await db.transaction(
-        'rw',
-        [
-          db.customer_returns,
-          db.sales,
-          db.customers,
-          db.medicines,
-          db.medicine_batches,
-          db.inventory_movements,
-          db.audit_logs,
-          db.pending_sync,
-        ],
-        async () => {
-          // 1. Record Return Entry
-          await db.customer_returns.put(customerReturn);
-
-          // 2. Enqueue Canonical Sync Item
-          await db.pending_sync.put({
-            id: `sync_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-            local_id: customerReturn.id,
-            entity_type: 'return',
-            operation: 'CREATE',
-            payload: customerReturn,
-            device_id: deviceId,
-            idempotency_key: idempotencyKey,
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
-            version: 1,
-            sync_status: 'pending',
-            retry_count: 0,
-          });
-
-          // 3. Apply Inventory Restock or Quarantine Movement
-          if (finalAction === 'return_to_stock' && !isBatchExpired) {
-            if (targetBatch) {
-              const prevBatchQty = targetBatch.quantity_available;
-              const newBatchQty = prevBatchQty + returnQty;
-              targetBatch.quantity_available = newBatchQty;
-              if (targetBatch.status === 'exhausted' && newBatchQty > 0) {
-                targetBatch.status = 'active';
-              }
-              await db.medicine_batches.put(targetBatch);
-
-              const medBatches = await db.medicine_batches
-                .where('medicine_id')
-                .equals(selectedItemToReturn.medicine_id)
-                .toArray();
-              const totalAvailable = medBatches
-                .filter((b) => b.status === 'active' && !isExpired(b.expiry_date, now))
-                .reduce((sum, b) => sum + b.quantity_available, 0);
-
-              const med = await db.medicines.get(selectedItemToReturn.medicine_id);
-              if (med) {
-                med.current_stock = totalAvailable;
-                med.updated_at = todayStr;
-                med.updated_by = currentUser.name;
-                med.version = (med.version || 1) + 1;
-                await db.medicines.put(med);
-              }
-            }
-
-            await db.inventory_movements.put({
-              id: `mov-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-              medicine_id: selectedItemToReturn.medicine_id,
-              medicine_name: selectedItemToReturn.medicine_name,
-              batch_id: selectedItemToReturn.batch_id,
-              batch_number: selectedItemToReturn.batch_number,
-              previous_quantity: targetBatch ? targetBatch.quantity_available - returnQty : 0,
-              adjustment_quantity: returnQty,
-              new_quantity: targetBatch ? targetBatch.quantity_available : returnQty,
-              reason: 'customer_return',
-              reference_id: returnSale.sale_number,
-              notes: `Customer return from receipt ${returnSale.receipt_number}: ${returnReason.trim()}`,
-              user_id: currentUser.id,
-              user_name: currentUser.name,
-              date: todayStr,
-              device_id: deviceId,
-              timestamp: Date.now(),
-            });
-          } else {
-            // Expired or Damaged Return -> Quarantined Movement (Stock is not sellable)
-            await db.inventory_movements.put({
-              id: `mov-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-              medicine_id: selectedItemToReturn.medicine_id,
-              medicine_name: selectedItemToReturn.medicine_name,
-              batch_id: selectedItemToReturn.batch_id,
-              batch_number: selectedItemToReturn.batch_number,
-              previous_quantity: targetBatch ? targetBatch.quantity_available : 0,
-              adjustment_quantity: 0,
-              new_quantity: targetBatch ? targetBatch.quantity_available : 0,
-              reason: 'expiry',
-              reference_id: returnSale.sale_number,
-              notes: `Customer return quarantined (${finalAction}) from receipt ${returnSale.receipt_number}: ${returnReason.trim()}`,
-              user_id: currentUser.id,
-              user_name: currentUser.name,
-              date: todayStr,
-              device_id: deviceId,
-              timestamp: Date.now(),
-            });
-          }
-
-          // 4. Update Customer Total Spend (Subtract refunded net amount)
-          if (returnSale.customer_id && returnSale.customer_id !== 'cus-001') {
-            const cust = await db.customers.get(returnSale.customer_id);
-            if (cust) {
-              cust.total_spent = Math.max(0, (cust.total_spent || 0) - refundAmount);
-              await db.customers.put(cust);
-            }
-          }
-
-          // 5. Update Sale Status
-          const allSaleReturns = await db.customer_returns.where('sale_id').equals(returnSale.id).toArray();
-          const totalReturnedQty = allSaleReturns.reduce((sum, r) => sum + r.quantity, 0) + returnQty;
-          const totalSoldQty = returnSale.items.reduce((sum, it) => sum + it.quantity, 0);
-
-          returnSale.status = totalReturnedQty >= totalSoldQty ? 'returned' : 'partially_returned';
-          await db.sales.put(returnSale);
-
-          // 6. Audit Log
-          await db.audit_logs.put({
-            id: `aud-ret-${Date.now()}`,
-            user_id: currentUser.id,
-            user_name: currentUser.name,
-            role: currentUser.role,
-            action: 'CUSTOMER_RETURN_PROCESSED',
-            entity: 'customer_return',
-            entity_id: customerReturn.id,
-            previous_value: `Sale ${returnSale.receipt_number}, Qty: ${selectedItemToReturn.quantity}`,
-            new_value: `Returned: ${returnQty}, Refund: ${refundAmount}, Action: ${finalAction}`,
-            device_id: deviceId,
-            timestamp: Date.now(),
-            date: todayStr,
-          });
-        }
-      );
+      // Committed: refresh the cache from the confirmed server state.
+      const cacheWarning = await refreshCacheAfterCommit(async () => {
+        await db.customer_returns.put(result.return);
+        await db.sales.put(result.sale);
+        await applyServerStockResult({ medicine: result.medicine, batch: result.batch });
+      });
 
       setReturnSale(null);
-      const actionNotice = finalAction === 'quarantine' && isBatchExpired ? ' (Quarantined due to batch expiration)' : '';
-      setReturnSuccess(`Return of ${returnQty}x ${selectedItemToReturn.medicine_name} processed. Refund: ${settings.currency} ${refundAmount.toFixed(2)}${actionNotice}`);
-      setTimeout(() => setReturnSuccess(null), 4500);
-      runSync().catch(() => {});
+      const restocked = result.return.action === 'return_to_stock';
+      setReturnSuccess(
+        `Return of ${returnQty}x ${selectedItemToReturn.medicine_name} recorded. Refund: ${settings.currency} ${result.refund_amount.toFixed(2)}` +
+          (restocked ? ' (returned to stock).' : ` (${result.return.action} — not added to sellable stock).`) +
+          (cacheWarning ? ` ${cacheWarning}` : '')
+      );
+      setTimeout(() => setReturnSuccess(null), 6000);
       await loadSales();
     } catch (err: any) {
-      console.error('Return processing failed:', err);
-      alert(err?.message || 'Failed to process return.');
+      setReturnError(err?.message || 'Failed to process return.');
     } finally {
       setIsProcessingReturn(false);
     }
@@ -364,154 +195,44 @@ export const SalesHistory: React.FC<SalesHistoryProps> = ({ currentUser, setting
   const handleOpenVoidModal = (s: Sale) => {
     setVoidingSale(s);
     setVoidReason('');
-    setSupervisorPin('');
     setSupervisorError(null);
   };
 
+  // Void is an explicit server-side reversal (ADMIN only): the original sale is kept and marked
+  // voided, its stock is restored with reverse movements, and it leaves completed revenue.
   const handleAuthorizeAndVoid = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!voidingSale || !currentUser) return;
+    setSupervisorError(null);
 
     if (!voidReason.trim()) {
       setSupervisorError('Void justification reason is mandatory.');
       return;
     }
-
-    // Only a logged-in Administrator may void (enforced again by the server).
     if (currentUser.role !== 'ADMIN') {
       setSupervisorError('Only an Administrator can void a sale. Ask an Administrator to log in.');
       return;
     }
-    const authorizingUser: User = currentUser;
-
-    const deviceId = await getDeviceId();
-    const now = new Date();
-    const todayStr = now.toISOString().split('T')[0];
 
     try {
-      // Atomic Dexie Transaction for Sale Voiding
-      await db.transaction(
-        'rw',
-        [
-          db.sales,
-          db.customers,
-          db.medicines,
-          db.medicine_batches,
-          db.inventory_movements,
-          db.audit_logs,
-          db.pending_sync,
-        ],
-        async () => {
-          // 1. Revert inventory for each line item (if unexpired, restore sellable stock; if expired, quarantine)
-          for (const item of voidingSale.items) {
-            const batch = await db.medicine_batches.get(item.batch_id);
-            const expired = batch ? isExpired(batch.expiry_date, now) : isExpired(item.expiry_date, now);
-
-            if (batch && !expired) {
-              const prevBatchQty = batch.quantity_available;
-              batch.quantity_available = prevBatchQty + item.quantity;
-              if (batch.status === 'exhausted') batch.status = 'active';
-              await db.medicine_batches.put(batch);
-
-              const medBatches = await db.medicine_batches
-                .where('medicine_id')
-                .equals(item.medicine_id)
-                .toArray();
-              const totalAvailable = medBatches
-                .filter((b) => b.status === 'active' && !isExpired(b.expiry_date, now))
-                .reduce((sum, b) => sum + b.quantity_available, 0);
-
-              const med = await db.medicines.get(item.medicine_id);
-              if (med) {
-                med.current_stock = totalAvailable;
-                med.updated_at = todayStr;
-                med.updated_by = authorizingUser.name;
-                med.version = (med.version || 1) + 1;
-                await db.medicines.put(med);
-              }
-            }
-
-            await db.inventory_movements.put({
-              id: `mov-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-              medicine_id: item.medicine_id,
-              medicine_name: item.medicine_name,
-              batch_id: item.batch_id,
-              batch_number: item.batch_number,
-              previous_quantity: batch ? batch.quantity_available - item.quantity : 0,
-              adjustment_quantity: expired ? 0 : item.quantity,
-              new_quantity: batch ? batch.quantity_available : 0,
-              reason: expired ? 'expiry' : 'correction',
-              reference_id: voidingSale.sale_number,
-              notes: `Reversal from voided sale authorized by ${authorizingUser.name}: ${voidReason.trim()}${expired ? ' (Quarantined - Expired)' : ''}`,
-              user_id: authorizingUser.id,
-              user_name: authorizingUser.name,
-              date: todayStr,
-              device_id: deviceId,
-              timestamp: Date.now(),
-            });
-          }
-
-          // 2. Mark sale voided with audit details
-          voidingSale.status = 'voided';
-          voidingSale.void_reason = `${voidReason.trim()} (Authorized by ${authorizingUser.name} - ${authorizingUser.role})`;
-          voidingSale.voided_by = authorizingUser.name;
-          voidingSale.sync_status = 'pending';
-          await db.sales.put(voidingSale);
-
-          // 3. Enqueue Canonical Void Sync Item
-          await db.pending_sync.put({
-            id: `sync_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-            local_id: voidingSale.id,
-            entity_type: 'sale',
-            operation: 'UPDATE',
-            payload: voidingSale,
-            device_id: deviceId,
-            idempotency_key: `VOID-${deviceId}-${voidingSale.id}`,
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
-            version: 1,
-            sync_status: 'pending',
-            retry_count: 0,
-          });
-
-          // 4. Reverse Customer Spend
-          if (voidingSale.customer_id && voidingSale.customer_id !== 'cus-001') {
-            const cust = await db.customers.get(voidingSale.customer_id);
-            if (cust) {
-              cust.total_spent = Math.max(0, (cust.total_spent || 0) - voidingSale.total);
-              await db.customers.put(cust);
-            }
-          }
-
-          // 5. Audit Log
-          await db.audit_logs.put({
-            id: `aud-void-${Date.now()}`,
-            user_id: authorizingUser.id,
-            user_name: authorizingUser.name,
-            role: authorizingUser.role,
-            action: 'SALE_TRANSACTION_VOIDED',
-            entity: 'sale',
-            entity_id: voidingSale.id,
-            previous_value: `Total: ${voidingSale.total}, Status: completed`,
-            new_value: `Status: voided, Reason: ${voidReason}, Initiated by: ${currentUser.name}`,
-            device_id: deviceId,
-            timestamp: Date.now(),
-            date: todayStr,
-          });
-        }
+      const result = await apiFetch<{ sale: Sale; medicines: any[]; batches: any[] }>(
+        `/api/sales/${voidingSale.id}/void`,
+        { body: { void_reason: voidReason.trim() } }
       );
-
+      const cacheWarning = await refreshCacheAfterCommit(async () => {
+        await db.sales.put(result.sale);
+        await applyServerStockResult({ batches: result.batches });
+        for (const m of result.medicines) await applyServerStockResult({ medicine: m });
+      });
+      setReturnSuccess(
+        `Transaction ${voidingSale.receipt_number} voided; stock restored and removed from completed revenue.` +
+          (cacheWarning ? ` ${cacheWarning}` : '')
+      );
+      setTimeout(() => setReturnSuccess(null), 6000);
       setVoidingSale(null);
-      setVoidReason('');
-      setSupervisorPin('');
-      setSupervisorError(null);
-      setReturnSuccess(`Transaction ${voidingSale.receipt_number} voided and financial aggregates reversed.`);
-      setTimeout(() => setReturnSuccess(null), 3500);
-      runSync().catch(() => {});
       await loadSales();
     } catch (err: any) {
-      console.error('Void transaction failed:', err);
-      alert(err?.message || 'Failed to void transaction.');
+      setSupervisorError(err?.message || 'Failed to void sale.');
     }
   };
 
@@ -740,14 +461,24 @@ export const SalesHistory: React.FC<SalesHistoryProps> = ({ currentUser, setting
 
                   return (
                     <tr key={s.id} className="hover:bg-slate-50 transition">
-                      <td className="py-2 px-3 font-mono font-bold text-slate-900">{s.receipt_number}</td>
+                      <td className="py-2 px-3 font-mono font-bold text-slate-900">
+                        {s.receipt_number}
+                        {s.price_mode === 'WHOLESALE' && (
+                          <span className="ml-1.5 align-middle text-[9px] px-1.5 py-0.5 rounded bg-amber-600 text-white font-bold uppercase tracking-wider">
+                            Wholesale
+                          </span>
+                        )}
+                      </td>
                       <td className="py-2 px-3 font-mono text-[11px] text-slate-600">
                         {s.date} {s.time}
                       </td>
                       {!isCashierUser && <td className="py-2 px-3 text-slate-800">{s.cashier_name}</td>}
                       <td className="py-2 px-3 text-slate-800">{s.customer_name || 'Walk-in'}</td>
                       <td className="py-2 px-3 text-slate-600 max-w-xs truncate">
-                        {s.items.map((i) => `${i.quantity}x ${i.medicine_name}`).join(', ')}
+                        {/* Price actually charged at the time of sale (stored on the sale line). */}
+                        {s.items
+                          .map((i) => `${i.quantity}x ${i.medicine_name} @ ${settings.currency} ${i.unit_price.toFixed(2)}${i.price_mode === 'WHOLESALE' ? ' (WS)' : ''}`)
+                          .join(', ')}
                       </td>
                       <td className="py-2 px-3 text-right font-mono text-slate-600">
                         {settings.currency} {saleSubtotal.toFixed(2)}
@@ -797,7 +528,7 @@ export const SalesHistory: React.FC<SalesHistoryProps> = ({ currentUser, setting
                             <Printer className="w-3.5 h-3.5" />
                           </button>
 
-                          {s.status === 'completed' && (
+                          {(s.status === 'completed' || s.status === 'partially_returned') && (
                             <button
                               onClick={() => handleOpenReturn(s)}
                               className="p-1 rounded border border-slate-200 hover:bg-amber-50 text-amber-700 transition cursor-pointer"
@@ -807,11 +538,11 @@ export const SalesHistory: React.FC<SalesHistoryProps> = ({ currentUser, setting
                             </button>
                           )}
 
-                          {s.status === 'completed' && (
+                          {s.status === 'completed' && currentUser?.role === 'ADMIN' && (
                             <button
                               onClick={() => handleOpenVoidModal(s)}
                               className="p-1 rounded border border-rose-200 hover:bg-rose-50 text-rose-600 transition cursor-pointer"
-                              title="Void Transaction (Requires Approval)"
+                              title="Void Transaction (Administrator)"
                             >
                               <Ban className="w-3.5 h-3.5" />
                             </button>
@@ -841,6 +572,7 @@ export const SalesHistory: React.FC<SalesHistoryProps> = ({ currentUser, setting
             </div>
 
             <form onSubmit={handleProcessReturn} className="p-4 space-y-3 text-xs">
+
               <div>
                 <label className="block font-semibold text-slate-700 mb-1">Select Item to Return</label>
                 <select
@@ -900,7 +632,7 @@ export const SalesHistory: React.FC<SalesHistoryProps> = ({ currentUser, setting
                   })()}
                 </div>
                 <div>
-                  <label className="block font-semibold text-slate-700 mb-1">Refund Due</label>
+                  <label className="block font-semibold text-slate-700 mb-1">Refund Due (paid price, after discount)</label>
                   <div className="p-2 border border-slate-200 bg-slate-50 rounded font-mono font-bold text-slate-900">
                     {settings.currency}{' '}
                     {((selectedItemToReturn.total / selectedItemToReturn.quantity) * returnQty).toFixed(2)}
@@ -936,6 +668,13 @@ export const SalesHistory: React.FC<SalesHistoryProps> = ({ currentUser, setting
                 />
               </div>
 
+              {returnError && (
+                <div className="p-2 rounded bg-rose-50 border border-rose-200 text-rose-800 text-[11px] flex items-center gap-1.5">
+                  <AlertTriangle className="w-3.5 h-3.5 text-rose-600 shrink-0" />
+                  <span>{returnError}</span>
+                </div>
+              )}
+
               <div className="flex justify-end gap-2 pt-2 border-t border-slate-200">
                 <button
                   type="button"
@@ -965,7 +704,7 @@ export const SalesHistory: React.FC<SalesHistoryProps> = ({ currentUser, setting
               <div className="flex items-center gap-2">
                 <ShieldCheck className="w-4 h-4 text-rose-400" />
                 <span className="font-bold text-xs uppercase tracking-wider">
-                  Void Sale — Supervisor Approval
+                  Void Sale — Administrator
                 </span>
               </div>
               <button onClick={() => setVoidingSale(null)} className="text-slate-400 hover:text-white p-1 rounded cursor-pointer">
@@ -974,8 +713,9 @@ export const SalesHistory: React.FC<SalesHistoryProps> = ({ currentUser, setting
             </div>
 
             <form onSubmit={handleAuthorizeAndVoid} className="p-4 space-y-3 text-xs">
+
               <div className="p-3 bg-rose-50 border border-rose-200 rounded text-rose-800">
-                <p className="font-semibold">Manager or Administrator authorization required.</p>
+                <p className="font-semibold">The sale is kept and marked VOIDED; its stock is restored and it leaves completed revenue.</p>
                 <p className="text-[11px] mt-1">
                   Receipt: <strong>{voidingSale.receipt_number}</strong> | Amount: {settings.currency} {voidingSale.total.toFixed(2)}
                 </p>
@@ -994,23 +734,6 @@ export const SalesHistory: React.FC<SalesHistoryProps> = ({ currentUser, setting
                   className="w-full p-2 border border-slate-300 rounded focus:ring-1 focus:ring-teal-700 focus:border-teal-700 focus:outline-hidden"
                 />
               </div>
-
-              {currentUser?.role !== 'ADMIN' && (
-                <div>
-                  <label className="block font-semibold text-slate-700 mb-1 flex items-center gap-1.5">
-                    <Lock className="w-3.5 h-3.5 text-slate-500" />
-                    <span>Manager / Admin Override PIN *</span>
-                  </label>
-                  <input
-                    type="password"
-                    required
-                    value={supervisorPin}
-                    onChange={(e) => setSupervisorPin(e.target.value)}
-                    placeholder="Enter Supervisor PIN (e.g. 1234 / 2345)"
-                    className="w-full p-2 border border-slate-300 rounded font-mono tracking-widest text-center text-sm focus:ring-1 focus:ring-teal-700 focus:border-teal-700 focus:outline-hidden"
-                  />
-                </div>
-              )}
 
               {supervisorError && (
                 <div className="p-2 rounded bg-rose-50 border border-rose-200 text-rose-800 text-[11px] flex items-center gap-1.5">

@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { Plus, FileSpreadsheet, X } from 'lucide-react';
 import { db } from '../../db/dexie';
 import { downloadCSV } from '../../services/exportUtils';
-import { apiUrl } from '../../services/api';
+import { apiFetch } from '../../services/http';
 import type { Expense, PharmacySettings, User } from '../../types';
 
 interface ExpenseListProps {
@@ -19,6 +19,8 @@ export const ExpenseList: React.FC<ExpenseListProps> = ({ currentUser, settings 
   const [amount, setAmount] = useState<number>(0);
   const [paymentMethod, setPaymentMethod] = useState('M-Pesa');
   const [reference, setReference] = useState('');
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [isSaving, setIsSaving] = useState(false);
 
   const loadExpenses = async () => {
     setExpenses(await db.expenses.toArray());
@@ -28,40 +30,41 @@ export const ExpenseList: React.FC<ExpenseListProps> = ({ currentUser, settings 
     loadExpenses();
   }, []);
 
+  // PostgreSQL first: the expense exists only once the server has committed it.
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (amount <= 0 || !description.trim()) return;
+    setSaveError(null);
+    if (!(amount > 0)) {
+      setSaveError('Amount must be greater than zero.');
+      return;
+    }
+    if (!description.trim()) {
+      setSaveError('Description is required.');
+      return;
+    }
 
-    const todayStr = new Date().toISOString().split('T')[0];
-    const newExp: Expense = {
-      id: `exp-${Date.now()}`,
-      category,
-      description: description.trim(),
-      amount,
-      payment_method: paymentMethod,
-      reference: reference.trim() || undefined,
-      date: todayStr,
-      user_id: currentUser?.id || 'staff',
-      user_name: currentUser?.name || 'Staff',
-      created_at: todayStr,
-      sync_status: 'pending',
-    };
-
-    await db.expenses.put(newExp);
-
+    setIsSaving(true);
     try {
-      await fetch(apiUrl('/api/expenses'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(newExp),
+      const { expense } = await apiFetch<{ expense: Expense }>('/api/expenses', {
+        body: {
+          category,
+          description: description.trim(),
+          amount,
+          payment_method: paymentMethod,
+          reference: reference.trim() || undefined,
+        },
       });
-    } catch (e) {}
-
-    setIsModalOpen(false);
-    setDescription('');
-    setAmount(0);
-    setReference('');
-    await loadExpenses();
+      await db.expenses.put(expense);
+      setIsModalOpen(false);
+      setDescription('');
+      setAmount(0);
+      setReference('');
+      await loadExpenses();
+    } catch (err: any) {
+      setSaveError(err?.message || 'Failed to record expense.');
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   const handleExportCSV = () => {
@@ -180,6 +183,10 @@ export const ExpenseList: React.FC<ExpenseListProps> = ({ currentUser, settings 
             </div>
 
             <form onSubmit={handleSave} className="p-4 space-y-3 text-xs">
+
+              {saveError && (
+                <div className="p-2 rounded bg-rose-50 border border-rose-200 text-rose-800 text-[11px]">{saveError}</div>
+              )}
               <div>
                 <label className="block font-semibold text-slate-700 mb-1">Expense Category *</label>
                 <select
@@ -260,9 +267,10 @@ export const ExpenseList: React.FC<ExpenseListProps> = ({ currentUser, settings 
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-1.5 rounded bg-teal-700 hover:bg-teal-800 text-white font-semibold transition cursor-pointer"
+                  disabled={isSaving}
+                  className="px-4 py-1.5 rounded bg-teal-700 hover:bg-teal-800 text-white font-semibold transition cursor-pointer disabled:opacity-50"
                 >
-                  Save Expense
+                  {isSaving ? 'Saving...' : 'Save Expense'}
                 </button>
               </div>
             </form>

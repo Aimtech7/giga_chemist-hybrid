@@ -11,7 +11,7 @@ const MEDICINE_SELECT = `
     m.medicine_type, m.dosage_strength, m.dosage_form, m.manufacturer, m.description,
     COALESCE(m.purchase_price, 0)::float AS purchase_price,
     COALESCE(m.selling_price, 0)::float AS selling_price,
-    COALESCE(m.wholesale_price, m.selling_price, 0)::float AS wholesale_price,
+    m.wholesale_price::float AS wholesale_price,
     COALESCE(m.min_selling_price, m.selling_price, 0)::float AS min_selling_price,
     COALESCE(m.current_stock, 0)::int AS current_stock,
     COALESCE(m.reorder_level, 20)::int AS reorder_level,
@@ -40,7 +40,8 @@ export function toMedicine(r: any): Medicine {
     description: r.description || '',
     purchase_price: Number(r.purchase_price) || 0,
     selling_price: Number(r.selling_price) || 0,
-    wholesale_price: Number(r.wholesale_price) || 0,
+    // NULL = no wholesale price set. Never substituted with the retail price.
+    wholesale_price: r.wholesale_price != null ? Number(r.wholesale_price) : null,
     min_selling_price: Number(r.min_selling_price) || 0,
     current_stock: Number(r.current_stock) || 0,
     reorder_level: Number(r.reorder_level) || 0,
@@ -79,6 +80,15 @@ function optionalMoney(value: unknown, field: string): number | undefined {
   return roundMoney(n);
 }
 
+/** Wholesale price: undefined = unchanged, null/'' = clear (no wholesale price), else must be > 0. */
+function optionalWholesale(value: unknown): number | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null || value === '') return null;
+  const n = optionalMoney(value, 'Wholesale price')!;
+  if (n <= 0) throw new HttpError(400, 'Wholesale price must be greater than zero (leave it empty for no wholesale price).');
+  return n;
+}
+
 function optionalWholeNumber(value: unknown, field: string): number | undefined {
   if (value === undefined || value === null || value === '') return undefined;
   const n = Number(value);
@@ -105,6 +115,16 @@ async function resolveCategoryId(client: pg.PoolClient, name: unknown): Promise<
   return created.rows[0].id;
 }
 
+/** Barcodes are unique across medicines (case/space-insensitive); empty barcodes are ignored. */
+async function assertBarcodeFree(client: pg.PoolClient, barcode: string | undefined, exceptId?: string) {
+  if (!barcode || !barcode.trim()) return;
+  const res = await client.query(
+    `SELECT name FROM medicines WHERE lower(btrim(barcode)) = lower(btrim($1)) AND ($2::uuid IS NULL OR id <> $2::uuid) LIMIT 1`,
+    [barcode, exceptId ?? null]
+  );
+  if (res.rows[0]) throw new HttpError(409, `Barcode "${barcode.trim()}" is already used by "${res.rows[0].name}".`);
+}
+
 function uniqueViolation(err: any, what: string): never {
   if (err?.code === '23505') throw new HttpError(409, `${what} is already used by another medicine.`);
   throw err;
@@ -121,6 +141,7 @@ export async function createMedicine(data: Partial<Medicine>, actor: MedicineAct
   return withTransaction(async (client) => {
     const categoryId = await resolveCategoryId(client, data.category);
     const id = crypto.randomUUID();
+    await assertBarcodeFree(client, text(data.barcode, 100));
     try {
       await client.query(
         `INSERT INTO medicines (
@@ -138,7 +159,7 @@ export async function createMedicine(data: Partial<Medicine>, actor: MedicineAct
           text(data.dosage_strength, 100) || '', text(data.dosage_form, 100) || 'Tablet',
           text(data.manufacturer, 255) || null, text(data.description, 2000) || null,
           purchase, selling,
-          optionalMoney(data.wholesale_price, 'Wholesale price') ?? selling,
+          optionalWholesale(data.wholesale_price) ?? null,
           optionalMoney(data.min_selling_price, 'Minimum selling price') ?? selling,
           optionalWholeNumber(data.reorder_level, 'Reorder level') ?? 20,
           text(data.unit, 50) || 'Unit', Boolean(data.prescription_required),
@@ -170,6 +191,7 @@ export async function updateMedicineDetails(id: string, data: Partial<Medicine>,
     const before = (await getMedicineById(id, client))!;
 
     const categoryId = data.category !== undefined ? await resolveCategoryId(client, data.category) : undefined;
+    if (data.barcode !== undefined) await assertBarcodeFree(client, text(data.barcode, 100), id);
     const status = data.status !== undefined ? String(data.status) : undefined;
     if (status !== undefined && !['active', 'inactive'].includes(status)) {
       throw new HttpError(400, 'status must be "active" or "inactive".');
@@ -228,7 +250,7 @@ export interface UpdatePricingParams {
   selling_price?: number;
   purchase_price?: number;
   min_selling_price?: number;
-  wholesale_price?: number;
+  wholesale_price?: number | null;
   reorder_level?: number;
   user_id: string;
   user_name: string;
@@ -246,7 +268,7 @@ async function applyPricingUpdate(
   if (selling !== undefined && selling <= 0) throw new HttpError(400, 'Selling price must be greater than zero.');
   const purchase = optionalMoney(p.purchase_price, 'Purchase/cost price');
   const minSelling = optionalMoney(p.min_selling_price, 'Minimum selling price');
-  const wholesale = optionalMoney(p.wholesale_price, 'Wholesale price');
+  const wholesale = optionalWholesale(p.wholesale_price);
   const reorder = optionalWholeNumber(p.reorder_level, 'Reorder level');
 
   const locked = await client.query(
@@ -260,11 +282,12 @@ async function applyPricingUpdate(
   await client.query(
     `UPDATE medicines SET
        selling_price = COALESCE($2, selling_price), purchase_price = COALESCE($3, purchase_price),
-       min_selling_price = COALESCE($4, min_selling_price), wholesale_price = COALESCE($5, wholesale_price),
+       min_selling_price = COALESCE($4, min_selling_price),
+       wholesale_price = CASE WHEN $8::boolean THEN $5::numeric ELSE wholesale_price END,
        reorder_level = COALESCE($6, reorder_level), updated_by = $7,
        version = version + 1, updated_at = CURRENT_TIMESTAMP
      WHERE id = $1`,
-    [id, selling ?? null, purchase ?? null, minSelling ?? null, wholesale ?? null, reorder ?? null, actor.user_id]
+    [id, selling ?? null, purchase ?? null, minSelling ?? null, wholesale ?? null, reorder ?? null, actor.user_id, wholesale !== undefined]
   );
   const saved = (await getMedicineById(id, client))!;
 

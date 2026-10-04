@@ -1,100 +1,77 @@
-import { pgPool, isLocalMode, supabaseAdmin, isSupabaseConfigured } from './client';
-import { serverDb } from '../db';
+import crypto from 'crypto';
+import { pgPool, HttpError, withTransaction, businessNow, roundMoney } from './client';
+import { recordAuditLog } from './audit';
+import type { SaleActor } from './sales';
 import type { Expense } from '../../src/types';
 
-export async function getAllExpenses(): Promise<Expense[]> {
-  try {
-    const res = await pgPool.query(`
-      SELECT 
-        e.id, e.branch_id, e.category, e.description,
-        COALESCE(e.amount, 0)::float as amount,
-        e.payment_method, e.reference, e.user_id, u.name as user_name,
-        e.date, e.created_at
-      FROM expenses e
-      LEFT JOIN users u ON e.user_id = u.id
-      ORDER BY e.date DESC, e.created_at DESC
-    `);
-    if (res.rows && res.rows.length > 0) {
-      return res.rows.map((r) => ({
-        id: r.id,
-        branch_id: r.branch_id,
-        category: r.category,
-        description: r.description,
-        amount: Number(r.amount) || 0,
-        payment_method: r.payment_method,
-        reference: r.reference || undefined,
-        user_id: r.user_id,
-        user_name: r.user_name || 'Staff',
-        date: r.date ? new Date(r.date).toISOString().split('T')[0] : '',
-        sync_status: 'synced',
-        created_at: r.created_at ? new Date(r.created_at).toISOString() : new Date().toISOString(),
-      }));
-    }
-  } catch (err) {}
+export const EXPENSE_CATEGORIES = ['Rent', 'Electricity', 'Internet', 'Salaries', 'Transport', 'Maintenance', 'Supplies', 'Miscellaneous'] as const;
+const EXPENSE_PAYMENT_METHODS = ['Cash', 'M-Pesa', 'Card', 'Bank'];
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
-  if (!isLocalMode && isSupabaseConfigured) {
-    try {
-      const { data, error } = await supabaseAdmin
-        .from('expenses')
-        .select('*')
-        .order('date', { ascending: false });
-      if (!error && data) return data as Expense[];
-    } catch (err) {
-      console.warn('[Server DB] Supabase expenses query failed:', err);
-    }
-  }
-  return serverDb.get().expenses;
+function toExpense(r: any): Expense {
+  return {
+    id: r.id,
+    branch_id: r.branch_id || undefined,
+    category: r.category,
+    description: r.description,
+    amount: Number(r.amount) || 0,
+    payment_method: r.payment_method,
+    reference: r.reference || undefined,
+    user_id: r.user_id,
+    user_name: r.user_name || 'Staff',
+    date: r.date || '',
+    sync_status: 'synced',
+    created_at: r.created_at ? new Date(r.created_at).toISOString() : '',
+  } as Expense;
 }
 
-export async function recordExpense(expense: Expense): Promise<Expense> {
-  const processedExpense: Expense = {
-    ...expense,
-    id: expense.id || `exp-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-    created_at: expense.created_at || new Date().toISOString(),
-    sync_status: 'synced',
-  };
+export async function getAllExpenses(): Promise<Expense[]> {
+  const res = await pgPool.query(
+    `SELECT e.*, e.amount::float AS amount, u.name AS user_name
+     FROM expenses e LEFT JOIN users u ON e.user_id = u.id
+     ORDER BY e.date DESC, e.created_at DESC LIMIT 2000`
+  );
+  return res.rows.map(toExpense);
+}
 
-  try {
-    await pgPool.query(`
-      INSERT INTO expenses (id, category, description, amount, payment_method, reference, user_id, date)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-      ON CONFLICT (id) DO UPDATE SET
-        category = EXCLUDED.category,
-        description = EXCLUDED.description,
-        amount = EXCLUDED.amount,
-        payment_method = EXCLUDED.payment_method,
-        reference = EXCLUDED.reference
-    `, [
-      processedExpense.id,
-      processedExpense.category,
-      processedExpense.description,
-      processedExpense.amount,
-      processedExpense.payment_method,
-      processedExpense.reference || null,
-      processedExpense.user_id || null,
-      processedExpense.date,
-    ]);
-  } catch (pgErr) {}
-
-  if (!isLocalMode && isSupabaseConfigured) {
-    try {
-      await supabaseAdmin.from('expenses').insert({
-        id: processedExpense.id,
-        category: processedExpense.category,
-        description: processedExpense.description,
-        amount: processedExpense.amount,
-        payment_method: processedExpense.payment_method,
-        reference: processedExpense.reference || null,
-        user_id: processedExpense.user_id || 'admin',
-        date: processedExpense.date,
-      });
-    } catch (err) {
-      console.warn('[Server DB] Supabase expense insert failed:', err);
-    }
+export async function recordExpense(input: Partial<Expense>, actor: SaleActor): Promise<Expense> {
+  const category = input?.category;
+  if (!category || !EXPENSE_CATEGORIES.includes(category as any)) {
+    throw new HttpError(400, `Category must be one of ${EXPENSE_CATEGORIES.join(', ')}.`);
+  }
+  const description = typeof input.description === 'string' ? input.description.trim().slice(0, 2000) : '';
+  if (!description) throw new HttpError(400, 'Description is required.');
+  const amount = Number(input.amount);
+  if (!Number.isFinite(amount) || amount <= 0) throw new HttpError(400, 'Amount must be greater than zero.');
+  const method = input.payment_method || 'Cash';
+  if (!EXPENSE_PAYMENT_METHODS.includes(method)) throw new HttpError(400, `Payment method must be one of ${EXPENSE_PAYMENT_METHODS.join(', ')}.`);
+  if (input.date !== undefined && input.date !== '' && !DATE_RE.test(String(input.date))) {
+    throw new HttpError(400, 'Date must be YYYY-MM-DD.');
   }
 
-  const store = serverDb.get();
-  store.expenses.unshift(processedExpense);
-  serverDb.persist();
-  return processedExpense;
+  return withTransaction(async (client) => {
+    const date = input.date || (await businessNow(client)).date;
+    const id = crypto.randomUUID();
+    const res = await client.query(
+      `INSERT INTO expenses (id, category, description, amount, payment_method, reference, user_id, date)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *, amount::float AS amount`,
+      [id, category, description, roundMoney(amount), method,
+       typeof input.reference === 'string' && input.reference.trim() ? input.reference.trim().slice(0, 100) : null,
+       actor.user_id, date]
+    );
+    await recordAuditLog(
+      {
+        user_id: actor.user_id,
+        user_name: actor.user_name,
+        role: actor.role,
+        device_id: actor.device_id,
+        action: 'EXPENSE_RECORDED',
+        entity: 'expense',
+        entity_id: id,
+        new_value: { category, description, amount: roundMoney(amount), payment_method: method, date },
+      },
+      client
+    );
+    return toExpense({ ...res.rows[0], user_name: actor.user_name });
+  });
 }

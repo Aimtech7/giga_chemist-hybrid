@@ -23,7 +23,7 @@ export const ReceiptModal: React.FC<ReceiptModalProps> = ({ isOpen, onClose, sal
     const text = `GIGA CHEMIST
 Receipt #: ${sale.receipt_number}
 Date: ${sale.date} ${sale.time}
-Cashier: ${sale.cashier_name}
+Cashier: ${sale.cashier_name}${sale.price_mode === 'WHOLESALE' ? '\n*** WHOLESALE SALE ***' : ''}
 Total: ${settings.currency} ${sale.total.toFixed(2)}
 Payment: ${sale.payment_method} ${sale.payment_reference ? `(${sale.payment_reference})` : ''}
 Thank you. Get well soon!`;
@@ -79,6 +79,11 @@ Thank you. Get well soon!`;
                 <span>Cashier:</span>
                 <span>{sale.cashier_name}</span>
               </div>
+              {sale.price_mode === 'WHOLESALE' && (
+                <div className="mt-1 py-0.5 text-center font-black tracking-widest border border-slate-900">
+                  *** WHOLESALE SALE ***
+                </div>
+              )}
               {sale.customer_name && sale.customer_name !== 'Walk-in Customer' && (
                 <div className="flex justify-between">
                   <span>Customer:</span>
@@ -91,14 +96,18 @@ Thank you. Get well soon!`;
             <div className="py-2 border-b border-dashed border-slate-400 space-y-2">
               {sale.items.map((item, idx) => (
                 <div key={idx} className="text-[11px]">
-                  <div className="font-bold">{item.medicine_name}</div>
+                  <div className="font-bold">
+                    {item.medicine_name}
+                    {item.price_mode === 'WHOLESALE' && <span className="font-normal"> [WS]</span>}
+                  </div>
                   <div className="text-[10px] text-slate-600 flex justify-between">
                     <span>Batch: {item.batch_number}</span>
                     <span>Exp: {item.expiry_date}</span>
                   </div>
                   <div className="flex justify-between">
                     <span>{item.quantity} × {settings.currency} {item.unit_price.toFixed(2)}</span>
-                    <span className="font-bold">{settings.currency} {item.total.toFixed(2)}</span>
+                    {/* Line amount at the price charged; the sale discount is shown once below. */}
+                    <span className="font-bold">{settings.currency} {(item.quantity * item.unit_price).toFixed(2)}</span>
                   </div>
                 </div>
               ))}

@@ -2,8 +2,8 @@ import React, { useState, useEffect } from 'react';
 import { Plus, Search, Edit2, FileSpreadsheet, X } from 'lucide-react';
 import { db } from '../../db/dexie';
 import { downloadCSV } from '../../services/exportUtils';
-import { apiUrl } from '../../services/api';
 import type { Supplier, PharmacySettings, User } from '../../types';
+import { apiFetch } from '../../services/http';
 
 interface SupplierListProps {
   currentUser: User | null;
@@ -22,6 +22,7 @@ export const SupplierList: React.FC<SupplierListProps> = ({ currentUser, setting
   const [email, setEmail] = useState('');
   const [address, setAddress] = useState('');
   const [taxPin, setTaxPin] = useState('');
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   const isAdminOrManager = currentUser?.role === 'ADMIN' || currentUser?.role === 'MANAGER';
 
@@ -54,36 +55,33 @@ export const SupplierList: React.FC<SupplierListProps> = ({ currentUser, setting
     setIsModalOpen(true);
   };
 
+  // PostgreSQL first: new suppliers get a server UUID; edits target the existing UUID.
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!name.trim()) return;
-
-    const todayStr = new Date().toISOString().split('T')[0];
-    const supData: Supplier = {
-      id: editingSup ? editingSup.id : `sup-${Date.now()}`,
-      name: name.trim(),
-      contact_person: contactPerson.trim(),
-      phone: phone.trim(),
-      email: email.trim(),
-      address: address.trim(),
-      tax_pin: taxPin.trim() || undefined,
-      balance: editingSup ? editingSup.balance : 0,
-      status: 'active',
-      created_at: editingSup ? editingSup.created_at : todayStr,
-    };
-
-    await db.suppliers.put(supData);
-
+    setSaveError(null);
+    if (!name.trim()) {
+      setSaveError('Supplier name is required.');
+      return;
+    }
     try {
-      await fetch(apiUrl('/api/suppliers'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(supData),
+      const { supplier } = await apiFetch<{ supplier: Supplier }>('/api/suppliers', {
+        body: {
+          id: editingSup?.id,
+          name: name.trim(),
+          contact_person: contactPerson.trim(),
+          phone: phone.trim(),
+          email: email.trim(),
+          address: address.trim(),
+          tax_pin: taxPin.trim() || undefined,
+          status: editingSup?.status || 'active',
+        },
       });
-    } catch (e) {}
-
-    setIsModalOpen(false);
-    await loadSuppliers();
+      await db.suppliers.put(supplier);
+      setIsModalOpen(false);
+      await loadSuppliers();
+    } catch (err: any) {
+      setSaveError(err?.message || 'Failed to save supplier.');
+    }
   };
 
   const handleExportCSV = () => {
@@ -242,6 +240,10 @@ export const SupplierList: React.FC<SupplierListProps> = ({ currentUser, setting
             </div>
 
             <form onSubmit={handleSave} className="p-4 space-y-3 text-xs">
+
+              {saveError && (
+                <div className="p-2 rounded bg-rose-50 border border-rose-200 text-rose-800 text-[11px]">{saveError}</div>
+              )}
               <div>
                 <label className="block font-semibold text-slate-700 mb-1">Company / Supplier Name *</label>
                 <input

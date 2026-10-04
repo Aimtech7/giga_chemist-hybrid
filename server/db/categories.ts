@@ -21,33 +21,3 @@ export async function getAllCategories(): Promise<Category[]> {
   if (error) throw error;
   return (data || []) as Category[];
 }
-
-export async function upsertCategory(category: { id?: string; name: string; description?: string }): Promise<Category> {
-  const id = category.id || `cat-${Date.now()}`;
-  const now = new Date().toISOString();
-
-  try {
-    await pgPool.query(`
-      INSERT INTO categories (id, name, description, created_at, updated_at)
-      VALUES ($1, $2, $3, $4, $5)
-      ON CONFLICT (id) DO UPDATE SET
-        name = EXCLUDED.name,
-        description = EXCLUDED.description,
-        updated_at = EXCLUDED.updated_at
-    `, [id, category.name, category.description || null, now, now]);
-  } catch (err) {}
-
-  if (!isLocalMode && isSupabaseConfigured) {
-    try {
-      await supabaseAdmin.from('categories').upsert({ id, name: category.name, description: category.description });
-    } catch (e) {}
-  }
-
-  return {
-    id,
-    name: category.name,
-    description: category.description,
-    created_at: now,
-    updated_at: now,
-  };
-}

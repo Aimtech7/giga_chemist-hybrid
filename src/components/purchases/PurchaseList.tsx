@@ -1,8 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import { Truck, Plus, PackageCheck, AlertTriangle, FileSpreadsheet, X, Check } from 'lucide-react';
-import { db, getDeviceId } from '../../db/dexie';
+import { db } from '../../db/dexie';
 import { downloadCSV } from '../../services/exportUtils';
-import { apiUrl } from '../../services/api';
+import { apiFetch } from '../../services/http';
+import { applyServerStockResult, refreshCacheAfterCommit } from '../../services/stockCache';
 import { MedicineSelector } from '../common/MedicineSelector';
 import type { Purchase, PurchaseItem, Supplier, Medicine, PharmacySettings, User } from '../../types';
 
@@ -92,136 +93,53 @@ export const PurchaseList: React.FC<PurchaseListProps> = ({ currentUser, setting
     setItems(items.filter((_, i) => i !== index));
   };
 
+  // Receiving is ONE server transaction: purchase + items, batch create-or-increment, stock,
+  // movements and audit. The cache is updated only from the committed result.
   const handleReceiveStockPO = async (e: React.FormEvent) => {
     e.preventDefault();
+    setError(null);
     if (items.length === 0) {
       setError('Please add at least one medicine item to the purchase receipt.');
       return;
     }
-
-    const supplier = suppliers.find((s) => s.id === supplierId);
-    if (!supplier) {
+    if (!suppliers.some((s) => s.id === supplierId)) {
       setError('Supplier required.');
+      return;
+    }
+    if (!invoiceNumber.trim()) {
+      setError('Enter the supplier invoice number.');
       return;
     }
 
     setIsSubmitting(true);
     try {
-      const todayStr = new Date().toISOString().split('T')[0];
-      const deviceId = await getDeviceId();
-      const orderNumber = `PO-${Date.now().toString().substring(6)}`;
-      const totalAmount = items.reduce((acc, i) => acc + i.total, 0);
-
-      const newPurchase: Purchase = {
-        id: `pur-${Date.now()}`,
-        order_number: orderNumber,
-        invoice_number: invoiceNumber || `INV-${Math.floor(1000 + Math.random() * 9000)}`,
-        supplier_id: supplier.id,
-        supplier_name: supplier.name,
-        order_date: todayStr,
-        received_date: todayStr,
-        status: 'received',
-        items,
-        total_amount: totalAmount,
-        payment_status: 'paid',
-        created_by: currentUser?.name || 'Manager',
-        created_at: todayStr,
-        sync_status: 'pending',
-      };
-
-      // Create or increment batches and update medicine total stocks
-      await db.transaction('rw', [db.purchases, db.medicine_batches, db.medicines, db.inventory_movements, db.audit_logs], async () => {
-        await db.purchases.put(newPurchase);
-
-        for (const it of items) {
-          const batchId = `bat-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
-          await db.medicine_batches.put({
-            id: batchId,
-            medicine_id: it.medicine_id,
-            medicine_name: it.medicine_name,
-            batch_number: it.batch_number,
-            supplier_id: supplier.id,
-            supplier_name: supplier.name,
-            quantity_received: it.quantity,
-            quantity_available: it.quantity,
-            purchase_price: it.purchase_price,
-            manufacturing_date: it.manufacturing_date,
-            expiry_date: it.expiry_date,
-            received_date: todayStr,
-            purchase_invoice: newPurchase.invoice_number,
-            created_by: currentUser?.name || 'Manager',
-            created_at: todayStr,
-            status: 'active',
-          });
-
-          // Update medicine total current_stock
-          const med = await db.medicines.get(it.medicine_id);
-          if (med) {
-            const prevStock = med.current_stock;
-            med.current_stock += it.quantity;
-            med.purchase_price = it.purchase_price;
-            med.updated_at = todayStr;
-            med.updated_by = currentUser?.name || 'Staff';
-            med.version = (med.version || 1) + 1;
-            await db.medicines.put(med);
-
-            // Controlled movement
-            await db.inventory_movements.put({
-              id: `mov-pur-${Date.now()}-${Math.random().toString(36).substring(2, 5)}`,
-              medicine_id: med.id,
-              medicine_name: med.name,
-              batch_id: batchId,
-              batch_number: it.batch_number,
-              previous_quantity: prevStock,
-              adjustment_quantity: it.quantity,
-              new_quantity: med.current_stock,
-              reason: 'purchase_receipt',
-              reference_id: newPurchase.order_number,
-              notes: `Stock received via supplier invoice ${newPurchase.invoice_number}`,
-              user_id: currentUser?.id || 'usr-staff',
-              user_name: currentUser?.name || 'Staff',
-              date: todayStr,
-              device_id: deviceId,
-              timestamp: Date.now(),
-            });
-          }
-        }
-
-        // Audit log
-        await db.audit_logs.put({
-          id: `aud-pur-${Date.now()}`,
-          user_id: currentUser?.id || 'staff',
-          user_name: currentUser?.name || 'Staff',
-          role: currentUser?.role || 'MANAGER',
-          action: 'PURCHASE_GOODS_RECEIVED',
-          entity: 'purchase',
-          entity_id: newPurchase.id,
-          new_value: `Invoice ${newPurchase.invoice_number} received: ${items.length} batches, Total: ${settings.currency} ${totalAmount.toFixed(2)}`,
-          device_id: deviceId,
-          timestamp: Date.now(),
-          date: todayStr,
-        });
+      const result = await apiFetch<{ purchase: Purchase; medicines: any[]; batches: any[] }>('/api/purchases', {
+        body: {
+          supplier_id: supplierId,
+          invoice_number: invoiceNumber.trim(),
+          payment_status: 'paid',
+          items: items.map((i) => ({
+            medicine_id: i.medicine_id,
+            batch_number: i.batch_number,
+            manufacturing_date: i.manufacturing_date || null,
+            expiry_date: i.expiry_date || null,
+            quantity: i.quantity,
+            purchase_price: i.purchase_price,
+          })),
+        },
       });
-
-      // Call server if online
-      try {
-        await fetch(apiUrl('/api/purchases'), {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-user-role': currentUser?.role || 'MANAGER',
-            'x-user-id': currentUser?.id || 'staff',
-            'x-user-name': currentUser?.name || 'Staff',
-          },
-          body: JSON.stringify(newPurchase),
-        });
-      } catch (e) {}
-
+      const cacheWarning = await refreshCacheAfterCommit(async () => {
+        await db.purchases.put(result.purchase);
+        await applyServerStockResult({ batches: result.batches });
+        for (const m of result.medicines) await applyServerStockResult({ medicine: m });
+      });
+      if (cacheWarning) setError(cacheWarning);
       setIsNewOpen(false);
       setItems([]);
+      setInvoiceNumber('');
       await loadData();
     } catch (err: any) {
-      setError(err?.message || 'Failed to save purchase.');
+      setError(err?.message || 'Failed to receive purchase.');
     } finally {
       setIsSubmitting(false);
     }
@@ -335,6 +253,7 @@ export const PurchaseList: React.FC<PurchaseListProps> = ({ currentUser, setting
             </div>
 
             <form onSubmit={handleReceiveStockPO} className="p-5 space-y-4 max-h-[80vh] overflow-y-auto text-xs">
+
               {error && (
                 <div className="p-2.5 rounded bg-rose-50 border border-rose-200 text-rose-700 flex items-center gap-2">
                   <AlertTriangle className="w-4 h-4 shrink-0 text-rose-500" />

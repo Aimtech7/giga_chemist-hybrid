@@ -3,6 +3,7 @@ import { Plus, Search, Edit2, FileSpreadsheet, X } from 'lucide-react';
 import { db } from '../../db/dexie';
 import { downloadCSV } from '../../services/exportUtils';
 import type { Customer, PharmacySettings } from '../../types';
+import { apiFetch } from '../../services/http';
 
 interface CustomerListProps {
   settings: PharmacySettings;
@@ -19,6 +20,7 @@ export const CustomerList: React.FC<CustomerListProps> = ({ settings }) => {
   const [email, setEmail] = useState('');
   const [address, setAddress] = useState('');
   const [notes, setNotes] = useState('');
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   const loadCustomers = async () => {
     setCustomers(await db.customers.toArray());
@@ -47,26 +49,31 @@ export const CustomerList: React.FC<CustomerListProps> = ({ settings }) => {
     setIsModalOpen(true);
   };
 
+  // PostgreSQL first. Spend totals are maintained by sales/returns on the server, never sent from here.
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!name.trim()) return;
-
-    const todayStr = new Date().toISOString().split('T')[0];
-    const customerData: Customer = {
-      id: editingCust ? editingCust.id : `cus-${Date.now()}`,
-      name: name.trim(),
-      phone: phone.trim(),
-      email: email.trim() || undefined,
-      address: address.trim() || undefined,
-      notes: notes.trim() || undefined,
-      credit_balance: editingCust ? editingCust.credit_balance : 0,
-      total_spent: editingCust ? editingCust.total_spent : 0,
-      created_at: editingCust ? editingCust.created_at : todayStr,
-    };
-
-    await db.customers.put(customerData);
-    setIsModalOpen(false);
-    await loadCustomers();
+    setSaveError(null);
+    if (!name.trim()) {
+      setSaveError('Customer name is required.');
+      return;
+    }
+    try {
+      const { customer } = await apiFetch<{ customer: Customer }>('/api/customers', {
+        body: {
+          id: editingCust?.id,
+          name: name.trim(),
+          phone: phone.trim(),
+          email: email.trim() || undefined,
+          address: address.trim() || undefined,
+          notes: notes.trim() || undefined,
+        },
+      });
+      await db.customers.put(customer);
+      setIsModalOpen(false);
+      await loadCustomers();
+    } catch (err: any) {
+      setSaveError(err?.message || 'Failed to save customer.');
+    }
   };
 
   const handleExportCSV = () => {
@@ -219,6 +226,10 @@ export const CustomerList: React.FC<CustomerListProps> = ({ settings }) => {
             </div>
 
             <form onSubmit={handleSave} className="p-4 space-y-3 text-xs">
+
+              {saveError && (
+                <div className="p-2 rounded bg-rose-50 border border-rose-200 text-rose-800 text-[11px]">{saveError}</div>
+              )}
               <div>
                 <label className="block font-semibold text-slate-700 mb-1">Patient Full Name *</label>
                 <input

@@ -37,6 +37,17 @@ async function startServer() {
   // Mount API router
   app.use('/api', apiRouter);
 
+  // Errors raised before/inside the API router (e.g. malformed JSON body, oversized payload) are
+  // answered as JSON, never as Express's default HTML error page.
+  app.use('/api', (err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (res.headersSent) return next(err);
+    const status = typeof err?.status === 'number' && err.status >= 400 && err.status < 600 ? err.status : 500;
+    if (status >= 500) console.error('[API] Unhandled error:', err?.message || err);
+    res.status(status).json({
+      error: err?.type === 'entity.parse.failed' ? 'Request body is not valid JSON.' : status >= 500 ? 'Internal server error.' : err?.message || 'Bad request.',
+    });
+  });
+
   // Serve or mount Vite middlewares
   const distPath = path.resolve(__dirname, 'dist');
   const hasDist = fs.existsSync(path.join(distPath, 'index.html'));

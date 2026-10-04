@@ -1,70 +1,47 @@
 import crypto from 'crypto';
 import type pg from 'pg';
-import { pgPool, isLocalMode, supabaseAdmin, isSupabaseConfigured, cleanUuid, ensureUuid, HttpError, requireUuid, withTransaction } from './client';
-import { serverDb } from '../db';
+import { pgPool, cleanUuid, HttpError, requireUuid, withTransaction } from './client';
 import { ensureDevice } from './devices';
 import type { InventoryMovement } from '../../src/types';
 
 export async function getAllMovements(): Promise<InventoryMovement[]> {
-  try {
-    const res = await pgPool.query(`
-      SELECT
-        im.id, im.medicine_id, m.name as medicine_name,
-        im.batch_id, b.batch_number,
-        COALESCE(im.previous_quantity, 0)::int as previous_quantity,
-        COALESCE(im.adjustment_quantity, 0)::int as adjustment_quantity,
-        COALESCE(im.new_quantity, 0)::int as new_quantity,
-        im.reason, im.movement_type, im.reference_id, im.notes,
-        im.user_id, u.name as user_name,
-        im.device_id, im.date, im.created_at
-      FROM inventory_movements im
-      LEFT JOIN medicines m ON im.medicine_id = m.id
-      LEFT JOIN medicine_batches b ON im.batch_id = b.id
-      LEFT JOIN users u ON im.user_id = u.id
-      ORDER BY im.created_at DESC
-      LIMIT 1000
-    `);
-    if (isLocalMode || (res.rows && res.rows.length > 0)) {
-      return res.rows.map((r) => ({
-        id: r.id,
-        medicine_id: r.medicine_id,
-        medicine_name: r.medicine_name || 'Item',
-        batch_id: r.batch_id,
-        batch_number: r.batch_number || 'Batch',
-        previous_quantity: Number(r.previous_quantity) || 0,
-        adjustment_quantity: Number(r.adjustment_quantity) || 0,
-        new_quantity: Number(r.new_quantity) || 0,
-        // Legacy imported rows predate the reason column (NULL); their meaning is in movement_type.
-        reason: r.reason || r.movement_type || 'UNSPECIFIED',
-        movement_type: r.movement_type || undefined,
-        reference_id: r.reference_id || undefined,
-        notes: r.notes || undefined,
-        user_id: r.user_id || 'admin',
-        user_name: r.user_name || 'Staff',
-        device_id: r.device_id || 'SERVER',
-        date: r.date || '',
-        timestamp: r.created_at ? new Date(r.created_at).getTime() : Date.now(),
-      }));
-    }
-  } catch (err: any) {
-    if (isLocalMode) {
-      console.error('[Server DB] getAllMovements PostgreSQL error:', err.message);
-      throw err;
-    }
-  }
-
-  if (!isLocalMode && isSupabaseConfigured) {
-    try {
-      const { data, error } = await supabaseAdmin
-        .from('inventory_movements')
-        .select('*')
-        .order('created_at', { ascending: false });
-      if (!error && data) return data as InventoryMovement[];
-    } catch (err) {
-      console.warn('[Server DB] Supabase inventory movements query failed:', err);
-    }
-  }
-  return serverDb.get().inventory_movements;
+  const res = await pgPool.query(`
+    SELECT
+      im.id, im.medicine_id, m.name as medicine_name,
+      im.batch_id, b.batch_number,
+      COALESCE(im.previous_quantity, 0)::int as previous_quantity,
+      COALESCE(im.adjustment_quantity, 0)::int as adjustment_quantity,
+      COALESCE(im.new_quantity, 0)::int as new_quantity,
+      im.reason, im.movement_type, im.reference_id, im.notes,
+      im.user_id, u.name as user_name,
+      im.device_id, im.date, im.created_at
+    FROM inventory_movements im
+    LEFT JOIN medicines m ON im.medicine_id = m.id
+    LEFT JOIN medicine_batches b ON im.batch_id = b.id
+    LEFT JOIN users u ON im.user_id = u.id
+    ORDER BY im.created_at DESC
+    LIMIT 1000
+  `);
+  return res.rows.map((r) => ({
+    id: r.id,
+    medicine_id: r.medicine_id,
+    medicine_name: r.medicine_name || 'Item',
+    batch_id: r.batch_id,
+    batch_number: r.batch_number || 'Batch',
+    previous_quantity: Number(r.previous_quantity) || 0,
+    adjustment_quantity: Number(r.adjustment_quantity) || 0,
+    new_quantity: Number(r.new_quantity) || 0,
+    // Legacy imported rows predate the reason column (NULL); their meaning is in movement_type.
+    reason: r.reason || r.movement_type || 'UNSPECIFIED',
+    movement_type: r.movement_type || undefined,
+    reference_id: r.reference_id || undefined,
+    notes: r.notes || undefined,
+    user_id: r.user_id || 'admin',
+    user_name: r.user_name || 'Staff',
+    device_id: r.device_id || 'SERVER',
+    date: r.date || '',
+    timestamp: r.created_at ? new Date(r.created_at).getTime() : Date.now(),
+  }));
 }
 
 // ---------------------------------------------------------------------------
@@ -244,116 +221,6 @@ export function toMedicineStockDto(r: any) {
     version: Number(r.version) || 1,
     updated_at: r.updated_at ? new Date(r.updated_at).toISOString() : new Date().toISOString(),
   };
-}
-
-// ---------------------------------------------------------------------------
-// Generic movement recorder (purchases, returns, legacy adjust endpoint)
-// ---------------------------------------------------------------------------
-
-export async function recordInventoryMovement(movement: InventoryMovement): Promise<InventoryMovement> {
-  const movementRecord: InventoryMovement = {
-    ...movement,
-    id: ensureUuid(movement.id),
-    date: movement.date || localDateStr(),
-    timestamp: movement.timestamp || Date.now(),
-  };
-
-  try {
-    await withTransaction(async (client) => {
-      const deviceId = await resolveDeviceId(client, movementRecord.device_id);
-      await client.query(`
-        INSERT INTO inventory_movements (
-          id, medicine_id, batch_id, previous_quantity, adjustment_quantity, new_quantity,
-          movement_type, reason, reference_id, notes, user_id, device_id, date, timestamp
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-      `, [
-        movementRecord.id,
-        movementRecord.medicine_id,
-        movementRecord.batch_id,
-        movementRecord.previous_quantity || 0,
-        movementRecord.adjustment_quantity || 0,
-        movementRecord.new_quantity || 0,
-        ((movementRecord as any).movement_type || movementRecord.reason || 'STOCK_ADJUSTMENT').toUpperCase(),
-        movementRecord.reason || 'stock_adjustment',
-        movementRecord.reference_id || null,
-        movementRecord.notes || null,
-        cleanUuid(movementRecord.user_id),
-        deviceId,
-        movementRecord.date,
-        movementRecord.timestamp || Date.now(),
-      ]);
-
-      if (movementRecord.batch_id) {
-        await client.query(`
-          UPDATE medicine_batches
-          SET
-            quantity_available = GREATEST(0, quantity_available + $1),
-            status = CASE WHEN quantity_available + $1 <= 0 THEN 'exhausted' ELSE 'active' END,
-            updated_at = CURRENT_TIMESTAMP
-          WHERE id = $2
-        `, [movementRecord.adjustment_quantity, movementRecord.batch_id]);
-      }
-
-      if (movementRecord.medicine_id) {
-        await reconcileMedicineStock(client, movementRecord.medicine_id);
-      }
-    });
-  } catch (pgErr: any) {
-    console.error('[Server DB] recordInventoryMovement PostgreSQL error:', pgErr.message);
-    if (isLocalMode) {
-      throw pgErr;
-    }
-  }
-
-  // PostgreSQL is authoritative in local mode: no secondary JSON / cloud writes.
-  if (isLocalMode) return movementRecord;
-
-  if (isSupabaseConfigured) {
-    try {
-      const { error: movError } = await supabaseAdmin
-        .from('inventory_movements')
-        .insert(movementRecord);
-      if (movError) throw movError;
-
-      const { data: batchData } = await supabaseAdmin
-        .from('medicine_batches')
-        .select('quantity_available')
-        .eq('id', movementRecord.batch_id)
-        .single();
-
-      if (batchData) {
-        const updatedQty = Math.max(0, batchData.quantity_available + movementRecord.adjustment_quantity);
-        await supabaseAdmin
-          .from('medicine_batches')
-          .update({
-            quantity_available: updatedQty,
-            status: updatedQty === 0 ? 'exhausted' : 'active',
-          })
-          .eq('id', movementRecord.batch_id);
-      }
-    } catch (err) {
-      console.warn('[Server DB] Supabase recordInventoryMovement failed:', err);
-    }
-  }
-
-  const store = serverDb.get();
-  store.inventory_movements.unshift(movementRecord);
-  const targetBatch = store.medicine_batches.find((b) => b.id === movementRecord.batch_id);
-  if (targetBatch) {
-    targetBatch.quantity_available = Math.max(0, targetBatch.quantity_available + movementRecord.adjustment_quantity);
-    targetBatch.status = targetBatch.quantity_available === 0 ? 'exhausted' : 'active';
-  }
-  const targetMed = store.medicines.find((m) => m.id === movementRecord.medicine_id);
-  if (targetMed) {
-    const activeBatches = store.medicine_batches.filter(
-      (b) => b.medicine_id === targetMed.id && b.status === 'active'
-    );
-    targetMed.current_stock = activeBatches.reduce((acc, b) => acc + b.quantity_available, 0);
-  }
-  serverDb.persist();
-
-  return movementRecord;
 }
 
 // ---------------------------------------------------------------------------

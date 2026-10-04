@@ -33,6 +33,7 @@ export const MedicineList: React.FC<MedicineListProps> = ({ currentUser, setting
   const [selectedCategory, setSelectedCategory] = useState('All');
   const [categories, setCategories] = useState<Category[]>([]);
   const [stockFilter, setStockFilter] = useState<'all' | 'low' | 'out'>('all');
+  const [includeInactive, setIncludeInactive] = useState(false);
 
   // Modals
   const [editingMedicine, setEditingMedicine] = useState<Medicine | null>(null);
@@ -66,7 +67,8 @@ export const MedicineList: React.FC<MedicineListProps> = ({ currentUser, setting
       'Barcode',
       'SKU',
       ...(showCost ? ['Cost Price'] : []),
-      'Selling Price',
+      'Retail Price',
+      'Wholesale Price',
       'Current Stock',
       'Reorder Level',
       'Unit',
@@ -85,6 +87,7 @@ export const MedicineList: React.FC<MedicineListProps> = ({ currentUser, setting
         m.sku,
         ...(showCost ? [m.purchase_price] : []),
         m.selling_price,
+        m.wholesale_price ?? '',
         m.current_stock,
         m.reorder_level,
         m.unit,
@@ -100,8 +103,10 @@ export const MedicineList: React.FC<MedicineListProps> = ({ currentUser, setting
     );
   };
 
+  // Inactive medicines (incl. automated-test fixtures "ZZ ITEST …") are hidden unless asked for.
+  const activeMedicines = React.useMemo(() => medicines.filter((m) => m.status === 'active'), [medicines]);
   const filtered = React.useMemo(() => {
-    let pool = medicines;
+    let pool = includeInactive ? medicines : activeMedicines;
     if (selectedCategory !== 'All') {
       pool = pool.filter((m) => m.category === selectedCategory);
     }
@@ -113,7 +118,7 @@ export const MedicineList: React.FC<MedicineListProps> = ({ currentUser, setting
 
     if (!search.trim()) return pool;
     return searchMedicines(search, pool);
-  }, [medicines, selectedCategory, stockFilter, search]);
+  }, [medicines, activeMedicines, includeInactive, selectedCategory, stockFilter, search]);
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden bg-slate-50">
@@ -224,7 +229,7 @@ export const MedicineList: React.FC<MedicineListProps> = ({ currentUser, setting
                 stockFilter === 'all' ? 'bg-slate-800 text-white' : 'bg-white text-slate-600 hover:bg-slate-100'
               }`}
             >
-              All ({medicines.length})
+              All ({includeInactive ? medicines.length : activeMedicines.length})
             </button>
             <button
               onClick={() => setStockFilter('low')}
@@ -243,6 +248,16 @@ export const MedicineList: React.FC<MedicineListProps> = ({ currentUser, setting
               Out of Stock
             </button>
           </div>
+
+          <label className="flex items-center gap-1.5 text-xs text-slate-600 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={includeInactive}
+              onChange={(e) => setIncludeInactive(e.target.checked)}
+              className="accent-slate-700"
+            />
+            <span>Include inactive ({medicines.length - activeMedicines.length})</span>
+          </label>
         </div>
       </div>
 
@@ -257,7 +272,8 @@ export const MedicineList: React.FC<MedicineListProps> = ({ currentUser, setting
                 <th className="py-2.5 px-3">Category &amp; Form</th>
                 <th className="py-2.5 px-3 font-mono">Barcode / SKU</th>
                 {showCost && <th className="py-2.5 px-3 text-right">Cost Price</th>}
-                <th className="py-2.5 px-3 text-right">Selling Price</th>
+                <th className="py-2.5 px-3 text-right">Retail Price</th>
+                <th className="py-2.5 px-3 text-right">Wholesale Price</th>
                 <th className="py-2.5 px-3 text-right">Available Stock</th>
                 <th className="py-2.5 px-3 text-center">Status</th>
                 {!isCashierUser && <th className="py-2.5 px-3 text-right">Actions</th>}
@@ -266,7 +282,7 @@ export const MedicineList: React.FC<MedicineListProps> = ({ currentUser, setting
             <tbody className="divide-y divide-slate-100">
               {filtered.length === 0 ? (
                 <tr>
-                  <td colSpan={showCost ? 9 : 8} className="py-12 text-center text-slate-400">
+                  <td colSpan={showCost ? 10 : 9} className="py-12 text-center text-slate-400">
                     No medicines match the selected filter.
                   </td>
                 </tr>
@@ -314,6 +330,14 @@ export const MedicineList: React.FC<MedicineListProps> = ({ currentUser, setting
 
                       <td className="py-2 px-3 text-right font-mono font-bold text-slate-900">
                         {settings.currency} {m.selling_price.toFixed(2)}
+                      </td>
+
+                      <td className="py-2 px-3 text-right font-mono">
+                        {m.wholesale_price != null ? (
+                          <span className="font-bold text-amber-800">{settings.currency} {m.wholesale_price.toFixed(2)}</span>
+                        ) : (
+                          <span className="text-[10px] text-slate-400">Not set</span>
+                        )}
                       </td>
 
                       <td className="py-2 px-3 text-right font-mono">

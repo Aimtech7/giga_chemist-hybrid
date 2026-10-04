@@ -17,16 +17,16 @@ import {
   Filter,
   CheckCircle2,
 } from 'lucide-react';
-import { db, getDeviceId } from '../../db/dexie';
-import { allocateFefo, executeStockMovement } from '../../services/inventoryEngine';
-import { isExpired, isExpiringSoon, normalizeExpiryDate } from '../../utils/expiry';
+import { db } from '../../db/dexie';
+import { allocateFefo } from '../../services/inventoryEngine';
+import { isExpired } from '../../utils/expiry';
 import { searchMedicines } from '../../services/searchEngine';
 import { useBarcodeScanner } from '../../hooks/useBarcodeScanner';
 import { PaymentModal } from './PaymentModal';
 import { HeldSalesModal } from './HeldSalesModal';
 import { ReceiptModal } from './ReceiptModal';
-import { runSync } from '../../services/syncEngine';
-import { canViewCostData, isCashier } from '../../services/permissions';
+import { apiFetch, ApiError } from '../../services/http';
+import { applyServerStockResult, refreshCacheAfterCommit } from '../../services/stockCache';
 import type {
   Medicine,
   MedicineBatch,
@@ -38,8 +38,19 @@ import type {
   PharmacySettings,
   User as UserType,
   PaymentMethod,
+  PriceMode,
   SplitPayment,
 } from '../../types';
+
+/** Wholesale price of a medicine, or null when none is set (never substituted with retail). */
+function wholesalePriceOf(med: Medicine): number | null {
+  return med.wholesale_price != null && Number(med.wholesale_price) > 0 ? Number(med.wholesale_price) : null;
+}
+
+/** Price a line uses in the given mode; null = WHOLESALE requested but no wholesale price exists. */
+function linePrice(med: Medicine, mode: PriceMode): number | null {
+  return mode === 'WHOLESALE' ? wholesalePriceOf(med) : med.selling_price;
+}
 
 interface PosScreenProps {
   currentUser: UserType | null;
@@ -55,10 +66,34 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
   // Search & Filters
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<string>('All');
+  const [categoryOptions, setCategoryOptions] = useState<string[]>([]);
   const [selectedResultIndex, setSelectedResultIndex] = useState<number>(0);
+
+  // Pricing mode: RETAIL is the default; WHOLESALE must be switched on deliberately.
+  const [priceMode, setPriceMode] = useState<PriceMode>('RETAIL');
+  const isWholesale = priceMode === 'WHOLESALE';
 
   // Active Cart State
   const [cart, setCart] = useState<CartItem[]>([]);
+  // One idempotency key per attempted sale: a retried checkout can never create a second sale.
+  const checkoutKeyRef = useRef<string | null>(null);
+
+  // "No wholesale price" decision dialog (replaces the browser confirm box).
+  const [retailFallbackPrompt, setRetailFallbackPrompt] = useState<{
+    items: { name: string; retail: number }[];
+    context: 'add' | 'switch';
+  } | null>(null);
+  const fallbackResolverRef = useRef<((useRetail: boolean) => void) | null>(null);
+  const askRetailFallback = (items: Medicine[], context: 'add' | 'switch') =>
+    new Promise<boolean>((resolve) => {
+      fallbackResolverRef.current = resolve;
+      setRetailFallbackPrompt({ items: items.map((m) => ({ name: m.name, retail: m.selling_price })), context });
+    });
+  const resolveRetailFallback = (useRetail: boolean) => {
+    fallbackResolverRef.current?.(useRetail);
+    fallbackResolverRef.current = null;
+    setRetailFallbackPrompt(null);
+  };
   const [selectedCustomer, setSelectedCustomer] = useState<Customer | null>(null);
   const [discountPercent, setDiscountPercent] = useState<number>(0);
   const [discountError, setDiscountError] = useState<string | null>(null);
@@ -76,8 +111,27 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
   // Load active data from Dexie
   const loadData = async () => {
     try {
+      // Only ACTIVE medicines are sellable or searchable at the till (inactive ones, including the
+      // automated-test fixtures, never appear here).
       const meds = await db.medicines.where('status').equals('active').toArray();
       setMedicines(meds);
+
+      // Real categories (hydrated from PostgreSQL) that at least one active medicine uses.
+      const used = new Set(meds.map((m) => (m.category || '').trim().toLowerCase()).filter(Boolean));
+      const cats = await db.categories.orderBy('name').toArray();
+      const seen = new Set<string>();
+      const options: string[] = [];
+      for (const c of cats.length > 0 ? cats.map((x) => x.name) : meds.map((m) => m.category)) {
+        const key = (c || '').trim().toLowerCase();
+        if (key && used.has(key) && !seen.has(key)) {
+          seen.add(key);
+          options.push(c.trim());
+        }
+      }
+      options.sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+      setCategoryOptions(options);
+      // A remembered category that no longer exists falls back to All.
+      setSelectedCategory((prev) => (prev === 'All' || seen.has(prev.toLowerCase()) ? prev : 'All'));
 
       const allBatches = await db.medicine_batches.toArray();
       setBatches(allBatches);
@@ -103,7 +157,8 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
   const searchedMedicines = React.useMemo(() => {
     let pool = medicines;
     if (selectedCategory !== 'All') {
-      pool = pool.filter((m) => m.category === selectedCategory);
+      const wanted = selectedCategory.trim().toLowerCase();
+      pool = pool.filter((m) => (m.category || '').trim().toLowerCase() === wanted);
     }
     return searchMedicines(searchQuery, pool);
   }, [medicines, selectedCategory, searchQuery]);
@@ -146,7 +201,7 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
 
   useBarcodeScanner({
     onScan: handleBarcodeScan,
-    enabled: !isPaymentOpen && !isHeldOpen && !completedSale,
+    enabled: !isPaymentOpen && !isHeldOpen && !completedSale && !retailFallbackPrompt,
   });
 
   // Global Keyboard Shortcuts (F2 search, F4 pay, F8 hold, Escape, Arrow navigation)
@@ -163,6 +218,10 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
         e.preventDefault();
         if (cart.length > 0) handleHoldSale();
       } else if (e.key === 'Escape') {
+        if (retailFallbackPrompt) {
+          resolveRetailFallback(false);
+          return;
+        }
         if (isPaymentOpen) setIsPaymentOpen(false);
         if (isHeldOpen) setIsHeldOpen(false);
         if (completedSale) {
@@ -174,7 +233,7 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [cart, isPaymentOpen, isHeldOpen, completedSale]);
+  }, [cart, isPaymentOpen, isHeldOpen, completedSale, retailFallbackPrompt]);
 
   // Add medicine to cart with strict FEFO allocation & expired stock blocking
   const addToCart = async (medicine: Medicine) => {
@@ -201,22 +260,68 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
     }
 
     if (existingIndex >= 0) {
+      // Same medicine again: one line, quantity +1, price mode of that line unchanged.
       const updated = [...cart];
-      updated[existingIndex].quantity = requestedQty;
-      updated[existingIndex].allocated_batches = fefo.allocations;
+      updated[existingIndex] = { ...updated[existingIndex], quantity: requestedQty, allocated_batches: fefo.allocations };
       setCart(updated);
-    } else {
-      setCart([
-        ...cart,
-        {
-          medicine,
-          quantity: 1,
-          unit_price: medicine.selling_price,
-          discount_percent: 0,
-          allocated_batches: fefo.allocations,
-        },
-      ]);
+      return;
     }
+
+    let lineMode: PriceMode = priceMode;
+    let retailFallback = false;
+    if (priceMode === 'WHOLESALE' && wholesalePriceOf(medicine) === null) {
+      // Never price silently: selling at retail inside a wholesale sale needs explicit confirmation.
+      const ok = await askRetailFallback([medicine], 'add');
+      if (!ok) {
+        setWarningMessage(`${medicine.name} was not added: no wholesale price is set.`);
+        setTimeout(() => setWarningMessage(null), 4000);
+        return;
+      }
+      lineMode = 'RETAIL';
+      retailFallback = true;
+    }
+
+    setCart((prev) => [
+      ...prev,
+      {
+        medicine,
+        quantity: 1,
+        unit_price: linePrice(medicine, lineMode)!,
+        price_mode: lineMode,
+        retail_fallback: retailFallback,
+        discount_percent: 0,
+        allocated_batches: fefo.allocations,
+      },
+    ]);
+  };
+
+  /**
+   * Switches RETAIL <-> WHOLESALE and re-prices every cart line from the current medicine record,
+   * so no line can keep a stale price from the other mode.
+   */
+  const switchPriceMode = async (mode: PriceMode) => {
+    if (mode === priceMode) return;
+    if (mode === 'RETAIL') {
+      setCart((prev) =>
+        prev.map((i) => ({ ...i, price_mode: 'RETAIL', retail_fallback: false, unit_price: i.medicine.selling_price }))
+      );
+      setPriceMode('RETAIL');
+      return;
+    }
+    const missing = cart.filter((i) => wholesalePriceOf(i.medicine) === null);
+    if (missing.length > 0) {
+      const ok = await askRetailFallback(missing.map((i) => i.medicine), 'switch');
+      if (!ok) return;
+    }
+    setCart((prev) =>
+      prev.map((i) => {
+        const ws = wholesalePriceOf(i.medicine);
+        return ws === null
+          ? { ...i, price_mode: 'RETAIL', retail_fallback: true, unit_price: i.medicine.selling_price }
+          : { ...i, price_mode: 'WHOLESALE', retail_fallback: false, unit_price: ws };
+      })
+    );
+    setPriceMode('WHOLESALE');
   };
 
   const updateCartQuantity = async (medicineId: string, newQty: number) => {
@@ -241,18 +346,6 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
         item.medicine.id === medicineId
           ? { ...item, quantity: newQty, allocated_batches: fefo.allocations }
           : item
-      )
-    );
-  };
-
-  const updateItemDiscount = (medicineId: string, percent: number) => {
-    // Role-governed discounts
-    const maxDiscount = currentUser?.role === 'ADMIN' ? 100 : currentUser?.role === 'MANAGER' ? 25 : 10;
-    const clamped = Math.max(0, Math.min(maxDiscount, percent || 0));
-
-    setCart((prev) =>
-      prev.map((item) =>
-        item.medicine.id === medicineId ? { ...item, discount_percent: clamped } : item
       )
     );
   };
@@ -291,8 +384,16 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
     setDiscountPercent(0);
     setDiscountError(null);
     setCartNote('');
+    // Every new sale starts in RETAIL; wholesale must be chosen again deliberately.
+    setPriceMode('RETAIL');
+    checkoutKeyRef.current = null;
     searchInputRef.current?.focus();
   };
+
+  // Any change to what is being sold makes it a different sale (new idempotency key).
+  useEffect(() => {
+    checkoutKeyRef.current = null;
+  }, [cart, discountPercent, priceMode, selectedCustomer]);
 
   // Financial Calculations avoiding floating point issues
   const subtotal = Math.round(cart.reduce((sum, item) => sum + item.quantity * item.unit_price, 0) * 100) / 100;
@@ -325,25 +426,35 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
     const updatedCart: CartItem[] = [];
     let hadAdjustment = false;
 
+    // Held sales from before wholesale pricing carry no mode: they were retail.
+    const heldMode: PriceMode = heldSale.items.some((i) => i.price_mode === 'WHOLESALE' || i.retail_fallback)
+      ? 'WHOLESALE'
+      : 'RETAIL';
+
     for (const item of heldSale.items) {
+      // Re-price from the CURRENT medicine record so a resumed sale never uses a stale price.
+      const fresh = (await db.medicines.get(item.medicine.id)) || item.medicine;
+      const mode: PriceMode = item.price_mode === 'WHOLESALE' && wholesalePriceOf(fresh) !== null ? 'WHOLESALE' : 'RETAIL';
+      const repriced = {
+        ...item,
+        medicine: fresh,
+        price_mode: mode,
+        retail_fallback: heldMode === 'WHOLESALE' && mode === 'RETAIL',
+        unit_price: linePrice(fresh, mode)!,
+      };
+      if (repriced.unit_price !== item.unit_price) hadAdjustment = true;
       const fefo = await allocateFefo(item.medicine.id, item.quantity);
       if (fefo.possible) {
-        updatedCart.push({
-          ...item,
-          allocated_batches: fefo.allocations,
-        });
+        updatedCart.push({ ...repriced, allocated_batches: fefo.allocations });
       } else if (fefo.allocatedTotal > 0) {
         hadAdjustment = true;
-        updatedCart.push({
-          ...item,
-          quantity: fefo.allocatedTotal,
-          allocated_batches: fefo.allocations,
-        });
+        updatedCart.push({ ...repriced, quantity: fefo.allocatedTotal, allocated_batches: fefo.allocations });
       } else {
         hadAdjustment = true;
       }
     }
 
+    setPriceMode(heldMode);
     setCart(updatedCart);
     setCartNote(heldSale.note || '');
     await db.held_sales.delete(heldSale.id);
@@ -361,7 +472,8 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
     setHeldSales(await db.held_sales.toArray());
   };
 
-  // Complete Sale & Controlled Stock Deduction within an Atomic Dexie Transaction
+  // Complete the sale on the server. PostgreSQL decides prices, batches (FEFO), stock and totals in
+  // ONE transaction; nothing is recorded locally unless that transaction committed.
   const handleCompleteSale = async (paymentData: {
     payment_method: PaymentMethod;
     payment_reference?: string;
@@ -369,202 +481,58 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
     change_given: number;
     split_payments?: SplitPayment[];
   }) => {
-    const deviceId = await getDeviceId();
-    const now = new Date();
-    const todayStr = now.toISOString().split('T')[0];
-    const timeStr = now.toTimeString().split(' ')[0].substring(0, 5);
+    if (!checkoutKeyRef.current) checkoutKeyRef.current = `SALE-${crypto.randomUUID()}`;
 
-    const saleNumber = `GIGA-${now.getFullYear()}${(now.getMonth() + 1)
-      .toString()
-      .padStart(2, '0')}-${Math.floor(1000 + Math.random() * 9000)}`;
-    const receiptNumber = `REC-${Math.floor(100000 + Math.random() * 900000)}`;
-
-    const saleItems: SaleItem[] = [];
-    let costTotal = 0;
-
-    // Line items prorated for overall cart discount
-    const discountRatio = subtotal > 0 ? (subtotal - discountAmount) / subtotal : 1;
-
-    for (const cartItem of cart) {
-      for (const alloc of cartItem.allocated_batches) {
-        const itemSubtotal = alloc.quantity * cartItem.unit_price;
-        const itemProratedDiscount = Math.round((itemSubtotal * (discountPercent / 100)) * 100) / 100;
-        const itemLineTotal = Math.round((itemSubtotal - itemProratedDiscount) * 100) / 100;
-
-        saleItems.push({
-          medicine_id: cartItem.medicine.id,
-          medicine_name: cartItem.medicine.name,
-          generic_name: cartItem.medicine.generic_name,
-          batch_id: alloc.batch_id,
-          batch_number: alloc.batch_number,
-          expiry_date: alloc.expiry_date,
-          quantity: alloc.quantity,
-          unit_price: cartItem.unit_price,
-          discount: itemProratedDiscount,
-          cost_price_snapshot: alloc.cost_price,
-          total: itemLineTotal,
-        });
-
-        costTotal += alloc.quantity * alloc.cost_price;
-      }
-    }
-
-    const newSale: Sale = {
-      id: `sal-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-      sale_number: saleNumber,
-      receipt_number: receiptNumber,
-      date: todayStr,
-      time: timeStr,
-      timestamp: Date.now(),
-      cashier_id: currentUser?.id || 'usr-cashier',
-      cashier_name: currentUser?.name || 'Cashier',
-      customer_id: selectedCustomer?.id,
-      customer_name: selectedCustomer?.name,
-      customer_phone: selectedCustomer?.phone,
-      device_id: deviceId,
-      items: saleItems,
-      subtotal,
+    const payload = {
+      idempotency_key: checkoutKeyRef.current,
+      price_mode: priceMode,
       discount_percent: discountPercent,
-      discount_total: discountAmount,
-      tax_total: taxTotal,
-      total,
-      cost_total: costTotal,
-      gross_profit: total - costTotal,
-      payment_method: paymentData.payment_method,
-      payment_reference: paymentData.payment_reference,
-      amount_received: paymentData.amount_received,
-      change_given: paymentData.change_given,
-      split_payments: paymentData.split_payments,
-      status: 'completed',
-      sync_status: 'pending',
-      retry_count: 0,
-      idempotency_key: `IDEMP-${deviceId}-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`,
+      customer_id: selectedCustomer?.id || null,
+      items: cart.map((i) => ({
+        medicine_id: i.medicine.id,
+        quantity: i.quantity,
+        unit_price: i.unit_price, // what the cashier saw; the server rejects it if it no longer matches
+        price_mode: i.price_mode,
+        retail_fallback_confirmed: i.retail_fallback === true,
+      })),
+      payment: {
+        method: paymentData.payment_method,
+        amount_received: paymentData.amount_received,
+        reference: paymentData.payment_reference,
+        split: paymentData.split_payments,
+      },
     };
 
+    let result: { sale: Sale; medicines: any[]; batches: any[]; duplicate: boolean };
     try {
-      // Atomic Dexie Transaction Covering All Tables
-      await db.transaction(
-        'rw',
-        [
-          db.medicines,
-          db.medicine_batches,
-          db.inventory_movements,
-          db.sales,
-          db.audit_logs,
-          db.customers,
-          db.pending_sync,
-        ],
-        async () => {
-          // 1. Revalidate & Deduct Batches
-          for (const cartItem of cart) {
-            for (const alloc of cartItem.allocated_batches) {
-              const batch = await db.medicine_batches.get(alloc.batch_id);
-              if (!batch) {
-                throw new Error(`Batch ${alloc.batch_number} not found.`);
-              }
-
-              if (isExpired(batch.expiry_date, now)) {
-                throw new Error(`Batch ${alloc.batch_number} has expired and cannot be dispensed.`);
-              }
-
-              const prevBatchQty = batch.quantity_available;
-              const newBatchQty = prevBatchQty - alloc.quantity;
-
-              if (newBatchQty < 0) {
-                throw new Error(`Insufficient stock in batch ${alloc.batch_number} (requested: ${alloc.quantity}, available: ${prevBatchQty})`);
-              }
-
-              batch.quantity_available = newBatchQty;
-              if (newBatchQty === 0) {
-                batch.status = 'exhausted';
-              }
-              await db.medicine_batches.put(batch);
-
-              // Record inventory movement
-              await db.inventory_movements.put({
-                id: `mov-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-                medicine_id: cartItem.medicine.id,
-                medicine_name: cartItem.medicine.name,
-                batch_id: batch.id,
-                batch_number: batch.batch_number,
-                previous_quantity: prevBatchQty,
-                adjustment_quantity: -alloc.quantity,
-                new_quantity: newBatchQty,
-                reason: 'sale',
-                reference_id: saleNumber,
-                notes: `Dispensed at register receipt ${receiptNumber}`,
-                user_id: currentUser?.id || 'usr-cashier',
-                user_name: currentUser?.name || 'Cashier',
-                date: todayStr,
-                device_id: deviceId,
-                timestamp: Date.now(),
-              });
-            }
-
-            // Recalculate medicine current_stock
-            const medBatches = await db.medicine_batches
-              .where('medicine_id')
-              .equals(cartItem.medicine.id)
-              .toArray();
-
-            const totalAvailable = medBatches
-              .filter((b) => b.status === 'active' && !isExpired(b.expiry_date, now))
-              .reduce((sum, b) => sum + b.quantity_available, 0);
-
-            const med = await db.medicines.get(cartItem.medicine.id);
-            if (med) {
-              med.current_stock = totalAvailable;
-              med.updated_at = todayStr;
-              med.updated_by = currentUser?.name || 'Cashier';
-              med.version = (med.version || 1) + 1;
-              await db.medicines.put(med);
-            }
-          }
-
-          // 2. Save sale locally
-          await db.sales.put(newSale);
-
-          // 3. Enqueue Canonical Sync Item
-          await db.pending_sync.put({
-            id: `sync_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-            local_id: newSale.id,
-            entity_type: 'sale',
-            operation: 'CREATE',
-            payload: newSale,
-            device_id: deviceId,
-            idempotency_key: newSale.idempotency_key,
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
-            version: 1,
-            sync_status: 'pending',
-            retry_count: 0,
-          });
-
-          // 4. Update customer total spend if applicable
-          if (selectedCustomer && selectedCustomer.id !== 'cus-001') {
-            const cust = await db.customers.get(selectedCustomer.id);
-            if (cust) {
-              cust.total_spent = (cust.total_spent || 0) + total;
-              cust.last_visit = todayStr;
-              await db.customers.put(cust);
-            }
-          }
-        }
-      );
-
-      // Refresh local medicines list & batches
-      await loadData();
-
-      // Trigger background sync
-      runSync().catch(() => {});
-
-      // Clear cart & trigger receipt view
-      clearCart();
-      setCompletedSale(newSale);
+      result = await apiFetch('/api/sales/checkout', { body: payload });
     } catch (err: any) {
-      console.error('Checkout failed, transaction rolled back:', err);
-      setWarningMessage(`Checkout failed: ${err?.message || 'Transaction aborted'}. No stock was deducted.`);
-      setTimeout(() => setWarningMessage(null), 5000);
+      if (err instanceof ApiError && err.data?.code === 'PRICE_CHANGED' && Array.isArray(err.data.details)) {
+        // Show the current server prices in the cart; the cashier must review and tender again.
+        const current = new Map<string, number>(err.data.details.map((d: any) => [d.medicine_id, Number(d.current)]));
+        setCart((prev) => prev.map((i) => (current.has(i.medicine.id) ? { ...i, unit_price: current.get(i.medicine.id)! } : i)));
+      }
+      const msg = err?.message || 'Checkout failed.';
+      setWarningMessage(`Sale NOT completed: ${msg}`);
+      setTimeout(() => setWarningMessage(null), 6000);
+      throw new Error(msg);
+    }
+
+    // Committed. Cache the authoritative result for fast reads; a cache error never undoes the sale.
+    const cacheWarning = await refreshCacheAfterCommit(async () => {
+      await db.sales.put(result.sale);
+      await applyServerStockResult({ batches: result.batches });
+      for (const m of result.medicines) await applyServerStockResult({ medicine: m });
+    });
+    await loadData();
+    clearCart();
+    setCompletedSale(result.sale);
+    if (result.duplicate) {
+      setWarningMessage('This sale was already completed earlier — showing the original receipt (no second sale was made).');
+      setTimeout(() => setWarningMessage(null), 6000);
+    } else if (cacheWarning) {
+      setWarningMessage(cacheWarning);
+      setTimeout(() => setWarningMessage(null), 8000);
     }
   };
 
@@ -588,17 +556,6 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
 
     return { label: 'Out of Stock', className: 'text-slate-600 bg-slate-100 border-slate-200', sellable: false };
   };
-
-  // Filter categories
-  const categories = [
-    'All',
-    'Analgesics & Antipyretics',
-    'Antibiotics',
-    'Antihistamines',
-    'Antidiabetics',
-    'Gastrointestinal',
-    'Respiratory',
-  ];
 
   return (
     <div className="flex-1 flex overflow-hidden bg-slate-100">
@@ -654,24 +611,35 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
             </div>
           </div>
 
-          {/* Category Filter Toolbar */}
-          <div className="flex items-center gap-1 overflow-x-auto pb-0.5 text-xs">
-            {categories.map((cat) => {
-              const active = selectedCategory === cat;
-              return (
-                <button
-                  key={cat}
-                  onClick={() => setSelectedCategory(cat)}
-                  className={`px-2.5 py-1 rounded text-xs font-medium whitespace-nowrap transition cursor-pointer ${
-                    active
-                      ? 'bg-slate-900 text-white font-semibold'
-                      : 'bg-slate-100 hover:bg-slate-200 text-slate-700'
-                  }`}
-                >
+          {/* Category filter: real PostgreSQL categories (hundreds exist, so a list, not buttons) */}
+          <div className="flex items-center gap-2 text-xs">
+            <label htmlFor="pos-category" className="font-semibold text-slate-600 shrink-0">
+              Category:
+            </label>
+            <select
+              id="pos-category"
+              value={selectedCategory}
+              onChange={(e) => setSelectedCategory(e.target.value)}
+              className={`flex-1 max-w-xs py-1 px-2 border rounded text-xs font-medium bg-white ${
+                selectedCategory === 'All' ? 'border-slate-300 text-slate-700' : 'border-slate-900 text-slate-900 font-semibold'
+              }`}
+            >
+              <option value="All">All categories ({categoryOptions.length})</option>
+              {categoryOptions.map((cat) => (
+                <option key={cat} value={cat}>
                   {cat}
-                </button>
-              );
-            })}
+                </option>
+              ))}
+            </select>
+            {selectedCategory !== 'All' && (
+              <button
+                type="button"
+                onClick={() => setSelectedCategory('All')}
+                className="px-2 py-1 rounded bg-slate-100 hover:bg-slate-200 text-slate-700 font-medium cursor-pointer"
+              >
+                Clear
+              </button>
+            )}
           </div>
 
           {warningMessage && (
@@ -733,9 +701,21 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
 
                     <div className="mt-2.5 pt-1.5 border-t border-slate-100 space-y-1">
                       <div className="flex items-center justify-between text-xs">
-                        <div className="font-bold font-mono text-slate-900">
-                          {settings.currency} {med.selling_price.toFixed(2)}
-                        </div>
+                        {isWholesale ? (
+                          wholesalePriceOf(med) !== null ? (
+                            <div className="font-bold font-mono text-amber-800" title="Wholesale price">
+                              WS {settings.currency} {wholesalePriceOf(med)!.toFixed(2)}
+                            </div>
+                          ) : (
+                            <div className="font-semibold text-[10px] text-rose-700" title={`Retail ${settings.currency} ${med.selling_price.toFixed(2)}`}>
+                              No wholesale price
+                            </div>
+                          )
+                        ) : (
+                          <div className="font-bold font-mono text-slate-900">
+                            {settings.currency} {med.selling_price.toFixed(2)}
+                          </div>
+                        )}
 
                         <div className="font-mono text-[11px] font-semibold text-slate-700">
                           {med.current_stock} <span className="text-[10px] font-normal text-slate-400">{med.unit}</span>
@@ -760,8 +740,41 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
 
       {/* RIGHT COLUMN: POS Register Cart & Checkout Tender */}
       <div className="w-96 flex flex-col bg-white border-l border-slate-200 shrink-0">
+        {/* Pricing mode: large, explicit switch. WHOLESALE recolours the whole cart. */}
+        <div className={`p-2 border-b ${isWholesale ? 'bg-amber-100 border-amber-300' : 'bg-slate-100 border-slate-200'}`}>
+          <div className="grid grid-cols-2 gap-1.5" role="radiogroup" aria-label="Pricing mode">
+            <button
+              type="button"
+              role="radio"
+              aria-checked={!isWholesale}
+              onClick={() => switchPriceMode('RETAIL')}
+              className={`py-2 rounded text-sm font-black tracking-wider transition cursor-pointer border-2 ${
+                !isWholesale ? 'bg-teal-700 border-teal-800 text-white shadow-xs' : 'bg-white border-slate-300 text-slate-500 hover:bg-slate-50'
+              }`}
+            >
+              RETAIL
+            </button>
+            <button
+              type="button"
+              role="radio"
+              aria-checked={isWholesale}
+              onClick={() => switchPriceMode('WHOLESALE')}
+              className={`py-2 rounded text-sm font-black tracking-wider transition cursor-pointer border-2 ${
+                isWholesale ? 'bg-amber-600 border-amber-700 text-white shadow-xs' : 'bg-white border-slate-300 text-slate-500 hover:bg-slate-50'
+              }`}
+            >
+              WHOLESALE
+            </button>
+          </div>
+          {isWholesale && (
+            <div className="mt-1.5 px-2 py-1 rounded bg-amber-600 text-white text-[11px] font-bold text-center uppercase tracking-wide">
+              Wholesale sale — wholesale prices are being charged
+            </div>
+          )}
+        </div>
+
         {/* Cart Header */}
-        <div className="p-3 bg-slate-900 text-white flex items-center justify-between">
+        <div className={`p-3 text-white flex items-center justify-between ${isWholesale ? 'bg-amber-800' : 'bg-slate-900'}`}>
           <div className="flex items-center gap-2">
             <ShoppingCart className="w-4 h-4 text-teal-400" />
             <span className="font-semibold text-xs tracking-tight">Dispensing Cart</span>
@@ -835,6 +848,21 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
                     <div className="font-semibold text-xs text-slate-900 leading-snug">
                       {item.medicine.name}
                     </div>
+                    <div className="mt-0.5">
+                      {item.price_mode === 'WHOLESALE' ? (
+                        <span className="text-[9px] px-1.5 py-0.5 rounded bg-amber-600 text-white font-bold uppercase tracking-wider">
+                          Wholesale
+                        </span>
+                      ) : item.retail_fallback ? (
+                        <span className="text-[9px] px-1.5 py-0.5 rounded bg-rose-100 border border-rose-300 text-rose-800 font-bold uppercase tracking-wider">
+                          Retail — no wholesale price
+                        </span>
+                      ) : (
+                        <span className="text-[9px] px-1.5 py-0.5 rounded bg-teal-50 border border-teal-200 text-teal-800 font-bold uppercase tracking-wider">
+                          Retail
+                        </span>
+                      )}
+                    </div>
                     {/* FEFO Batches preview */}
                     <div className="text-[10px] text-slate-500 font-mono">
                       {item.allocated_batches.map((b) => (
@@ -881,31 +909,13 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
 
                   <div className="text-right">
                     <div className="text-xs font-bold font-mono text-slate-900">
-                      {settings.currency}{' '}
-                      {(item.quantity * item.unit_price * (1 - (item.discount_percent || 0) / 100)).toFixed(2)}
+                      {settings.currency} {(item.quantity * item.unit_price).toFixed(2)}
                     </div>
                     <div className="text-[10px] text-slate-500 font-mono">
                       {item.quantity} × {settings.currency} {item.unit_price.toFixed(2)}
                     </div>
                   </div>
                 </div>
-
-                {/* Optional Item Discount */}
-                {currentUser?.role !== 'CASHIER' && (
-                  <div className="flex items-center justify-end gap-1 text-[10px] pt-1 border-t border-slate-200">
-                    <span className="text-slate-500">Disc %:</span>
-                    <input
-                      type="number"
-                      min="0"
-                      max="100"
-                      value={item.discount_percent || 0}
-                      onChange={(e) =>
-                        updateItemDiscount(item.medicine.id, parseFloat(e.target.value) || 0)
-                      }
-                      className="w-12 px-1 py-0.5 border border-slate-300 rounded text-right font-mono"
-                    />
-                  </div>
-                )}
               </div>
             ))
           )}
@@ -964,7 +974,7 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
             )}
 
             <div className="flex justify-between text-base font-bold text-slate-900 pt-1.5 border-t border-slate-200">
-              <span>TOTAL PAYABLE:</span>
+              <span>{isWholesale ? 'TOTAL PAYABLE (WHOLESALE):' : 'TOTAL PAYABLE:'}</span>
               <span className="font-mono text-teal-800">{settings.currency} {total.toFixed(2)}</span>
             </div>
           </div>
@@ -992,6 +1002,56 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
       </div>
 
       {/* MODALS */}
+      {retailFallbackPrompt && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 p-4" role="dialog" aria-modal="true" aria-labelledby="no-ws-title">
+          <div className="w-full max-w-md bg-white rounded border border-amber-300 shadow-lg overflow-hidden text-slate-800">
+            <div className="bg-amber-600 px-4 py-3 text-white flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4" />
+              <span id="no-ws-title" className="font-bold text-xs uppercase tracking-wider">No wholesale price</span>
+            </div>
+            <div className="p-4 space-y-3 text-sm">
+              {retailFallbackPrompt.items.length === 1 ? (
+                <p>
+                  <strong>{retailFallbackPrompt.items[0].name}</strong> has no wholesale price.
+                </p>
+              ) : (
+                <p>These medicines have no wholesale price:</p>
+              )}
+              <ul className="rounded border border-slate-200 divide-y divide-slate-100 max-h-48 overflow-y-auto">
+                {retailFallbackPrompt.items.map((it) => (
+                  <li key={it.name} className="px-3 py-1.5 flex justify-between gap-3 text-xs">
+                    <span className="font-semibold text-slate-900">{it.name}</span>
+                    <span className="font-mono text-slate-600 shrink-0">Retail {settings.currency} {it.retail.toFixed(2)}</span>
+                  </li>
+                ))}
+              </ul>
+              <p className="text-xs text-slate-600">
+                {retailFallbackPrompt.context === 'add'
+                  ? 'Use Retail Price adds it to this wholesale sale at its RETAIL price. Cancel leaves it out.'
+                  : 'Use Retail Price switches to WHOLESALE and keeps these at their RETAIL price. Cancel stays in RETAIL mode.'}
+              </p>
+            </div>
+            <div className="px-4 py-3 bg-slate-50 border-t border-slate-200 flex justify-end gap-2">
+              <button
+                type="button"
+                autoFocus
+                onClick={() => resolveRetailFallback(false)}
+                className="px-4 py-2 rounded border border-slate-300 bg-white hover:bg-slate-100 text-slate-700 text-xs font-semibold cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => resolveRetailFallback(true)}
+                className="px-4 py-2 rounded bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold cursor-pointer"
+              >
+                Use Retail Price
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <PaymentModal
         isOpen={isPaymentOpen}
         onClose={() => setIsPaymentOpen(false)}

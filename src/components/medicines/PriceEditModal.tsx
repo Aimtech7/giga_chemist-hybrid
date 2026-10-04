@@ -42,6 +42,8 @@ export const PriceEditModal: React.FC<PriceEditModalProps> = ({
   const [purchasePrice, setPurchasePrice] = useState<string>('');
   const [reorderLevel, setReorderLevel] = useState<string>('');
   const [minSellingPrice, setMinSellingPrice] = useState<string>('');
+  // Empty = no wholesale price (the POS then cannot sell this medicine at wholesale without confirmation).
+  const [wholesalePrice, setWholesalePrice] = useState<string>('');
 
   const [error, setError] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
@@ -73,6 +75,7 @@ export const PriceEditModal: React.FC<PriceEditModalProps> = ({
       setPurchasePrice(selectedMed.purchase_price ? selectedMed.purchase_price.toString() : '0');
       setReorderLevel(selectedMed.reorder_level ? selectedMed.reorder_level.toString() : '20');
       setMinSellingPrice(selectedMed.min_selling_price ? selectedMed.min_selling_price.toString() : selectedMed.selling_price.toString());
+      setWholesalePrice(selectedMed.wholesale_price != null ? selectedMed.wholesale_price.toString() : '');
       setError(null);
       setSuccessMsg(null);
     }
@@ -107,6 +110,8 @@ export const PriceEditModal: React.FC<PriceEditModalProps> = ({
   const numReorder = parseInt(reorderLevel, 10);
 
   const isValidSelling = !isNaN(numSelling) && isFinite(numSelling) && numSelling >= 0;
+  const numWholesale = wholesalePrice.trim() === '' ? null : parseFloat(wholesalePrice);
+  const isValidWholesale = numWholesale === null || (isFinite(numWholesale) && numWholesale > 0);
   const isValidPurchase = !isNaN(numPurchase) && isFinite(numPurchase) && numPurchase >= 0;
 
   const currentMarkup =
@@ -138,6 +143,11 @@ export const PriceEditModal: React.FC<PriceEditModalProps> = ({
       return;
     }
 
+    if (!isValidWholesale) {
+      setError('Wholesale price must be greater than zero, or left empty for no wholesale price.');
+      return;
+    }
+
     if (isNaN(numReorder) || numReorder < 0) {
       setError('Reorder level must be a valid positive integer.');
       return;
@@ -160,6 +170,7 @@ export const PriceEditModal: React.FC<PriceEditModalProps> = ({
           purchase_price: roundedPurchase,
           reorder_level: numReorder,
           min_selling_price: roundedMinSelling,
+          wholesale_price: numWholesale === null ? null : Math.round(numWholesale * 100) / 100,
         },
       });
       // The committed PostgreSQL record is authoritative for the cache and the POS.
@@ -169,6 +180,7 @@ export const PriceEditModal: React.FC<PriceEditModalProps> = ({
       await db.medicines.update(selectedMed.id, {
         selling_price: updatedMedicine.selling_price,
         purchase_price: updatedMedicine.purchase_price,
+        wholesale_price: updatedMedicine.wholesale_price ?? null,
         reorder_level: updatedMedicine.reorder_level,
         min_selling_price: updatedMedicine.min_selling_price,
         version: updatedMedicine.version,
@@ -295,9 +307,17 @@ export const PriceEditModal: React.FC<PriceEditModalProps> = ({
                       </span>
                     </div>
                     <div className="flex justify-between">
-                      <span className="text-slate-500">Selling Price:</span>
+                      <span className="text-slate-500">Retail Price:</span>
                       <span className="font-bold text-slate-900">
                         {settings.currency} {selectedMed.selling_price.toFixed(2)}
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">Wholesale Price:</span>
+                      <span className={`font-bold ${selectedMed.wholesale_price != null ? 'text-amber-800' : 'text-rose-600'}`}>
+                        {selectedMed.wholesale_price != null
+                          ? `${settings.currency} ${selectedMed.wholesale_price.toFixed(2)}`
+                          : 'Not set'}
                       </span>
                     </div>
                     <div className="flex justify-between pt-1 border-t border-slate-200 text-[11px]">
@@ -345,7 +365,7 @@ export const PriceEditModal: React.FC<PriceEditModalProps> = ({
                   <div>
                     <label className="block text-xs font-bold text-slate-800 mb-1 flex items-center gap-1">
                       <DollarSign className="w-3.5 h-3.5 text-teal-700" />
-                      <span>New Selling Price ({settings.currency}) *</span>
+                      <span>New Retail Price ({settings.currency}) *</span>
                     </label>
                     <input
                       type="number"
@@ -360,6 +380,26 @@ export const PriceEditModal: React.FC<PriceEditModalProps> = ({
                     />
                     <span className="text-[10px] text-slate-400 mt-0.5 block">
                       Price billed at register / POS.
+                    </span>
+                  </div>
+
+                  {/* Wholesale Price */}
+                  <div>
+                    <label className="block text-xs font-bold text-amber-800 mb-1 flex items-center gap-1">
+                      <DollarSign className="w-3.5 h-3.5 text-amber-700" />
+                      <span>Wholesale Price ({settings.currency})</span>
+                    </label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      min="0.01"
+                      value={wholesalePrice}
+                      onChange={(e) => setWholesalePrice(e.target.value)}
+                      className="w-full px-3 py-2 border border-amber-300 rounded font-mono font-bold text-sm text-slate-900 bg-amber-50/40 focus:ring-1 focus:ring-amber-600 focus:outline-hidden"
+                      placeholder="Leave empty = no wholesale price"
+                    />
+                    <span className="text-[10px] text-slate-400 mt-0.5 block">
+                      Charged automatically in POS WHOLESALE mode.
                     </span>
                   </div>
 
@@ -425,6 +465,15 @@ export const PriceEditModal: React.FC<PriceEditModalProps> = ({
                   </div>
                 </div>
 
+                {numWholesale !== null && isValidSelling && numWholesale > numSelling && (
+                  <div className="p-2 rounded bg-amber-50 border border-amber-200 text-amber-900 text-xs flex items-center gap-2">
+                    <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                    <span>
+                      <strong>Check:</strong> wholesale price ({settings.currency} {numWholesale.toFixed(2)}) is higher than the retail price ({settings.currency} {numSelling.toFixed(2)}).
+                    </span>
+                  </div>
+                )}
+
                 {/* Loss-Leader Warning */}
                 {isValidSelling && isValidPurchase && numSelling < numPurchase && (
                   <div className="p-2 rounded bg-rose-50 border border-rose-200 text-rose-800 text-xs flex items-center gap-2 animate-fadeIn">
@@ -459,7 +508,7 @@ export const PriceEditModal: React.FC<PriceEditModalProps> = ({
                   </button>
                   <button
                     type="submit"
-                    disabled={isSubmitting || !isValidSelling || !isValidPurchase}
+                    disabled={isSubmitting || !isValidSelling || !isValidPurchase || !isValidWholesale}
                     className="px-4 py-2 rounded bg-teal-700 hover:bg-teal-800 text-white text-xs font-bold transition flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
                   >
                     {isSubmitting ? (

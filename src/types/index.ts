@@ -106,7 +106,8 @@ export interface Medicine {
   description: string;
   purchase_price: number;
   selling_price: number;
-  wholesale_price?: number;
+  /** Wholesale price; null/undefined = no wholesale price set for this medicine. */
+  wholesale_price?: number | null;
   min_selling_price?: number;
   current_stock: number;
   reorder_level: number;
@@ -175,6 +176,9 @@ export interface InventoryMovement {
   timestamp: number;
 }
 
+/** Which price list a sale line used. NULL on legacy (pre-wholesale) sales = retail. */
+export type PriceMode = 'RETAIL' | 'WHOLESALE';
+
 export type PaymentMethod = 'Cash' | 'M-Pesa' | 'Card' | 'Bank' | 'Mixed';
 
 export interface SplitPayment {
@@ -187,6 +191,10 @@ export interface CartItem {
   medicine: Medicine;
   quantity: number;
   unit_price: number;
+  /** Price list actually applied to this line. */
+  price_mode: PriceMode;
+  /** WHOLESALE cart but this medicine has no wholesale price: retail was explicitly confirmed. */
+  retail_fallback?: boolean;
   discount_percent: number;
   allocated_batches: {
     batch_id: string;
@@ -198,6 +206,8 @@ export interface CartItem {
 }
 
 export interface SaleItem {
+  /** sale_items.id (server) */
+  id?: string;
   medicine_id: string;
   medicine_name: string;
   generic_name: string;
@@ -209,6 +219,7 @@ export interface SaleItem {
   discount: number;
   cost_price_snapshot: number;
   total: number;
+  price_mode?: PriceMode | null;
 }
 
 export type SaleStatus = 'completed' | 'held' | 'returned' | 'partially_returned' | 'voided';
@@ -229,6 +240,8 @@ export interface Sale {
   customer_phone?: string;
   device_id: string;
   items: SaleItem[];
+  /** Sale-level pricing mode selected at the till (null on legacy sales). */
+  price_mode?: PriceMode | null;
   subtotal: number;
   discount_percent?: number;
   discount_total: number;
@@ -248,6 +261,8 @@ export interface Sale {
   retry_count: number;
   last_sync_attempt?: number;
   idempotency_key: string;
+  /** Quantities/amounts already returned per medicine+batch (server). */
+  returned_items?: { medicine_id: string; batch_id: string; quantity: number; refunded: number }[];
 }
 
 export type ReturnAction = 'return_to_stock' | 'damaged' | 'quarantine' | 'dispose';

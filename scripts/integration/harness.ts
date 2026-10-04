@@ -172,3 +172,57 @@ export async function upsertFixtureMedicine(barcode: string, name: string, selli
   );
   return id;
 }
+
+// ---------------------------------------------------------------------------
+// Fixture hygiene. Runs before and after every suite run. Only touches records that the tests
+// created and that are unambiguously identifiable:
+//   users      email LIKE 'itest-%@gigachemist.local'
+//   medicines  barcode LIKE 'ITEST-%'
+//   suppliers / customers  name LIKE 'ZZ ITEST%'
+// Sales are deleted only when made by an itest user AND every line is an ITEST medicine.
+// ---------------------------------------------------------------------------
+export async function cleanupFixtures(): Promise<Record<string, number>> {
+  const client = await pool.connect();
+  const counts: Record<string, number> = {};
+  try {
+    await client.query('BEGIN');
+    const testSales = `
+      SELECT s.id FROM sales s JOIN users u ON u.id = s.cashier_id
+      WHERE u.email LIKE 'itest-%@gigachemist.local'
+        AND NOT EXISTS (SELECT 1 FROM sale_items si JOIN medicines m ON m.id = si.medicine_id
+                        WHERE si.sale_id = s.id AND m.barcode NOT LIKE 'ITEST-%')`;
+    counts.returns = (await client.query(`DELETE FROM returns WHERE sale_id IN (${testSales})`)).rowCount || 0;
+    counts.sales = (await client.query(`DELETE FROM sales WHERE id IN (${testSales})`)).rowCount || 0; // items/payments cascade
+    const testPurchases = `SELECT p.id FROM purchases p JOIN suppliers s ON s.id = p.supplier_id WHERE s.name LIKE 'ZZ ITEST%'`;
+    counts.purchases = (await client.query(`DELETE FROM purchases WHERE id IN (${testPurchases})`)).rowCount || 0;
+    counts.expenses = (await client.query(
+      `DELETE FROM expenses WHERE user_id IN (SELECT id FROM users WHERE email LIKE 'itest-%@gigachemist.local')`
+    )).rowCount || 0;
+    counts.movements = (await client.query(
+      `DELETE FROM inventory_movements WHERE medicine_id IN (SELECT id FROM medicines WHERE barcode LIKE 'ITEST-%')`
+    )).rowCount || 0;
+    await client.query(
+      `UPDATE medicine_batches SET quantity_available = 0, status = 'exhausted', supplier_id = NULL
+       WHERE medicine_id IN (SELECT id FROM medicines WHERE barcode LIKE 'ITEST-%')`
+    );
+    await client.query(
+      `UPDATE medicines SET current_stock = 0, status = 'inactive' WHERE barcode LIKE 'ITEST-%'`
+    );
+    counts.customers = (await client.query(
+      `DELETE FROM customers c WHERE c.name LIKE 'ZZ ITEST%' AND NOT EXISTS (SELECT 1 FROM sales s WHERE s.customer_id = c.id)`
+    )).rowCount || 0;
+    counts.suppliers = (await client.query(
+      `DELETE FROM suppliers s WHERE s.name LIKE 'ZZ ITEST%' AND NOT EXISTS (SELECT 1 FROM purchases p WHERE p.supplier_id = s.id)`
+    )).rowCount || 0;
+    counts.users_deactivated = (await client.query(
+      `UPDATE users SET active = false WHERE email LIKE 'itest-%@gigachemist.local' AND active`
+    )).rowCount || 0;
+    await client.query('COMMIT');
+    return counts;
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}

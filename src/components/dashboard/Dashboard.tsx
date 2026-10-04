@@ -14,6 +14,7 @@ import {
   ShieldCheck,
 } from 'lucide-react';
 import { db } from '../../db/dexie';
+import { apiFetch } from '../../services/http';
 import { getInventoryValuation } from '../../services/inventoryEngine';
 import { getPendingCount } from '../../services/syncEngine';
 import { canViewCostData, isCashier } from '../../services/permissions';
@@ -49,32 +50,34 @@ export const Dashboard: React.FC<DashboardProps> = ({ currentUser, settings, onN
 
   useEffect(() => {
     async function loadDashboard() {
-      const todayStr = new Date().toISOString().split('T')[0];
       const sales = await db.sales.toArray();
-      
-      // Filter today's completed sales
-      const todaySalesList = sales.filter((s) => {
-        if (s.date !== todayStr || s.status !== 'completed') return false;
-        if (isCashierUser && currentUser?.id) {
-          // Operational cashier sees their own shift transactions or all today's register transactions
-          return s.cashier_id === currentUser.id || !s.cashier_id;
-        }
-        return true;
-      });
 
+      // Today's totals come from PostgreSQL (Africa/Nairobi business day; Cashier = own sales only;
+      // voids excluded; discounted totals; split payments counted per part). Never summed from cache.
       let todaySales = 0;
       let todayProfit = 0;
+      let todayTransactions = 0;
       let cashSales = 0;
       let mpesaSales = 0;
       let cardSales = 0;
-
-      todaySalesList.forEach((s) => {
-        todaySales += s.total;
-        if (showCostAndProfits && s.gross_profit) todayProfit += s.gross_profit;
-        if (s.payment_method === 'Cash') cashSales += s.total;
-        else if (s.payment_method === 'M-Pesa') mpesaSales += s.total;
-        else if (s.payment_method === 'Card') cardSales += s.total;
-      });
+      try {
+        const summary = await apiFetch<{
+          totalSales: number;
+          transactionCount: number;
+          cashTotal: number;
+          mpesaTotal: number;
+          otherTotal: number;
+          grossProfit?: number;
+        }>('/api/sales/today-summary');
+        todaySales = summary.totalSales;
+        todayTransactions = summary.transactionCount;
+        cashSales = summary.cashTotal;
+        mpesaSales = summary.mpesaTotal;
+        cardSales = summary.otherTotal;
+        if (showCostAndProfits) todayProfit = summary.grossProfit ?? 0;
+      } catch (err: any) {
+        console.error('[Dashboard] Today summary unavailable:', err?.message || err);
+      }
 
       let inventoryValue = 0;
       let lowStock = 0;
@@ -110,7 +113,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ currentUser, settings, onN
       setMetrics({
         todaySales,
         todayProfit,
-        todayTransactions: todaySalesList.length,
+        todayTransactions,
         cashSales,
         mpesaSales,
         cardSales,

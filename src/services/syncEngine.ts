@@ -1,7 +1,7 @@
 import { db, getDeviceId, getSettings, saveSettings } from '../db/dexie';
 import { setSyncingState, refreshNetworkStatus } from './network';
-import { getAuthHeaders } from './auth';
-import { apiUrl } from './api';
+import { apiFetch } from './http';
+import { getCachedUser, hasUsableToken } from './session';
 import { supabase } from '../lib/supabase';
 import type {
   Sale,
@@ -122,18 +122,17 @@ export async function refreshPendingCount(): Promise<number> {
 }
 
 /**
- * Execute full synchronization between client IndexedDB and server REST API
- * Implements:
- * 1. Transaction-based payloads
- * 2. Stable idempotency keys
- * 3. Safe stock merge (prevents overwriting local unsynced stock)
- * 4. Reliable retry & error reporting
+ * Local-mode synchronization. PostgreSQL is authoritative and every sale / return / expense is
+ * completed online against it, so there is nothing to "push": a sync is a refresh of this
+ * browser's cache from the server.
+ *
+ * Items left in the old offline queue (from earlier versions) are NEVER replayed and never marked
+ * synced: they are marked 'failed' with a reason so the operator can see and re-enter them.
  */
 export async function runSync(force = false): Promise<boolean> {
   const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
   if (!isOnline && !force) {
     currentSummary.state = 'offline';
-    currentSummary.pendingCount = await getPendingCount();
     notifyListeners();
     return false;
   }
@@ -144,202 +143,26 @@ export async function runSync(force = false): Promise<boolean> {
   notifyListeners();
 
   try {
-    const deviceId = await getDeviceId();
+    const stranded = await markLegacyQueueFailed();
+    const ok = await syncFromLocalApiToDexie();
+    if (!ok) throw new Error('Could not refresh data from the GIGA CHEMIST server.');
 
-    // 1. Collect pending records
-    const [pendingSales, pendingMovements, pendingReturns, pendingExpenses, queueItems] =
-      await Promise.all([
-        db.sales.where('sync_status').equals('pending').toArray(),
-        db.inventory_movements.toArray(),
-        db.customer_returns.where('sync_status').equals('pending').toArray(),
-        db.expenses.where('sync_status').equals('pending').toArray(),
-        db.pending_sync.where('sync_status').equals('pending').toArray(),
-      ]);
-
-    // Merge any queued sales/returns not yet flagged in tables
-    for (const q of queueItems) {
-      if (q.entity_type === 'sale' && q.payload) {
-        if (!pendingSales.some((s) => s.id === q.local_id)) {
-          pendingSales.push(q.payload);
-        }
-      } else if (q.entity_type === 'return' && q.payload) {
-        if (!pendingReturns.some((r) => r.id === q.local_id)) {
-          pendingReturns.push(q.payload);
-        }
-      } else if (q.entity_type === 'expense' && q.payload) {
-        if (!pendingExpenses.some((e) => e.id === q.local_id)) {
-          pendingExpenses.push(q.payload);
-        }
-      }
-    }
-
-    const payload: SyncPayload = {
-      device_id: deviceId,
-      sales: pendingSales,
-      movements: pendingMovements.slice(-100),
-      returns: pendingReturns,
-      expenses: pendingExpenses,
-    };
-
-    // Send to canonical server sync endpoint with auth headers
-    const authHeaders = getAuthHeaders();
-    const response = await fetch(apiUrl('/api/sync'), {
-      method: 'POST',
-      headers: {
-        ...authHeaders,
-        'Content-Type': 'application/json',
-        'x-device-id': deviceId,
-      },
-      body: JSON.stringify(payload),
-    });
-
-    if (!response.ok) {
-      throw new Error(`Server returned HTTP ${response.status}: ${response.statusText}`);
-    }
-
-    const data: SyncResponse = await response.json();
-    const nowStr = new Date().toISOString();
-
-    // 2. Mark acknowledged items as synced in atomic transaction
-    await db.transaction('rw', [
-      db.sales,
-      db.customer_returns,
-      db.expenses,
-      db.pending_sync,
-      db.medicines,
-      db.medicine_batches,
-      db.settings,
-      db.sync_metadata,
-    ], async () => {
-      // Mark sales synced
-      for (const saleId of data.synced_sale_ids || []) {
-        const sale = await db.sales.get(saleId);
-        if (sale) {
-          sale.sync_status = 'synced';
-          sale.retry_count = 0;
-          await db.sales.put(sale);
-        }
-        // Also update matching queue items
-        const qItems = await db.pending_sync.where('local_id').equals(saleId).toArray();
-        for (const qi of qItems) {
-          qi.sync_status = 'synced';
-          qi.updated_at = nowStr;
-          await db.pending_sync.put(qi);
-        }
-      }
-
-      // Mark returns synced
-      for (const retId of data.synced_return_ids || []) {
-        const ret = await db.customer_returns.get(retId);
-        if (ret) {
-          ret.sync_status = 'synced';
-          await db.customer_returns.put(ret);
-        }
-        const qItems = await db.pending_sync.where('local_id').equals(retId).toArray();
-        for (const qi of qItems) {
-          qi.sync_status = 'synced';
-          qi.updated_at = nowStr;
-          await db.pending_sync.put(qi);
-        }
-      }
-
-      // Mark expenses synced
-      for (const expId of data.synced_expense_ids || []) {
-        const exp = await db.expenses.get(expId);
-        if (exp) {
-          exp.sync_status = 'synced';
-          await db.expenses.put(exp);
-        }
-        const qItems = await db.pending_sync.where('local_id').equals(expId).toArray();
-        for (const qi of qItems) {
-          qi.sync_status = 'synced';
-          qi.updated_at = nowStr;
-          await db.pending_sync.put(qi);
-        }
-      }
-
-      // 3. SAFE STOCK MERGE (PREVENT SILENT STOCK ERASURE):
-      // Find remaining unsynced sales/returns to protect local stock counts
-      const remainingPendingSales = await db.sales.where('sync_status').equals('pending').toArray();
-      const lockedMedicineIds = new Set<string>();
-      const lockedBatchIds = new Set<string>();
-
-      for (const s of remainingPendingSales) {
-        if (Array.isArray(s.items)) {
-          for (const it of s.items) {
-            lockedMedicineIds.add(it.medicine_id);
-            lockedBatchIds.add(it.batch_id);
-          }
-        }
-      }
-
-      // Merge Authoritative Medicines safely
-      if (data.authoritative_medicines && data.authoritative_medicines.length > 0) {
-        for (const srvMed of data.authoritative_medicines) {
-          const localMed = await db.medicines.get(srvMed.id);
-          if (localMed && lockedMedicineIds.has(srvMed.id)) {
-            // Unsynced sales exist for this product: update metadata, preserve local deducted stock
-            await db.medicines.put({
-              ...srvMed,
-              current_stock: localMed.current_stock,
-            });
-          } else {
-            // No pending changes: apply authoritative stock
-            await db.medicines.put(srvMed);
-          }
-        }
-      }
-
-      // Merge Authoritative Batches safely
-      if (data.authoritative_batches && data.authoritative_batches.length > 0) {
-        for (const srvBatch of data.authoritative_batches) {
-          const localBatch = await db.medicine_batches.get(srvBatch.id);
-          if (localBatch && lockedBatchIds.has(srvBatch.id)) {
-            // Unsynced local deductions: preserve local available quantity
-            await db.medicine_batches.put({
-              ...srvBatch,
-              quantity_available: localBatch.quantity_available,
-              status: localBatch.status,
-            });
-          } else {
-            await db.medicine_batches.put(srvBatch);
-          }
-        }
-      }
-
-      // Save Authoritative Settings
-      if (data.authoritative_settings) {
-        await saveSettings(data.authoritative_settings);
-      }
-
-      await db.sync_metadata.put({ key: 'last_successful_sync', value: nowStr });
-    });
-
-    currentSummary.state = 'synced';
-    currentSummary.pendingCount = await getPendingCount();
+    currentSummary.state = stranded > 0 ? 'error' : 'synced';
+    currentSummary.errorMessage =
+      stranded > 0
+        ? `${stranded} item(s) saved only on this browser by an older version were NOT applied to the database. Re-enter them.`
+        : undefined;
     currentSummary.lastSyncedAt = new Date();
-    currentSummary.errorMessage = undefined;
-    setSyncingState(false);
+    currentSummary.pendingCount = await getPendingCount();
+    setSyncingState(false, currentSummary.errorMessage);
     notifyListeners();
     refreshNetworkStatus();
-    return true;
+    return stranded === 0;
   } catch (error: any) {
-    console.warn('Sync attempt failed:', error);
-
-    // Increment retry count for pending queue items
-    try {
-      const pendingItems = await db.pending_sync.where('sync_status').equals('pending').toArray();
-      for (const item of pendingItems) {
-        item.retry_count = (item.retry_count || 0) + 1;
-        item.last_attempt = Date.now();
-        item.error_message = error?.message || 'Sync connection failed';
-        await db.pending_sync.put(item);
-      }
-    } catch (e) {}
-
+    console.warn('[SyncEngine] Sync failed:', error);
     currentSummary.state = isOnline ? 'error' : 'offline';
     currentSummary.pendingCount = await getPendingCount();
-    currentSummary.errorMessage = error?.message || 'Sync failed. Local data preserved safely.';
+    currentSummary.errorMessage = error?.message || 'Sync failed.';
     setSyncingState(false, currentSummary.errorMessage);
     notifyListeners();
     refreshNetworkStatus();
@@ -347,198 +170,75 @@ export async function runSync(force = false): Promise<boolean> {
   }
 }
 
+/** Marks every still-pending legacy offline item as failed (never synced). Returns how many. */
+async function markLegacyQueueFailed(): Promise<number> {
+  const reason = 'Not applied: offline-queued writes are not accepted in local mode. Re-enter this record.';
+  return db.transaction('rw', [db.pending_sync, db.sales, db.customer_returns, db.expenses], async () => {
+    let n = 0;
+    for (const q of await db.pending_sync.where('sync_status').equals('pending').toArray()) {
+      await db.pending_sync.put({ ...q, sync_status: 'failed', error_message: reason, updated_at: new Date().toISOString() });
+      n++;
+    }
+    for (const s of await db.sales.where('sync_status').equals('pending').toArray()) {
+      await db.sales.put({ ...s, sync_status: 'failed' });
+      n++;
+    }
+    for (const r of await db.customer_returns.where('sync_status').equals('pending').toArray()) {
+      await db.customer_returns.put({ ...r, sync_status: 'failed' });
+      n++;
+    }
+    for (const e of await db.expenses.where('sync_status').equals('pending').toArray()) {
+      await db.expenses.put({ ...e, sync_status: 'failed' });
+      n++;
+    }
+    return n;
+  });
+}
+
 /**
- * Local API to Dexie Hydration Routine (for Standalone Offline-First & Target PC Mode)
- * Populates local Dexie stores directly from authenticated local Express API endpoints
+ * Hydrates this browser's Dexie cache from the authenticated local API (PostgreSQL).
+ * Admin-only resources are skipped for Cashiers (the server would answer 403 anyway).
+ * Returns false only if the essential catalog (medicines + batches) could not be loaded.
  */
 export async function syncFromLocalApiToDexie(): Promise<boolean> {
-  try {
-    console.log('[SyncEngine] Hydrating formulary and operational data from local Express API (PostgreSQL)...');
-    const authHeaders = getAuthHeaders();
+  if (!hasUsableToken()) return false;
+  const isAdmin = getCachedUser()?.role === 'ADMIN';
+  console.log('[SyncEngine] Refreshing local cache from the GIGA CHEMIST server (PostgreSQL)...');
 
-    // 1. Fetch Categories
+  const load = async <T>(label: string, endpoint: string, store: (rows: T) => Promise<void>): Promise<boolean> => {
     try {
-      const resCat = await fetch(apiUrl('/api/categories'), { headers: authHeaders });
-      if (!resCat.ok) {
-        const body = await resCat.json().catch(() => ({}));
-        console.error(`[SyncEngine] Categories hydration failed: HTTP ${resCat.status}`, body.error || '');
-      } else {
-        const categories = await resCat.json();
-        if (!Array.isArray(categories)) {
-          console.error('[SyncEngine] Categories hydration failed: expected a JSON array from /api/categories.');
-        } else {
-          // bulkPut is keyed by category id, so re-hydration never duplicates rows.
-          await db.categories.bulkPut(categories);
-          console.log(`[SyncEngine] Hydrated ${categories.length} categories into Dexie.`);
-        }
-      }
-    } catch (e) {
-      console.error('[SyncEngine] Categories hydration failed:', e);
+      await store(await apiFetch<T>(endpoint));
+      return true;
+    } catch (err: any) {
+      console.error(`[SyncEngine] ${label} hydration failed:`, err?.message || err);
+      return false;
     }
+  };
+  const putAll = async (table: any, rows: unknown) => {
+    if (!Array.isArray(rows)) throw new Error('expected a JSON array');
+    for (let i = 0; i < rows.length; i += 500) await table.bulkPut(rows.slice(i, i + 500));
+  };
 
-    // 2. Fetch Suppliers
-    try {
-      const resSup = await fetch(apiUrl('/api/suppliers'), { headers: authHeaders });
-      if (resSup.ok) {
-        const suppliers = await resSup.json();
-        if (Array.isArray(suppliers) && suppliers.length > 0) {
-          await db.suppliers.bulkPut(suppliers);
-          console.log(`[SyncEngine] Hydrated ${suppliers.length} suppliers into Dexie.`);
-        }
-      }
-    } catch (e) {
-      console.warn('[SyncEngine] Suppliers hydration notice:', e);
-    }
-
-    // 3. Fetch Customers
-    try {
-      const resCust = await fetch(apiUrl('/api/customers'), { headers: authHeaders });
-      if (resCust.ok) {
-        const customers = await resCust.json();
-        if (Array.isArray(customers) && customers.length > 0) {
-          await db.customers.bulkPut(customers);
-          console.log(`[SyncEngine] Hydrated ${customers.length} customers into Dexie.`);
-        }
-      }
-    } catch (e) {
-      console.warn('[SyncEngine] Customers hydration notice:', e);
-    }
-
-    // 4. Fetch All Medicines from local PostgreSQL API (Chunked for UI performance)
-    try {
-      const resMeds = await fetch(apiUrl('/api/medicines'), { headers: authHeaders });
-      if (resMeds.ok) {
-        const medicines = await resMeds.json();
-        if (Array.isArray(medicines) && medicines.length > 0) {
-          const chunkSize = 500;
-          for (let i = 0; i < medicines.length; i += chunkSize) {
-            const chunk = medicines.slice(i, i + chunkSize);
-            await db.medicines.bulkPut(chunk);
-          }
-          console.log(`[SyncEngine] Hydrated ${medicines.length} medicines into Dexie store.`);
-        }
-      }
-    } catch (e) {
-      console.warn('[SyncEngine] Medicines hydration notice:', e);
-    }
-
-    // 5. Fetch Batches from local PostgreSQL API
-    try {
-      const resBatches = await fetch(apiUrl('/api/batches'), { headers: authHeaders });
-      if (resBatches.ok) {
-        const batches = await resBatches.json();
-        if (Array.isArray(batches) && batches.length > 0) {
-          const chunkSize = 500;
-          for (let i = 0; i < batches.length; i += chunkSize) {
-            const chunk = batches.slice(i, i + chunkSize);
-            await db.medicine_batches.bulkPut(chunk);
-          }
-          console.log(`[SyncEngine] Hydrated ${batches.length} batches into Dexie store.`);
-        }
-      }
-    } catch (e) {
-      console.warn('[SyncEngine] Batches hydration notice:', e);
-    }
-
-    // 6. Fetch Sales History (recent sales into Dexie for instant offline viewing)
-    try {
-      const resSales = await fetch(apiUrl('/api/sales?limit=500'), { headers: authHeaders });
-      if (resSales.ok) {
-        const data = await resSales.json();
-        const salesList = Array.isArray(data) ? data : (data.sales || []);
-        if (Array.isArray(salesList) && salesList.length > 0) {
-          const chunkSize = 200;
-          for (let i = 0; i < salesList.length; i += chunkSize) {
-            const chunk = salesList.slice(i, i + chunkSize);
-            await db.sales.bulkPut(chunk);
-          }
-          console.log(`[SyncEngine] Hydrated ${salesList.length} sales into Dexie store.`);
-        }
-      }
-    } catch (e) {
-      console.warn('[SyncEngine] Sales hydration notice:', e);
-    }
-
-    // 7. Fetch Purchases
-    try {
-      const resPurchases = await fetch(apiUrl('/api/purchases'), { headers: authHeaders });
-      if (resPurchases.ok) {
-        const purchases = await resPurchases.json();
-        if (Array.isArray(purchases) && purchases.length > 0) {
-          await db.purchases.bulkPut(purchases);
-          console.log(`[SyncEngine] Hydrated ${purchases.length} purchases into Dexie store.`);
-        }
-      }
-    } catch (e) {
-      console.warn('[SyncEngine] Purchases hydration notice:', e);
-    }
-
-    // 8. Fetch Inventory Movements
-    try {
-      const resMovements = await fetch(apiUrl('/api/inventory/movements'), { headers: authHeaders });
-      if (resMovements.ok) {
-        const movements = await resMovements.json();
-        if (Array.isArray(movements) && movements.length > 0) {
-          const chunkSize = 500;
-          for (let i = 0; i < movements.length; i += chunkSize) {
-            const chunk = movements.slice(i, i + chunkSize);
-            await db.inventory_movements.bulkPut(chunk);
-          }
-          console.log(`[SyncEngine] Hydrated ${movements.length} movements into Dexie store.`);
-        }
-      }
-    } catch (e) {
-      console.warn('[SyncEngine] Movements hydration notice:', e);
-    }
-
-    // 9. Fetch Returns
-    try {
-      const resReturns = await fetch(apiUrl('/api/returns'), { headers: authHeaders });
-      if (resReturns.ok) {
-        const returns = await resReturns.json();
-        if (Array.isArray(returns) && returns.length > 0) {
-          await db.customer_returns.bulkPut(returns);
-          console.log(`[SyncEngine] Hydrated ${returns.length} returns into Dexie store.`);
-        }
-      }
-    } catch (e) {
-      console.warn('[SyncEngine] Returns hydration notice:', e);
-    }
-
-    // 10. Fetch Expenses
-    try {
-      const resExpenses = await fetch(apiUrl('/api/expenses'), { headers: authHeaders });
-      if (resExpenses.ok) {
-        const expenses = await resExpenses.json();
-        if (Array.isArray(expenses) && expenses.length > 0) {
-          await db.expenses.bulkPut(expenses);
-          console.log(`[SyncEngine] Hydrated ${expenses.length} expenses into Dexie store.`);
-        }
-      }
-    } catch (e) {
-      console.warn('[SyncEngine] Expenses hydration notice:', e);
-    }
-
-    // 11. Fetch Settings
-    try {
-      const resSettings = await fetch(apiUrl('/api/settings'), { headers: authHeaders });
-      if (resSettings.ok) {
-        const s = await resSettings.json();
-        if (s && s.pharmacy_name) {
-          await saveSettings(s);
-        }
-      }
-    } catch (e) {}
-
-    currentSummary.state = 'synced';
-    currentSummary.lastSyncedAt = new Date();
-    currentSummary.pendingCount = await getPendingCount();
-    notifyListeners();
-    return true;
-  } catch (err) {
-    console.warn('[SyncEngine] Local API to Dexie hydration notice:', err);
-    return false;
+  // Keyed bulkPut: re-hydration overwrites cached rows with the server version, never duplicates.
+  await load('Categories', '/api/categories', (rows) => putAll(db.categories, rows));
+  await load('Customers', '/api/customers', (rows) => putAll(db.customers, rows));
+  const medsOk = await load('Medicines', '/api/medicines', (rows) => putAll(db.medicines, rows));
+  const batchesOk = await load('Batches', '/api/batches', (rows) => putAll(db.medicine_batches, rows));
+  await load<any>('Sales', '/api/sales?limit=500', (data) => putAll(db.sales, Array.isArray(data) ? data : data?.sales || []));
+  await load('Returns', '/api/returns', (rows) => putAll(db.customer_returns, rows));
+  if (isAdmin) {
+    await load('Suppliers', '/api/suppliers', (rows) => putAll(db.suppliers, rows));
+    await load('Purchases', '/api/purchases', (rows) => putAll(db.purchases, rows));
+    await load('Inventory movements', '/api/inventory/movements', (rows) => putAll(db.inventory_movements, rows));
+    await load('Expenses', '/api/expenses', (rows) => putAll(db.expenses, rows));
   }
+  await load<any>('Settings', '/api/settings', async (s) => {
+    if (s?.pharmacy_name) await saveSettings(s);
+  });
+
+  currentSummary.pendingCount = await getPendingCount();
+  notifyListeners();
+  return medsOk && batchesOk;
 }
 
 /**

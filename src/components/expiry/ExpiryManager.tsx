@@ -13,7 +13,8 @@ import {
   Search,
 } from 'lucide-react';
 import { db } from '../../db/dexie';
-import { disposeOrQuarantineBatch } from '../../services/inventoryEngine';
+import { apiFetch } from '../../services/http';
+import { applyServerStockResult, refreshCacheAfterCommit } from '../../services/stockCache';
 import { isExpired, getDaysUntilExpiry, normalizeExpiryDate } from '../../utils/expiry';
 import { downloadCSV } from '../../services/exportUtils';
 import { StockAdjustmentModal } from '../inventory/StockAdjustmentModal';
@@ -95,14 +96,32 @@ export const ExpiryManager: React.FC<ExpiryManagerProps> = ({ currentUser, setti
 
     setIsProcessing(true);
     try {
-      await disposeOrQuarantineBatch({
-        batchId: selectedBatch.id,
-        action: disposalAction,
-        reasonNotes: disposalNotes.trim() || `Marked as ${disposalAction} via Expiry Manager`,
-        user: currentUser,
-      });
+      // Server-side, audited stock removal of the whole remaining batch quantity (one transaction).
+      const qty = Number(selectedBatch.quantity_available) || 0;
+      if (qty > 0) {
+        const reasonByAction: Record<string, string> = {
+          quarantine: 'EXPIRED_QUARANTINE',
+          destroy: 'EXPIRED_DESTROYED',
+          return_to_supplier: 'RETURN_TO_SUPPLIER',
+          remove: 'EXPIRED_REMOVED',
+        };
+        const result = await apiFetch('/api/inventory/remove-stock', {
+          body: {
+            medicine_id: selectedBatch.medicine_id,
+            batch_id: selectedBatch.id,
+            quantity: qty,
+            reason: reasonByAction[disposalAction] || 'EXPIRED_REMOVED',
+            notes: disposalNotes.trim() || `Marked as ${disposalAction} via Expiry Manager`,
+          },
+        });
+        await refreshCacheAfterCommit(() => applyServerStockResult(result));
+      }
 
-      setActionSuccess(`Batch ${selectedBatch.batch_number} successfully processed as ${disposalAction}.`);
+      setActionSuccess(
+        qty > 0
+          ? `Batch ${selectedBatch.batch_number}: ${qty} unit(s) removed from stock (${disposalAction}).`
+          : `Batch ${selectedBatch.batch_number} has no remaining quantity; nothing to remove.`
+      );
       setSelectedBatch(null);
       setDisposalNotes('');
       await loadBatches();

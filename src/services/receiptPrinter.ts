@@ -8,13 +8,13 @@ export function generateThermalReceiptHtml(sale: Sale, settings: PharmacySetting
     .map(
       (item) => `
       <div style="margin-bottom: 6px; border-bottom: 1px dashed #ddd; padding-bottom: 4px;">
-        <div style="font-weight: 700; font-size: 13px;">${item.medicine_name}</div>
+        <div style="font-weight: 700; font-size: 13px;">${item.medicine_name}${item.price_mode === 'WHOLESALE' ? ' [WS]' : ''}</div>
         <div style="display: flex; justify-content: space-between; font-size: 11px; color: #444;">
           <span>Batch: ${item.batch_number} (Exp: ${item.expiry_date})</span>
         </div>
         <div style="display: flex; justify-content: space-between; font-size: 12px; margin-top: 2px;">
           <span>${item.quantity} × ${settings.currency} ${item.unit_price.toFixed(2)}</span>
-          <span style="font-weight: 600;">${settings.currency} ${item.total.toFixed(2)}</span>
+          <span style="font-weight: 600;">${settings.currency} ${(item.quantity * item.unit_price).toFixed(2)}</span>
         </div>
       </div>
     `
@@ -106,6 +106,11 @@ export function generateThermalReceiptHtml(sale: Sale, settings: PharmacySetting
           <span>Cashier:</span>
           <span>${sale.cashier_name}</span>
         </div>
+        ${
+          sale.price_mode === 'WHOLESALE'
+            ? `<div class="text-center font-bold" style="margin-top: 4px; border: 1px solid #000; letter-spacing: 2px;">*** WHOLESALE SALE ***</div>`
+            : ''
+        }
         ${
           sale.customer_name && sale.customer_name !== 'Walk-in Customer'
             ? `<div class="row">

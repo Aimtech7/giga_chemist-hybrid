@@ -7,16 +7,15 @@ import {
   updateMedicineDetails,
   adminUpdateMedicinePricing,
   getAllBatches,
-  upsertBatch,
   getAllMovements,
-  recordInventoryMovement,
   adminSetStock,
   adminAddStock,
   adminRemoveStock,
   adminEditBatchExpiry,
   adminPhysicalStockCount,
   getAllSales,
-  processSaleCheckout,
+  checkoutSale,
+  voidSale,
   getTodaySalesSummary,
   getAllCustomers,
   upsertCustomer,
@@ -443,7 +442,6 @@ apiRouter.get('/medicines', requirePermission('medicine.view'), async (req: Auth
       const sanitized = medicines.map((m) => ({
         ...m,
         purchase_price: 0,
-        wholesale_price: 0,
       }));
       return res.json(sanitized);
     }
@@ -523,30 +521,6 @@ apiRouter.get('/batches', requirePermission('medicine.view'), async (req: Authen
   }
 });
 
-apiRouter.post('/batches', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
-  try {
-    const batchData: MedicineBatch = req.body;
-    if (!batchData.medicine_id || !batchData.batch_number) {
-      return res.status(400).json({ error: 'Medicine ID and batch number are required.' });
-    }
-
-    const saved = await upsertBatch(batchData);
-    await recordAuditLog({
-      user_id: req.userId || 'admin',
-      user_name: req.userName || 'Admin',
-      role: req.userRole || 'ADMIN',
-      action: 'CREATE_BATCH',
-      entity: 'medicine_batch',
-      entity_id: saved.id,
-      new_value: JSON.stringify(saved),
-    });
-
-    res.json({ success: true, batch: saved });
-  } catch (err: any) {
-    res.status(400).json({ error: err.message || 'Failed to create batch.' });
-  }
-});
-
 // --- 6. INVENTORY MOVEMENTS & STOCK ADJUSTMENTS ---
 apiRouter.get('/inventory/movements', requirePermission('inventory.view'), async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -554,50 +528,6 @@ apiRouter.get('/inventory/movements', requirePermission('inventory.view'), async
     res.json(movements);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch inventory movements.' });
-  }
-});
-
-apiRouter.post('/inventory/adjust', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
-  try {
-    const { medicine_id, medicine_name, batch_id, batch_number, adjustment_quantity, reason, notes } = req.body;
-    if (!medicine_id || !batch_id || adjustment_quantity === undefined) {
-      return res.status(400).json({ error: 'medicine_id, batch_id, and adjustment_quantity are required.' });
-    }
-    requireUuid(medicine_id, 'medicine_id');
-    requireUuid(batch_id, 'batch_id');
-
-    const movement = await recordInventoryMovement({
-      id: crypto.randomUUID(),
-      medicine_id,
-      medicine_name: medicine_name || 'Item',
-      batch_id,
-      batch_number: batch_number || 'Batch',
-      previous_quantity: 0,
-      adjustment_quantity: Number(adjustment_quantity),
-      new_quantity: Number(adjustment_quantity),
-      reason: (reason as any) || 'stock_adjustment',
-      notes,
-      user_id: req.userId!,
-      user_name: req.userName || 'Admin',
-      device_id: (req.headers['x-device-id'] as string) || 'SERVER',
-      date: new Date().toLocaleDateString('en-CA'),
-      timestamp: Date.now(),
-    });
-
-    await recordAuditLog({
-      user_id: req.userId!,
-      user_name: req.userName || 'Admin',
-      role: req.userRole || 'ADMIN',
-      action: 'INVENTORY_ADJUSTMENT',
-      entity: 'inventory_movement',
-      entity_id: movement.id,
-      new_value: JSON.stringify({ adjustment_quantity, reason, notes }),
-    });
-
-    res.json({ success: true, movement });
-  } catch (err: any) {
-    console.error('[API] /inventory/adjust failed:', err.message);
-    res.status(errorStatus(err)).json({ error: err.message || 'Failed to adjust stock.' });
   }
 });
 
@@ -686,279 +616,189 @@ apiRouter.post('/inventory/physical-count', requireRole('ADMIN'), async (req: Au
   }
 });
 
-// --- 7. SALES & ATOMIC TRANSACTION CHECKOUT ---
-// Today's Sales Summary (Server-side calculated with Cashier isolation)
+// --- 7. SALES (server-authoritative checkout, explicit void, PostgreSQL daily summary) ---
+function saleActor(req: AuthenticatedRequest) {
+  return stockActor(req) as ReturnType<typeof stockActor> & { role: UserRole };
+}
+
+function sendError(res: Response, err: any, fallback: string, label: string) {
+  const status = errorStatus(err);
+  if (status >= 500) console.error(`[API] ${label} failed:`, err.message);
+  res.status(status).json({ error: err.message || fallback, code: err.code, details: err.details });
+}
+
+// Today's totals. A CASHIER always gets only their own; an ADMIN gets all (or ?cashierId=<uuid>).
 apiRouter.get('/sales/today-summary', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   try {
-    // Strict isolation: CASHIER can only ever fetch their own daily sales summary
-    const cashierId = req.userRole === 'CASHIER' ? req.userId : (req.query.cashierId as string | undefined);
-    const summary = await getTodaySalesSummary({ cashierId, role: req.userRole });
+    const cashierId = req.userRole === 'ADMIN' ? (req.query.cashierId as string | undefined) || undefined : req.userId;
+    const summary = await getTodaySalesSummary({ cashierId });
+    if (req.userRole !== 'ADMIN') delete summary.grossProfit;
     res.json(summary);
   } catch (err: any) {
-    res.status(500).json({ error: 'Failed to calculate today sales summary.', details: err.message });
+    sendError(res, err, 'Failed to calculate today sales summary.', 'GET /sales/today-summary');
   }
 });
 
 apiRouter.get('/sales', requirePermission('sales.view_own'), async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const page = req.query.page ? parseInt(req.query.page as string, 10) : undefined;
-    const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : undefined;
-    const search = req.query.search as string | undefined;
-    const startDate = req.query.startDate as string | undefined;
-    const endDate = req.query.endDate as string | undefined;
-    const cashierId = req.userRole === 'CASHIER' ? req.userId : (req.query.cashierId as string | undefined);
-
-    const result = await getAllSales({ page, limit, search, startDate, endDate, cashierId });
-
-    if (req.userRole === 'CASHIER') {
-      if (Array.isArray(result)) {
-        const sanitized = result.map((s) => ({
-          ...s,
-          cost_total: 0,
-          gross_profit: 0,
-          items: s.items?.map((item) => ({ ...item, cost_price_snapshot: 0 })),
-        }));
-        return res.json(sanitized);
-      } else {
-        const sanitized = {
-          ...result,
-          sales: result.sales.map((s) => ({
-            ...s,
-            cost_total: 0,
-            gross_profit: 0,
-            items: s.items?.map((item) => ({ ...item, cost_price_snapshot: 0 })),
-          })),
-        };
-        return res.json(sanitized);
-      }
-    }
-
-    res.json(result);
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch sales history.' });
+    const result = await getAllSales({
+      page: req.query.page ? parseInt(req.query.page as string, 10) : undefined,
+      limit: req.query.limit ? parseInt(req.query.limit as string, 10) : undefined,
+      search: req.query.search as string | undefined,
+      startDate: req.query.startDate as string | undefined,
+      endDate: req.query.endDate as string | undefined,
+      cashierId: req.userRole === 'CASHIER' ? req.userId : (req.query.cashierId as string | undefined),
+    });
+    if (req.userRole !== 'CASHIER') return res.json(result);
+    // Cost and profit are hidden from Cashiers.
+    const strip = (s: Sale) => ({
+      ...s,
+      cost_total: 0,
+      gross_profit: 0,
+      items: s.items?.map((item) => ({ ...item, cost_price_snapshot: 0 })),
+    });
+    res.json(Array.isArray(result) ? result.map(strip) : { ...result, sales: result.sales.map(strip) });
+  } catch (err: any) {
+    sendError(res, err, 'Failed to fetch sales history.', 'GET /sales');
   }
 });
 
 apiRouter.post('/sales/checkout', requirePermission('sales.create'), async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const saleData: Sale = req.body;
-    if (!saleData.receipt_number || !Array.isArray(saleData.items) || saleData.items.length === 0) {
-      return res.status(400).json({ error: 'Invalid sale payload structure.' });
-    }
-
-    const result = await processSaleCheckout(
-      {
-        ...saleData,
-        cashier_id: req.userId || saleData.cashier_id,
-        cashier_name: req.userName || saleData.cashier_name,
-      },
-      {
-        userRole: req.userRole,
-        userId: req.userId,
-      }
-    );
-
-    res.json(result);
+    const result = await checkoutSale(req.body || {}, saleActor(req));
+    res.status(result.duplicate ? 200 : 201).json(result);
   } catch (err: any) {
-    res.status(400).json({ error: err.message || 'Failed to process sale checkout.' });
+    sendError(res, err, 'Failed to process sale checkout.', 'POST /sales/checkout');
   }
 });
 
-apiRouter.post('/sales/:id/void', requirePermission('sales.void'), async (req: AuthenticatedRequest, res: Response) => {
+// Explicit, transactional reversal. ADMIN only. Never re-runs checkout; history is kept.
+apiRouter.post('/sales/:id/void', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { id } = req.params;
-    const { void_reason } = req.body;
-
-    const result = await processSaleCheckout({
-      id,
-      receipt_number: req.body.receipt_number || id,
-      sale_number: req.body.sale_number || id,
-      status: 'voided',
-      void_reason: void_reason || 'Administrative void',
-      voided_by: req.userId,
-      items: [],
-      total: 0,
-      subtotal: 0,
-      amount_received: 0,
-      cost_total: 0,
-      gross_profit: 0,
-      payment_method: 'Cash',
-      date: new Date().toISOString().split('T')[0],
-      time: new Date().toLocaleTimeString(),
-    } as any);
-
-    await recordAuditLog({
-      user_id: req.userId || 'admin',
-      user_name: req.userName || 'Admin',
-      role: 'ADMIN',
-      action: 'SALE_VOIDED',
-      entity: 'sale',
-      entity_id: id,
-      new_value: JSON.stringify({ void_reason }),
-    });
-
-    res.json({ success: true, result });
+    res.json(await voidSale(req.params.id, req.body?.void_reason ?? req.body?.reason, saleActor(req)));
   } catch (err: any) {
-    res.status(400).json({ error: err.message || 'Failed to void sale.' });
+    sendError(res, err, 'Failed to void sale.', 'POST /sales/:id/void');
   }
 });
 
-// --- 8. SYNCHRONIZATION ENGINE ENDPOINT (/api/sync) ---
-apiRouter.post('/sync', requirePermission('sales.create'), async (req: AuthenticatedRequest, res: Response) => {
+// --- 8. SYNCHRONIZATION ENDPOINT (/api/sync) ---
+// In APP_MODE=local every write is completed online against PostgreSQL, so browser-queued
+// (offline) sales/returns/expenses are refused rather than replayed with browser-made numbers.
+apiRouter.post('/sync', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const payload: SyncPayload = req.body;
-    const syncedSaleIds: string[] = [];
-    const syncedMovementIds: string[] = [];
-    const syncedReturnIds: string[] = [];
-    const syncedExpenseIds: string[] = [];
-
-    // 1. Process pending offline sales with idempotency
-    if (Array.isArray(payload.sales)) {
-      for (const sale of payload.sales) {
-        const result = await processSaleCheckout(sale);
-        if (result.success) {
-          syncedSaleIds.push(sale.id);
-        }
-      }
+    const payload: Partial<SyncPayload> = req.body || {};
+    const queued =
+      (payload.sales?.length || 0) + (payload.returns?.length || 0) + (payload.expenses?.length || 0);
+    if (queued > 0) {
+      return res.status(409).json({
+        error: `Offline-queued writes are not accepted in local mode. ${queued} queued item(s) were NOT applied; ` +
+          'complete them again while connected to the POS server.',
+        code: 'OFFLINE_QUEUE_REJECTED',
+      });
     }
-
-    // 2. Process customer returns
-    if (Array.isArray(payload.returns)) {
-      for (const ret of payload.returns) {
-        await processCustomerReturn(ret);
-        syncedReturnIds.push(ret.id);
-      }
-    }
-
-    // 3. Process expenses
-    if (Array.isArray(payload.expenses)) {
-      for (const exp of payload.expenses) {
-        await recordExpense(exp);
-        syncedExpenseIds.push(exp.id);
-      }
-    }
-
-    // Fetch latest authoritative master catalogs
-    const [medicines, batches, settings] = await Promise.all([
-      getAllMedicines(),
-      getAllBatches(),
-      getPharmacySettings(),
-    ]);
-
-    const sanitizedMedicines = req.userRole === 'CASHIER'
-      ? medicines.map((m) => ({ ...m, purchase_price: 0, wholesale_price: 0 }))
-      : medicines;
-
+    const [medicines, batches, settings] = await Promise.all([getAllMedicines(), getAllBatches(), getPharmacySettings()]);
     const syncResponse: SyncResponse = {
       success: true,
-      synced_sale_ids: syncedSaleIds,
-      synced_movement_ids: syncedMovementIds,
-      synced_return_ids: syncedReturnIds,
-      synced_expense_ids: syncedExpenseIds,
-      authoritative_medicines: sanitizedMedicines,
+      synced_sale_ids: [],
+      synced_movement_ids: [],
+      synced_return_ids: [],
+      synced_expense_ids: [],
+      authoritative_medicines:
+        req.userRole === 'CASHIER' ? medicines.map((m) => ({ ...m, purchase_price: 0 })) : medicines,
       authoritative_batches: batches,
       authoritative_settings: settings,
       server_timestamp: Date.now(),
     };
-
     res.json(syncResponse);
   } catch (err: any) {
-    res.status(500).json({ error: 'Sync processing error', details: err.message });
+    sendError(res, err, 'Sync processing error.', 'POST /sync');
   }
 });
 
 // --- 9. CUSTOMERS ---
-apiRouter.get('/customers', requirePermission('sales.view_own'), async (req, res) => {
+apiRouter.get('/customers', requirePermission('sales.view_own'), async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const customers = await getAllCustomers();
-    res.json(customers);
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch customers.' });
-  }
-});
-
-apiRouter.post('/customers', requirePermission('sales.create'), async (req, res) => {
-  try {
-    const saved = await upsertCustomer(req.body);
-    res.json({ success: true, customer: saved });
+    res.json(await getAllCustomers());
   } catch (err: any) {
-    res.status(400).json({ error: err.message || 'Failed to save customer.' });
+    sendError(res, err, 'Failed to fetch customers.', 'GET /customers');
   }
 });
 
-// --- 10. SUPPLIERS ---
-apiRouter.get('/suppliers', requirePermission('suppliers.manage'), async (req, res) => {
+apiRouter.post('/customers', requirePermission('sales.create'), async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const suppliers = await getAllSuppliers();
-    res.json(suppliers);
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch suppliers.' });
-  }
-});
-
-apiRouter.post('/suppliers', requirePermission('suppliers.manage'), async (req, res) => {
-  try {
-    const saved = await upsertSupplier(req.body);
-    res.json({ success: true, supplier: saved });
+    res.json({ success: true, customer: await upsertCustomer(req.body || {}, saleActor(req)) });
   } catch (err: any) {
-    res.status(400).json({ error: err.message || 'Failed to save supplier.' });
+    sendError(res, err, 'Failed to save customer.', 'POST /customers');
   }
 });
 
-// --- 11. PURCHASES ---
-apiRouter.get('/purchases', requirePermission('stock.receive'), async (req, res) => {
+// --- 10. SUPPLIERS (ADMIN) ---
+apiRouter.get('/suppliers', requirePermission('suppliers.manage'), async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const purchases = await getAllPurchases();
-    res.json(purchases);
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch purchases.' });
-  }
-});
-
-apiRouter.post('/purchases/receive', requirePermission('stock.receive'), async (req, res) => {
-  try {
-    const saved = await receivePurchaseOrder(req.body);
-    res.json({ success: true, purchase: saved });
+    res.json(await getAllSuppliers());
   } catch (err: any) {
-    res.status(400).json({ error: err.message || 'Failed to receive purchase.' });
+    sendError(res, err, 'Failed to fetch suppliers.', 'GET /suppliers');
   }
 });
+
+apiRouter.post('/suppliers', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    res.json({ success: true, supplier: await upsertSupplier(req.body || {}, saleActor(req)) });
+  } catch (err: any) {
+    sendError(res, err, 'Failed to save supplier.', 'POST /suppliers');
+  }
+});
+
+// --- 11. PURCHASES (ADMIN) ---
+apiRouter.get('/purchases', requirePermission('stock.receive'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    res.json(await getAllPurchases());
+  } catch (err: any) {
+    sendError(res, err, 'Failed to fetch purchases.', 'GET /purchases');
+  }
+});
+
+async function handleReceivePurchase(req: AuthenticatedRequest, res: Response) {
+  try {
+    res.status(201).json(await receivePurchaseOrder(req.body || {}, saleActor(req)));
+  } catch (err: any) {
+    sendError(res, err, 'Failed to receive purchase.', 'POST /purchases');
+  }
+}
+apiRouter.post('/purchases', requireRole('ADMIN'), handleReceivePurchase);
+apiRouter.post('/purchases/receive', requireRole('ADMIN'), handleReceivePurchase);
 
 // --- 12. RETURNS ---
-apiRouter.get('/returns', requirePermission('returns.create'), async (req, res) => {
+apiRouter.get('/returns', requirePermission('returns.create'), async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const returns = await getAllReturns();
-    res.json(returns);
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch returns.' });
-  }
-});
-
-apiRouter.post('/returns', requirePermission('returns.create'), async (req, res) => {
-  try {
-    const saved = await processCustomerReturn(req.body);
-    res.json({ success: true, return: saved });
+    res.json(await getAllReturns({ userId: req.userRole === 'CASHIER' ? req.userId : undefined }));
   } catch (err: any) {
-    res.status(400).json({ error: err.message || 'Failed to process return.' });
+    sendError(res, err, 'Failed to fetch returns.', 'GET /returns');
   }
 });
 
-// --- 13. EXPENSES ---
-apiRouter.get('/expenses', requirePermission('expenses.manage'), async (req, res) => {
+apiRouter.post('/returns', requirePermission('returns.create'), async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const expenses = await getAllExpenses();
-    res.json(expenses);
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch expenses.' });
-  }
-});
-
-apiRouter.post('/expenses', requirePermission('expenses.manage'), async (req, res) => {
-  try {
-    const saved = await recordExpense(req.body);
-    res.json({ success: true, expense: saved });
+    res.status(201).json(await processCustomerReturn(req.body || {}, saleActor(req)));
   } catch (err: any) {
-    res.status(400).json({ error: err.message || 'Failed to record expense.' });
+    sendError(res, err, 'Failed to process return.', 'POST /returns');
+  }
+});
+
+// --- 13. EXPENSES (ADMIN) ---
+apiRouter.get('/expenses', requirePermission('expenses.manage'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    res.json(await getAllExpenses());
+  } catch (err: any) {
+    sendError(res, err, 'Failed to fetch expenses.', 'GET /expenses');
+  }
+});
+
+apiRouter.post('/expenses', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    res.status(201).json({ success: true, expense: await recordExpense(req.body || {}, saleActor(req)) });
+  } catch (err: any) {
+    sendError(res, err, 'Failed to record expense.', 'POST /expenses');
   }
 });
 

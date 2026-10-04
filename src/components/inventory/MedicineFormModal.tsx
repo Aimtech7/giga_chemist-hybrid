@@ -35,8 +35,8 @@ export const MedicineFormModal: React.FC<MedicineFormModalProps> = ({
     description: '',
     purchase_price: 5,
     selling_price: 15,
-    wholesale_price: 12,
-    min_selling_price: 10,
+    wholesale_price: null,
+    min_selling_price: undefined,
     reorder_level: 30,
     unit: 'Strips (10 tabs)',
     prescription_required: false,
@@ -70,8 +70,8 @@ export const MedicineFormModal: React.FC<MedicineFormModalProps> = ({
         description: '',
         purchase_price: 10,
         selling_price: 25,
-        wholesale_price: 20,
-        min_selling_price: 18,
+        wholesale_price: null,
+        min_selling_price: undefined,
         reorder_level: 20,
         unit: 'Strips (10 tabs)',
         prescription_required: false,
@@ -140,8 +140,9 @@ export const MedicineFormModal: React.FC<MedicineFormModalProps> = ({
         ...formData,
         purchase_price: Number(formData.purchase_price) || 0,
         selling_price: Number(formData.selling_price) || 0,
-        wholesale_price: Number(formData.wholesale_price) || 0,
-        min_selling_price: Number(formData.min_selling_price) || 0,
+        // Empty wholesale = no wholesale price (never invented from a default).
+        wholesale_price: formData.wholesale_price != null && Number(formData.wholesale_price) > 0 ? Number(formData.wholesale_price) : null,
+        min_selling_price: Number(formData.min_selling_price) || undefined,
         reorder_level: Number(formData.reorder_level) || 0,
       };
       // Stock is never edited from this form (use Stock Management / Physical Count).
@@ -347,6 +348,24 @@ export const MedicineFormModal: React.FC<MedicineFormModalProps> = ({
                 value={formData.selling_price || ''}
                 onChange={(e) => setFormData({ ...formData, selling_price: parseFloat(e.target.value) || 0 })}
                 className="w-full p-2 border border-teal-300 rounded font-mono font-black text-teal-900 bg-white"
+              />
+            </div>
+
+            {/* Wholesale Price (Admin Only) */}
+            <div className="bg-amber-50 p-2.5 rounded border border-amber-200">
+              <label className="block font-bold text-amber-900 mb-1">
+                Wholesale Price ({settings.currency})
+              </label>
+              <input
+                type="number"
+                step="0.01"
+                min="0.01"
+                value={formData.wholesale_price ?? ''}
+                onChange={(e) =>
+                  setFormData({ ...formData, wholesale_price: e.target.value === '' ? null : parseFloat(e.target.value) })
+                }
+                placeholder="Leave empty = no wholesale price"
+                className="w-full p-2 border border-amber-300 rounded font-mono font-black text-amber-900 bg-white"
               />
             </div>
 
