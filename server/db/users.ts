@@ -13,11 +13,14 @@ export const ASSIGNABLE_ROLES: UserRole[] = ['ADMIN', 'CASHIER'];
 export const MIN_PASSWORD_LENGTH = 8;
 const PIN_PATTERN = /^\d{4,6}$/;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+/** Same rule as chk_users_username_format (migration 011); stored lower-case. */
+const USERNAME_PATTERN = /^[a-z0-9][a-z0-9._-]{2,49}$/;
 
 interface UserRow {
   id: string;
   name: string;
   email: string;
+  username: string | null;
   role: UserRole;
   phone: string | null;
   active: boolean;
@@ -28,13 +31,14 @@ interface UserRow {
   last_login: Date | null;
 }
 
-const PUBLIC_COLUMNS = 'id, name, email, role, phone, active, created_at, updated_at, last_login';
+const PUBLIC_COLUMNS = 'id, name, email, username, role, phone, active, created_at, updated_at, last_login';
 
 function toUser(r: any): User {
   return {
     id: r.id,
     name: r.name,
     email: r.email,
+    username: r.username || undefined,
     role: r.role,
     phone: r.phone || undefined,
     active: Boolean(r.active),
@@ -55,6 +59,24 @@ function requireEmail(email: unknown): string {
   const clean = typeof email === 'string' ? email.trim().toLowerCase() : '';
   if (!EMAIL_PATTERN.test(clean) || clean.length > 255) throw new HttpError(400, 'A valid email address is required.');
   return clean;
+}
+
+/** undefined = unchanged; null/'' = remove username; otherwise 3-50 chars [a-z0-9._-], stored lower-case. */
+function optionalUsername(value: unknown): string | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null || (typeof value === 'string' && value.trim() === '')) return null;
+  const clean = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  if (!USERNAME_PATTERN.test(clean)) {
+    throw new HttpError(400, 'Username must be 3-50 characters: letters, digits, dot, underscore or hyphen (not an email).');
+  }
+  return clean;
+}
+
+/** Maps a unique violation to the field that collided. */
+function duplicateMessage(err: any, email?: string, username?: string | null): string {
+  return String(err?.constraint || '').includes('username')
+    ? `Username "${username}" is already in use by another staff member.`
+    : `A user account with email "${email}" already exists.`;
 }
 
 function requireName(name: unknown): string {
@@ -127,21 +149,25 @@ export async function getActiveUserForSession(id: string): Promise<User | null> 
 const DUMMY_HASH = hashCredential(crypto.randomBytes(16).toString('hex')).combined;
 
 export async function authenticateUser(identifier: string, secret: string): Promise<User> {
-  const email = typeof identifier === 'string' ? identifier.trim().toLowerCase() : '';
+  const login = typeof identifier === 'string' ? identifier.trim().toLowerCase() : '';
   const cleanSecret = typeof secret === 'string' ? secret.trim() : '';
-  if (!email || !cleanSecret) throw new HttpError(400, 'Email and password (or PIN) are required.');
+  if (!login || !cleanSecret) throw new HttpError(400, 'Email or username and password (or PIN) are required.');
 
-  const res = await pgPool.query(`SELECT * FROM users WHERE LOWER(email) = $1 LIMIT 1`, [email]);
+  // The identifier must resolve to exactly one account: email if it contains '@', otherwise the
+  // username. The secret is only ever checked against THAT account.
+  const res = login.includes('@')
+    ? await pgPool.query(`SELECT * FROM users WHERE LOWER(email) = $1 LIMIT 1`, [login])
+    : await pgPool.query(`SELECT * FROM users WHERE LOWER(username) = $1 LIMIT 1`, [login]);
   const row: UserRow | undefined = res.rows[0];
 
   if (!row) {
     verifyCredential(cleanSecret, DUMMY_HASH);
-    throw new HttpError(401, 'Invalid email or password.');
+    throw new HttpError(401, 'Invalid email/username or password.');
   }
 
   const passwordOk = verifyCredential(cleanSecret, row.password_hash);
   const pinOk = !passwordOk && PIN_PATTERN.test(cleanSecret) && verifyCredential(cleanSecret, row.pin_hash);
-  if (!passwordOk && !pinOk) throw new HttpError(401, 'Invalid email or password.');
+  if (!passwordOk && !pinOk) throw new HttpError(401, 'Invalid email/username or password.');
 
   if (!row.active) {
     throw new HttpError(403, 'This staff account has been deactivated. Please contact an Administrator.');
@@ -158,6 +184,7 @@ export async function authenticateUser(identifier: string, secret: string): Prom
 export async function createUser(data: {
   name: string;
   email: string;
+  username?: string | null;
   role: UserRole;
   password?: string;
   pin?: string;
@@ -168,32 +195,34 @@ export async function createUser(data: {
   const name = requireName(data.name);
   const email = requireEmail(data.email);
   const role = requireRole(data.role);
+  const username = optionalUsername(data.username) ?? null;
   const password = validatePassword(data.password);
   const pinHash = data.pin ? hashCredential(validatePin(String(data.pin))).combined : unusablePinHash();
   const phone = typeof data.phone === 'string' && data.phone.trim() ? data.phone.trim().slice(0, 50) : null;
 
   try {
     const res = await pgPool.query(
-      `INSERT INTO users (id, name, email, role, phone, active, password_hash, pin_hash, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      `INSERT INTO users (id, name, email, username, role, phone, active, password_hash, pin_hash, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
        RETURNING ${PUBLIC_COLUMNS}`,
-      [crypto.randomUUID(), name, email, role, phone, data.active !== false, hashCredential(password).combined, pinHash]
+      [crypto.randomUUID(), name, email, username, role, phone, data.active !== false, hashCredential(password).combined, pinHash]
     );
     return toUser(res.rows[0]);
   } catch (err: any) {
-    if (uniqueViolation(err)) throw new HttpError(409, `A user account with email "${email}" already exists.`);
+    if (uniqueViolation(err)) throw new HttpError(409, duplicateMessage(err, email, username));
     throw err;
   }
 }
 
 export async function updateUser(
   id: string,
-  updates: Partial<{ name: string; email: string; role: UserRole; phone: string; active: boolean }>,
+  updates: Partial<{ name: string; email: string; username: string | null; role: UserRole; phone: string; active: boolean }>,
   actorId?: string
 ): Promise<User> {
   if (!isValidUuid(id)) throw new HttpError(400, 'User id must be a valid UUID.');
   const name = updates.name !== undefined ? requireName(updates.name) : undefined;
   const email = updates.email !== undefined ? requireEmail(updates.email) : undefined;
+  const username = optionalUsername(updates.username);
   const role = updates.role !== undefined ? requireRole(updates.role) : undefined;
   const active = updates.active !== undefined ? Boolean(updates.active) : undefined;
   const phone =
@@ -221,14 +250,15 @@ export async function updateUser(
            role = COALESCE($3, role),
            phone = CASE WHEN $4::boolean THEN $5 ELSE phone END,
            active = COALESCE($6, active),
+           username = CASE WHEN $8::boolean THEN $9 ELSE username END,
            updated_at = CURRENT_TIMESTAMP
          WHERE id = $7
          RETURNING ${PUBLIC_COLUMNS}`,
-        [name ?? null, email ?? null, role ?? null, phone !== undefined, phone ?? null, active ?? null, id]
+        [name ?? null, email ?? null, role ?? null, phone !== undefined, phone ?? null, active ?? null, id, username !== undefined, username ?? null]
       );
       return toUser(res.rows[0]);
     } catch (err: any) {
-      if (uniqueViolation(err)) throw new HttpError(409, `Email "${email}" is already in use by another staff member.`);
+      if (uniqueViolation(err)) throw new HttpError(409, duplicateMessage(err, email, username));
       throw err;
     }
   });

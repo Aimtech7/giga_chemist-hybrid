@@ -26,6 +26,8 @@ export interface User {
   branch_id?: string;
   name: string;
   email: string;
+  /** Optional login name (lower-case), alternative to the email at sign-in. */
+  username?: string;
   role: UserRole;
   phone?: string;
   active: boolean;

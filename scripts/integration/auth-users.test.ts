@@ -12,6 +12,40 @@ export interface Ctx {
 
 export async function authTests(ctx: Ctx) {
   section('AUTH');
+  // ---- Login identifiers: email AND username, password AND PIN, for both roles ----
+  const tryLogin = (identifier: string, secret: string) => api('POST', '/api/auth/login', null, { email: identifier, password: secret });
+  for (const f of [ctx.admin, ctx.cashier]) {
+    const label = f.role === 'ADMIN' ? 'Admin' : 'Cashier';
+    const byUser = await tryLogin(f.username, f.password);
+    check(byUser.status === 200 && byUser.data?.user?.role === f.role, `${label} username + password login`, byUser.status);
+    const byUserUpper = await tryLogin(f.username.toUpperCase(), f.password);
+    check(byUserUpper.status === 200, `${label} username is case-insensitive`, byUserUpper.status);
+    const byEmail = await tryLogin(f.email, f.password);
+    check(byEmail.status === 200 && byEmail.data?.user?.id === f.id, `${label} email + password login`, byEmail.status);
+    const byUserPin = await tryLogin(f.username, f.pin);
+    check(byUserPin.status === 200, `${label} username + station PIN login`, byUserPin.status);
+    const byEmailPin = await tryLogin(f.email, f.pin);
+    check(byEmailPin.status === 200, `${label} email + station PIN login`, byEmailPin.status);
+    const wrongPw = await tryLogin(f.username, 'definitely-wrong-123');
+    check(wrongPw.status === 401, `${label} wrong password -> 401`, wrongPw.status);
+    const wrongPin = await tryLogin(f.username, f.pin === '111111' ? '222222' : '111111');
+    check(wrongPin.status === 401, `${label} wrong PIN -> 401`, wrongPin.status);
+    const me = await api('GET', '/api/auth/me', byUser.data?.token);
+    check(me.status === 200 && me.data?.user?.role === f.role && me.data?.user?.username === f.username, `${label} token loads ${f.role} role (/auth/me)`, me.data?.user);
+    const adminRoute = await api('GET', '/api/users', byUser.data?.token);
+    check(adminRoute.status === (f.role === 'ADMIN' ? 200 : 403), `${label} on Admin-only route -> ${f.role === 'ADMIN' ? 200 : 403}`, adminRoute.status);
+  }
+  const unknownUser = await tryLogin('no-such-user', 'whatever-123');
+  const unknownEmail = await tryLogin('no-such-user@gigachemist.local', 'whatever-123');
+  const wrongForReal = await tryLogin(ctx.admin.username, 'definitely-wrong-123');
+  check(unknownUser.status === 401 && unknownEmail.status === 401 && unknownUser.data?.error === wrongForReal.data?.error && unknownEmail.data?.error === wrongForReal.data?.error,
+    'unknown username / unknown email / wrong password share one generic 401 message', [unknownUser.data?.error, wrongForReal.data?.error]);
+  // A matching secret on ANOTHER account must never log in (the old server scanned all accounts).
+  const crossAccount = await tryLogin(ctx.cashier.username, ctx.admin.password);
+  check(crossAccount.status === 401, "another account's password never authenticates this user", crossAccount.status);
+  const nameAsId = await tryLogin('ITest Admin', ctx.admin.password);
+  check(nameAsId.status === 401, 'display name is not a login identifier', nameAsId.status);
+
   const health = await api('GET', '/api/health');
   check(health.status === 200 && health.contentType.includes('json'), 'health endpoint returns JSON');
 
@@ -75,7 +109,7 @@ export async function userTests(ctx: Ctx) {
   check(createdAdmin.status === 201 && UUID_RE.test(createdAdmin.data?.user?.id), 'Admin creates an Admin (UUID id)', createdAdmin.data);
 
   const cashierPw = randomPassword();
-  const createdCashier = await api('POST', '/api/users', ctx.adminToken, { name: 'ITest Created Cashier', email: NEW_CASHIER, role: 'CASHIER', password: cashierPw, pin: '4821' });
+  const createdCashier = await api('POST', '/api/users', ctx.adminToken, { name: 'ITest Created Cashier', email: NEW_CASHIER, username: 'ITest-Created-Cashier', role: 'CASHIER', password: cashierPw, pin: '4821' });
   const newCashierId: string = createdCashier.data?.user?.id;
   check(createdCashier.status === 201 && UUID_RE.test(newCashierId), 'Admin creates a Cashier (UUID id)', createdCashier.data);
 
@@ -92,6 +126,19 @@ export async function userTests(ctx: Ctx) {
   check(Boolean(token), 'new Cashier can log in with the set password');
   const pinLogin = await api('POST', '/api/auth/login', null, { email: NEW_CASHIER, password: '4821' });
   check(pinLogin.status === 200, 'new Cashier can log in with PIN');
+  check(createdCashier.data?.user?.username === 'itest-created-cashier', 'username stored lower-case', createdCashier.data?.user?.username);
+  const unameLogin = await api('POST', '/api/auth/login', null, { email: 'itest-created-cashier', password: cashierPw });
+  check(unameLogin.status === 200 && unameLogin.data?.user?.id === newCashierId, 'new Cashier can log in with username');
+  const dupUser = await api('POST', '/api/users', ctx.adminToken, { name: 'Dup U', email: 'itest-dup-username@gigachemist.local', username: 'ITEST-CREATED-CASHIER', role: 'CASHIER', password: randomPassword() });
+  check(dupUser.status === 409 && /Username/.test(dupUser.data?.error || ''), 'duplicate username (case-insensitive) -> 409', dupUser.data);
+  for (const bad of ['ab', 'has space', 'x@y.com', '-lead']) {
+    const bu = await api('POST', '/api/users', ctx.adminToken, { name: 'Bad U', email: `itest-bad-${Date.now()}@gigachemist.local`, username: bad, role: 'CASHIER', password: randomPassword() });
+    check(bu.status === 400, `invalid username "${bad}" rejected (400)`, bu.status);
+  }
+  const renamed = await api('PUT', `/api/users/${newCashierId}`, ctx.adminToken, { username: 'itest-renamed-cashier' });
+  const oldName = await api('POST', '/api/auth/login', null, { email: 'itest-created-cashier', password: cashierPw });
+  const newName = await api('POST', '/api/auth/login', null, { email: 'itest-renamed-cashier', password: cashierPw });
+  check(renamed.status === 200 && oldName.status === 401 && newName.status === 200, 'Admin changes username; old username stops working');
 
   // Edit name/email/role
   const edited = await api('PUT', `/api/users/${newCashierId}`, ctx.adminToken, { name: 'ITest Cashier Renamed', phone: '0700000001' });
@@ -130,6 +177,10 @@ export async function userTests(ctx: Ctx) {
   check(deadSession.status === 401, 'deactivated user existing token -> 401 immediately', deadSession.status);
   const deadLogin = await api('POST', '/api/auth/login', null, { email: NEW_CASHIER, password: selfPw });
   check(deadLogin.status === 403, 'deactivated user cannot log in (403)', deadLogin.status);
+  const deadUname = await api('POST', '/api/auth/login', null, { email: 'itest-renamed-cashier', password: selfPw });
+  check(deadUname.status === 403, 'deactivated user cannot log in by username either (403)', deadUname.status);
+  const deadWrong = await api('POST', '/api/auth/login', null, { email: 'itest-renamed-cashier', password: 'wrong-password-99' });
+  check(deadWrong.status === 401, 'deactivated user + wrong password -> generic 401 (status not revealed)', deadWrong.status);
   const react = await api('PATCH', `/api/users/${newCashierId}/status`, ctx.adminToken, { active: true });
   check(react.status === 200 && react.data?.user?.active === true, 'Admin reactivates user');
   check(Boolean(await login(NEW_CASHIER, selfPw).catch(() => '')), 'reactivated user can log in');

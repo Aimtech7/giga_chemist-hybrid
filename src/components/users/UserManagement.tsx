@@ -33,6 +33,7 @@ export const UserManagement: React.FC<UserManagementProps> = ({ currentUser }) =
   const [editingUser, setEditingUser] = useState<UserType | null>(null);
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
+  const [username, setUsername] = useState('');
   const [role, setRole] = useState<UserRole>('CASHIER');
   const [pin, setPin] = useState('');
   const [password, setPassword] = useState('');
@@ -95,6 +96,7 @@ export const UserManagement: React.FC<UserManagementProps> = ({ currentUser }) =
       setEditingUser(u);
       setName(u.name);
       setEmail(u.email);
+      setUsername(u.username || '');
       setRole(u.role);
       setPin('');
       setPassword('');
@@ -105,6 +107,7 @@ export const UserManagement: React.FC<UserManagementProps> = ({ currentUser }) =
       setEditingUser(null);
       setName('');
       setEmail('');
+      setUsername('');
       setRole('CASHIER');
       // No default credentials: the Administrator sets the initial password (and optional PIN).
       setPin('');
@@ -140,6 +143,8 @@ export const UserManagement: React.FC<UserManagementProps> = ({ currentUser }) =
       const payload: any = {
         name: name.trim(),
         email: email.trim().toLowerCase(),
+        // Empty clears the username; the server validates format and uniqueness.
+        username: username.trim().toLowerCase() || null,
         role,
         phone: phone.trim() || undefined,
         active,
@@ -317,7 +322,10 @@ export const UserManagement: React.FC<UserManagementProps> = ({ currentUser }) =
                       </div>
                     </div>
                   </td>
-                  <td className="py-2.5 px-3 font-mono text-slate-600">{u.email}</td>
+                  <td className="py-2.5 px-3 font-mono text-slate-600">
+                    {u.email}
+                    {u.username && <div className="text-[10px] text-slate-400">username: {u.username}</div>}
+                  </td>
                   <td className="py-2.5 px-3 font-medium">
                     <span
                       className={`inline-block px-2 py-0.5 rounded text-[10px] font-bold border ${
@@ -411,7 +419,7 @@ export const UserManagement: React.FC<UserManagementProps> = ({ currentUser }) =
               </div>
 
               <div>
-                <label className="block font-semibold text-slate-700 mb-1">Email / Username *</label>
+                <label className="block font-semibold text-slate-700 mb-1">Email *</label>
                 <input
                   type="email"
                   required
@@ -420,6 +428,19 @@ export const UserManagement: React.FC<UserManagementProps> = ({ currentUser }) =
                   onChange={(e) => setEmail(e.target.value)}
                   className="w-full p-2 border border-slate-300 rounded focus:ring-1 focus:ring-teal-700 focus:outline-hidden"
                 />
+              </div>
+
+              <div>
+                <label className="block font-semibold text-slate-700 mb-1">Username (optional, for sign-in)</label>
+                <input
+                  type="text"
+                  placeholder="e.g. grace"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  autoComplete="off"
+                  className="w-full p-2 border border-slate-300 rounded font-mono focus:ring-1 focus:ring-teal-700 focus:outline-hidden"
+                />
+                <span className="text-[10px] text-slate-400">3-50 letters, digits, dot, underscore or hyphen. Staff can sign in with this or their email.</span>
               </div>
 
               <div className="grid grid-cols-2 gap-2">

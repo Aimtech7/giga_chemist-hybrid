@@ -70,7 +70,8 @@ let serverLog = '';
 export async function startServer(): Promise<void> {
   serverLog = '';
   server = spawn(process.execPath, ['--import', 'tsx', 'server.ts'], {
-    env: { ...process.env, PORT: String(PORT) },
+    // Higher login rate limit for this private test server only (the suite logs in many times).
+    env: { ...process.env, PORT: String(PORT), AUTH_RATE_LIMIT_PER_MINUTE: '1000' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   server.stdout!.on('data', (d) => (serverLog += d.toString()));
@@ -130,7 +131,11 @@ export async function login(email: string, password: string): Promise<string> {
 export interface Fixture {
   id: string;
   email: string;
+  /** Login username = email local part (e.g. itest-admin). */
+  username: string;
   password: string;
+  /** Random 6-digit station PIN for this run (never printed). */
+  pin: string;
   role: 'ADMIN' | 'CASHIER';
 }
 
@@ -140,17 +145,17 @@ export function randomPassword(): string {
 
 export async function upsertFixtureUser(email: string, name: string, role: 'ADMIN' | 'CASHIER'): Promise<Fixture> {
   const password = randomPassword();
-  const hash = hashCredential(password).combined;
-  const pin = hashCredential(crypto.randomBytes(16).toString('hex')).combined;
+  const pin = String(crypto.randomInt(100000, 1000000));
+  const username = email.split('@')[0];
   const res = await pool.query(
-    `INSERT INTO users (id, name, email, role, active, password_hash, pin_hash)
-     VALUES ($1, $2, $3, $4, true, $5, $6)
-     ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name, role = EXCLUDED.role, active = true,
+    `INSERT INTO users (id, name, email, username, role, active, password_hash, pin_hash)
+     VALUES ($1, $2, $3, $4, $5, true, $6, $7)
+     ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name, username = EXCLUDED.username, role = EXCLUDED.role, active = true,
        password_hash = EXCLUDED.password_hash, pin_hash = EXCLUDED.pin_hash, updated_at = CURRENT_TIMESTAMP
      RETURNING id`,
-    [crypto.randomUUID(), name, email, role, hash, pin]
+    [crypto.randomUUID(), name, email, username, role, hashCredential(password).combined, hashCredential(pin).combined]
   );
-  return { id: res.rows[0].id, email, password, role };
+  return { id: res.rows[0].id, email, username, password, pin, role };
 }
 
 /** Test medicines are identified by barcode; created once, re-activated per run, priced fresh. */

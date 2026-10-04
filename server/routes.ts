@@ -87,7 +87,8 @@ function authRateLimiter(req: Request, res: Response, next: NextFunction) {
   const ip = req.ip || req.socket.remoteAddress || '127.0.0.1';
   const now = Date.now();
   const windowMs = 60 * 1000; // 1 minute
-  const maxAttempts = 20;
+  // Login attempts per IP per minute (default 20). Overridable for the isolated integration-test server.
+  const maxAttempts = Number(process.env.AUTH_RATE_LIMIT_PER_MINUTE) > 0 ? Number(process.env.AUTH_RATE_LIMIT_PER_MINUTE) : 20;
 
   const record = authRateLimits.get(ip);
   if (!record || now > record.resetAt) {
@@ -276,9 +277,10 @@ apiRouter.post('/auth/login', authRateLimiter, async (req: Request, res: Respons
 });
 
 // Validates the caller's token against the database and returns the current account.
-apiRouter.get('/auth/me', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+apiRouter.get('/auth/me', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const user = await getUserById(req.userId!).catch(() => null);
   res.json({
-    user: { id: req.userId, name: req.userName, email: req.userEmail, role: req.userRole },
+    user: user || { id: req.userId, name: req.userName, email: req.userEmail, role: req.userRole },
     permissions: ROLE_PERMISSIONS[req.userRole!],
     token_expires_at: req.tokenPayload?.exp ? req.tokenPayload.exp * 1000 : undefined,
   });
@@ -304,14 +306,14 @@ apiRouter.get('/users', requireRole('ADMIN'), async (req: AuthenticatedRequest, 
 
 apiRouter.post('/users', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { name, email, role, password, pin, phone, active } = req.body || {};
-    const created = await createUser({ name, email, role, password, pin, phone, active, created_by: req.userId });
+    const { name, email, username, role, password, pin, phone, active } = req.body || {};
+    const created = await createUser({ name, email, username, role, password, pin, phone, active, created_by: req.userId });
     await recordAuditLog({
       ...actorAudit(req),
       action: 'USER_CREATED',
       entity: 'user',
       entity_id: created.id,
-      new_value: { name: created.name, role: created.role, email: created.email, active: created.active },
+      new_value: { name: created.name, role: created.role, email: created.email, username: created.username, active: created.active },
     });
     res.status(201).json({ success: true, user: created });
   } catch (err: any) {
@@ -323,16 +325,16 @@ apiRouter.put('/users/:id', requireRole('ADMIN'), async (req: AuthenticatedReque
   try {
     const { id } = req.params;
     // Credentials are never changed through this endpoint (see reset-password / change-password).
-    const { name, email, role, phone, active } = req.body || {};
+    const { name, email, username, role, phone, active } = req.body || {};
     const before = await getUserById(id);
-    const updated = await updateUser(id, { name, email, role, phone, active }, req.userId);
+    const updated = await updateUser(id, { name, email, username, role, phone, active }, req.userId);
     await recordAuditLog({
       ...actorAudit(req),
       action: 'USER_UPDATED',
       entity: 'user',
       entity_id: id,
-      previous_value: before ? { name: before.name, email: before.email, role: before.role, active: before.active } : undefined,
-      new_value: { name: updated.name, email: updated.email, role: updated.role, active: updated.active },
+      previous_value: before ? { name: before.name, email: before.email, username: before.username, role: before.role, active: before.active } : undefined,
+      new_value: { name: updated.name, email: updated.email, username: updated.username, role: updated.role, active: updated.active },
     });
     res.json({ success: true, user: updated });
   } catch (err: any) {
