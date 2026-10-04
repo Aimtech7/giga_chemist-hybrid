@@ -456,7 +456,7 @@ export const UserManagement: React.FC<UserManagementProps> = ({ currentUser }) =
                       type="password"
                       required
                       minLength={6}
-                      placeholder="e.g. Giga@2026"
+                      placeholder="At least 8 characters"
                       value={password}
                       onChange={(e) => setPassword(e.target.value)}
                       className="w-full p-2 border border-slate-300 rounded font-mono focus:ring-1 focus:ring-teal-700 focus:outline-hidden"
