@@ -1,14 +1,18 @@
+import 'dotenv/config';
 import readline from 'readline';
-import dotenv from 'dotenv';
-import { createUser, getUserAuthRecord, updateUser } from '../server/db/users';
+import { pgPool } from '../server/db/client';
+import { createUser, updateUser, adminResetUserPassword, MIN_PASSWORD_LENGTH } from '../server/db/users';
 
-dotenv.config();
-
-function askQuestion(query: string): Promise<string> {
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
+/**
+ * Creates (or repairs) an Administrator account in the PostgreSQL users table.
+ *
+ *   npm run create-admin -- "<Full Name>" <email> <password> [pin]
+ *
+ * There are NO default credentials: a password of at least MIN_PASSWORD_LENGTH characters is
+ * required. Secrets are hashed with PBKDF2-SHA512 and never printed.
+ */
+function ask(query: string): Promise<string> {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   return new Promise((resolve) =>
     rl.question(query, (ans) => {
       rl.close();
@@ -22,62 +26,32 @@ async function main() {
   console.log('  GIGA CHEMIST — Administrator Account Setup');
   console.log('=============================================================\n');
 
-  // Check if args provided via command line: npm run create-admin -- name email password pin
-  const args = process.argv.slice(2);
-  let name = args[0];
-  let email = args[1];
-  let password = args[2];
-  let pin = args[3];
+  const [argName, argEmail, argPassword, argPin] = process.argv.slice(2);
+  const name = argName || (await ask('Admin full name: '));
+  const email = (argEmail || (await ask('Admin email: '))).toLowerCase();
+  const password = argPassword || (await ask(`Admin password (min ${MIN_PASSWORD_LENGTH} characters): `));
+  const pin = argPin || (await ask('Optional 4-6 digit PIN (Enter to skip): ')) || undefined;
 
-  if (!name) {
-    name = (await askQuestion('Enter Admin Full Name (default: Dr. Austin): ')) || 'Dr. Austin (Admin)';
-  }
-  if (!email) {
-    email = (await askQuestion('Enter Admin Email (default: admin@gigachemist.co.ke): ')) || 'admin@gigachemist.co.ke';
-  }
-  if (!password) {
-    password = (await askQuestion('Enter Admin Password (default: admin123): ')) || 'admin123';
-  }
-  if (!pin) {
-    pin = (await askQuestion('Enter 4-Digit Station PIN (default: 1234): ')) || '1234';
+  if (!name || !email || !password) {
+    throw new Error('Name, email and password are all required. No default credentials exist.');
   }
 
-  console.log(`\nRegistering administrator account:`);
-  console.log(`- Name:     ${name}`);
-  console.log(`- Email:    ${email}`);
-  console.log(`- Role:     ADMIN`);
-  console.log(`- PIN:      **** (Hashed via PBKDF2)`);
-  console.log(`- Password: **** (Hashed via PBKDF2)`);
-
-  try {
-    const existing = await getUserAuthRecord(email);
-    if (existing) {
-      console.log(`\nAccount with email "${email}" already exists. Updating credentials...`);
-      const updated = await updateUser(existing.id, {
-        name,
-        role: 'ADMIN',
-        password,
-        pin,
-        active: true,
-      });
-      console.log(`✓ Admin user "${updated.name}" updated successfully!`);
-    } else {
-      const created = await createUser({
-        name,
-        email,
-        role: 'ADMIN',
-        password,
-        pin,
-        active: true,
-      });
-      console.log(`\n✓ Admin user "${created.name}" (${created.email}) created successfully!`);
-    }
-
-    console.log('\nYou can now log in to GIGA CHEMIST at http://localhost:3000 using these credentials.');
-  } catch (err: any) {
-    console.error('\n[ERROR] Failed to register admin account:', err.message);
-    process.exit(1);
+  const existing = await pgPool.query('SELECT id FROM users WHERE LOWER(email) = $1', [email]);
+  if (existing.rows[0]) {
+    const id = existing.rows[0].id;
+    await updateUser(id, { name, role: 'ADMIN', active: true });
+    await adminResetUserPassword({ targetUserId: id, newPassword: password, newPin: pin });
+    console.log(`\n✓ Existing account ${email} updated: role ADMIN, active, new password${pin ? ' and PIN' : ''}.`);
+  } else {
+    const created = await createUser({ name, email, role: 'ADMIN', password, pin, active: true });
+    console.log(`\n✓ Administrator ${created.name} (${created.email}) created.`);
   }
+  console.log('Log in at http://localhost:3000 with this email and password.');
 }
 
-main();
+main()
+  .catch((err) => {
+    console.error('\n[ERROR] Failed to register admin account:', err.message);
+    process.exitCode = 1;
+  })
+  .finally(() => pgPool.end());

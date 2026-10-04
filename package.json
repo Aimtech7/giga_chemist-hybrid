@@ -23,7 +23,8 @@
     "migrate:execute": "tsx scripts/migrate-chemist-pos/migrate.ts --execute",
     "migrate:validate": "tsx scripts/migrate-chemist-pos/validate-migration.ts",
     "supabase:inspect": "tsx scripts/inspect-supabase.ts",
-    "supabase:load": "tsx scripts/load-supabase-data.ts"
+    "supabase:load": "tsx scripts/load-supabase-data.ts",
+    "test:integration": "tsx scripts/integration/run.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

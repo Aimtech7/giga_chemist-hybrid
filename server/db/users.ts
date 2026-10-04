@@ -1,183 +1,159 @@
-import { supabaseAdmin, isSupabaseConfigured, pgPool } from './client';
+import crypto from 'crypto';
+import { pgPool, HttpError, isValidUuid, withTransaction, type Queryable } from './client';
 import { hashCredential, verifyCredential } from '../auth';
 import type { User, UserRole } from '../../src/types';
 
-export interface ServerUserRecord extends User {
+/**
+ * Staff accounts live ONLY in the PostgreSQL users table. Credentials are PBKDF2-SHA512 hashes in
+ * the self-contained "salt$hash" format (server/auth.ts). Plaintext secrets are never stored or logged.
+ */
+
+/** Roles that can be assigned through user management. */
+export const ASSIGNABLE_ROLES: UserRole[] = ['ADMIN', 'CASHIER'];
+export const MIN_PASSWORD_LENGTH = 8;
+const PIN_PATTERN = /^\d{4,6}$/;
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+interface UserRow {
+  id: string;
+  name: string;
+  email: string;
+  role: UserRole;
+  phone: string | null;
+  active: boolean;
   password_hash: string;
   pin_hash: string;
-  salt: string;
-  created_by?: string;
-  updated_by?: string;
-  updated_at?: string;
+  created_at: Date | null;
+  updated_at: Date | null;
+  last_login: Date | null;
 }
 
-// In-memory persistent user repository for offline/isolated server environments
-let localUsersStore: ServerUserRecord[] = [];
+const PUBLIC_COLUMNS = 'id, name, email, role, phone, active, created_at, updated_at, last_login';
 
-// Default production accounts with PBKDF2-SHA512 hashes (zero plaintext passwords)
-const ADMIN_PWD_HASH = '779dee3d684fedaf93208ec655922c2d$6c586a0921bc148e975fa3213f5042f3c50f78675973b4ec1f13a0dbe169a264afd8451bc3864cbc23402132c723758f7216c2b0ffcc719352f002dc97446c31';
-const ADMIN_PIN_HASH = '779dee3d684fedaf93208ec655922c2d$c8fe04e878654e4c19b6edccfe20e709084e606ddd83c1b8d57f6ef0b98b1da83e12edafa3df59662a165c9e09e41dd9ba2d04cb780d04934f3e09a2e6422524';
-const CASHIER_PWD_HASH = '64366af56fd0eaeaf3953cdb930ddbea$0e91b3f2ad71606545da39425918b1e9d32732e29eddb7dd53dfdec87e2bd8629181632b400de352abc3e9054bee69ecfc69d7743a06eb5d98ae4c0e3b9216c0';
-const CASHIER_PIN_HASH = '64366af56fd0eaeaf3953cdb930ddbea$29a014b818995f1a6d567e3aa108c65228411a2fbade8e54b7caeea4eeedb8fbc42b2c161c15bdf585be9024d7a61c6d0213b12324f535ca0b510152d21dd654';
-
-function initializeDefaultDevUsers(): ServerUserRecord[] {
-  return [
-    {
-      id: '00000000-0000-0000-0000-000000000099',
-      name: 'Administrator',
-      email: 'admin@gigachemist.co.ke',
-      role: 'ADMIN',
-      phone: '+254 700 123 456',
-      active: true,
-      created_at: '2026-01-01T00:00:00.000Z',
-      password_hash: ADMIN_PWD_HASH,
-      pin_hash: ADMIN_PIN_HASH,
-      salt: '779dee3d684fedaf93208ec655922c2d',
-    },
-    {
-      id: '00000000-0000-0000-0000-000000000098',
-      name: 'Cashier',
-      email: 'cashier@gigachemist.co.ke',
-      role: 'CASHIER',
-      phone: '+254 700 123 456',
-      active: true,
-      created_at: '2026-01-01T00:00:00.000Z',
-      password_hash: CASHIER_PWD_HASH,
-      pin_hash: CASHIER_PIN_HASH,
-      salt: '64366af56fd0eaeaf3953cdb930ddbea',
-    },
-  ];
+function toUser(r: any): User {
+  return {
+    id: r.id,
+    name: r.name,
+    email: r.email,
+    role: r.role,
+    phone: r.phone || undefined,
+    active: Boolean(r.active),
+    created_at: r.created_at ? new Date(r.created_at).toISOString() : '',
+    updated_at: r.updated_at ? new Date(r.updated_at).toISOString() : undefined,
+    last_login: r.last_login ? new Date(r.last_login).toISOString() : undefined,
+  } as User;
 }
 
-localUsersStore = initializeDefaultDevUsers();
-
-export function sanitizeUser(user: ServerUserRecord): User {
-  const { password_hash, pin_hash, salt, ...sanitized } = user;
-  return sanitized;
+function requireRole(role: unknown): UserRole {
+  if (typeof role !== 'string' || !ASSIGNABLE_ROLES.includes(role as UserRole)) {
+    throw new HttpError(400, `Role must be one of: ${ASSIGNABLE_ROLES.join(', ')}.`);
+  }
+  return role as UserRole;
 }
+
+function requireEmail(email: unknown): string {
+  const clean = typeof email === 'string' ? email.trim().toLowerCase() : '';
+  if (!EMAIL_PATTERN.test(clean) || clean.length > 255) throw new HttpError(400, 'A valid email address is required.');
+  return clean;
+}
+
+function requireName(name: unknown): string {
+  const clean = typeof name === 'string' ? name.trim() : '';
+  if (!clean || clean.length > 255) throw new HttpError(400, 'Name is required (max 255 characters).');
+  return clean;
+}
+
+export function validatePassword(password: unknown, field = 'Password'): string {
+  if (typeof password !== 'string' || password.length < MIN_PASSWORD_LENGTH) {
+    throw new HttpError(400, `${field} must be at least ${MIN_PASSWORD_LENGTH} characters long.`);
+  }
+  if (password.length > 200) throw new HttpError(400, `${field} is too long.`);
+  return password;
+}
+
+function validatePin(pin: unknown): string {
+  if (typeof pin !== 'string' || !PIN_PATTERN.test(pin)) {
+    throw new HttpError(400, 'PIN must be 4 to 6 digits.');
+  }
+  return pin;
+}
+
+/** pin_hash is NOT NULL: accounts without a PIN get a hash of random bytes nobody knows. */
+function unusablePinHash(): string {
+  return hashCredential(crypto.randomBytes(32).toString('hex')).combined;
+}
+
+function uniqueViolation(err: any): boolean {
+  return err?.code === '23505';
+}
+
+/** Throws 409 unless at least one OTHER active ADMIN remains. Locks the admin rows to serialize. */
+async function assertAnotherActiveAdmin(q: Queryable, excludingUserId: string) {
+  const res = await q.query(
+    `SELECT id FROM users WHERE role = 'ADMIN' AND active = true AND id <> $1 FOR UPDATE`,
+    [excludingUserId]
+  );
+  if (res.rows.length === 0) {
+    throw new HttpError(409, 'There must be at least one active Administrator. This change would remove the last one.');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Reads
+// ---------------------------------------------------------------------------
 
 export async function getAllUsers(): Promise<User[]> {
-  try {
-    const res = await pgPool.query(
-      `SELECT id, branch_id, name, email, role, phone, active, created_at, updated_at, last_login FROM users ORDER BY name`
-    );
-    if (res.rows && res.rows.length > 0) {
-      return res.rows.map((r) => ({
-        id: r.id,
-        name: r.name,
-        email: r.email,
-        role: r.role,
-        phone: r.phone || undefined,
-        active: Boolean(r.active),
-        created_at: r.created_at,
-        updated_at: r.updated_at,
-        last_login: r.last_login,
-      }));
-    }
-  } catch (pgErr) {}
-
-  if (isSupabaseConfigured) {
-    try {
-      const { data, error } = await supabaseAdmin
-        .from('users')
-        .select('id, name, email, role, phone, active, created_at, updated_at, last_login')
-        .order('name');
-      if (!error && data && data.length > 0) {
-        return data as User[];
-      }
-    } catch (err) {
-      console.warn('[Server DB] Supabase users query failed:', err);
-    }
-  }
-  return localUsersStore.map(sanitizeUser);
+  const res = await pgPool.query(`SELECT ${PUBLIC_COLUMNS} FROM users ORDER BY name`);
+  return res.rows.map(toUser);
 }
 
 export async function getUserById(id: string): Promise<User | null> {
-  try {
-    const res = await pgPool.query(
-      `SELECT id, branch_id, name, email, role, phone, active, created_at, updated_at, last_login FROM users WHERE id::text = $1`,
-      [id]
-    );
-    if (res.rows && res.rows.length > 0) {
-      const r = res.rows[0];
-      return {
-        id: r.id,
-        name: r.name,
-        email: r.email,
-        role: r.role,
-        phone: r.phone || undefined,
-        active: Boolean(r.active),
-        created_at: r.created_at,
-        updated_at: r.updated_at,
-        last_login: r.last_login,
-      };
-    }
-  } catch (pgErr) {}
-
-  if (isSupabaseConfigured) {
-    try {
-      const { data, error } = await supabaseAdmin
-        .from('users')
-        .select('id, name, email, role, phone, active, created_at, updated_at, last_login')
-        .eq('id', id)
-        .single();
-      if (!error && data) {
-        return data as User;
-      }
-    } catch (err) {}
-  }
-  const found = localUsersStore.find((u) => u.id === id);
-  return found ? sanitizeUser(found) : null;
+  if (!isValidUuid(id)) return null;
+  const res = await pgPool.query(`SELECT ${PUBLIC_COLUMNS} FROM users WHERE id = $1`, [id]);
+  return res.rows[0] ? toUser(res.rows[0]) : null;
 }
 
-export async function getUserAuthRecord(identifier: string): Promise<ServerUserRecord | null> {
-  const cleanId = identifier.trim().toLowerCase();
+/** Fresh identity for an authenticated request: role and active flag come from the DB, not the token. */
+export async function getActiveUserForSession(id: string): Promise<User | null> {
+  const user = await getUserById(id);
+  return user && user.active ? user : null;
+}
 
-  try {
-    const res = await pgPool.query(
-      `SELECT * FROM users WHERE LOWER(email) = $1 OR id::text = $1 LIMIT 1`,
-      [cleanId]
-    );
-    if (res.rows && res.rows.length > 0) {
-      const r = res.rows[0];
-      return {
-        id: r.id,
-        name: r.name,
-        email: r.email,
-        role: r.role,
-        phone: r.phone || undefined,
-        active: Boolean(r.active),
-        password_hash: r.password_hash,
-        pin_hash: r.pin_hash,
-        salt: r.password_hash?.includes('$') ? r.password_hash.split('$')[0] : '',
-        created_at: r.created_at,
-        updated_at: r.updated_at,
-        last_login: r.last_login,
-      };
-    }
-  } catch (pgErr) {}
+// ---------------------------------------------------------------------------
+// Authentication
+// ---------------------------------------------------------------------------
 
-  if (isSupabaseConfigured) {
-    try {
-      const { data, error } = await supabaseAdmin
-        .from('users')
-        .select('*')
-        .or(`email.ilike.${cleanId},id.eq.${cleanId}`)
-        .single();
-      if (!error && data) {
-        return {
-          ...data,
-          salt: data.password_hash?.includes('$') ? data.password_hash.split('$')[0] : (data.salt || ''),
-        } as ServerUserRecord;
-      }
-    } catch (err) {}
+/** A real hash to verify against when the account does not exist, so timing does not reveal it. */
+const DUMMY_HASH = hashCredential(crypto.randomBytes(16).toString('hex')).combined;
+
+export async function authenticateUser(identifier: string, secret: string): Promise<User> {
+  const email = typeof identifier === 'string' ? identifier.trim().toLowerCase() : '';
+  const cleanSecret = typeof secret === 'string' ? secret.trim() : '';
+  if (!email || !cleanSecret) throw new HttpError(400, 'Email and password (or PIN) are required.');
+
+  const res = await pgPool.query(`SELECT * FROM users WHERE LOWER(email) = $1 LIMIT 1`, [email]);
+  const row: UserRow | undefined = res.rows[0];
+
+  if (!row) {
+    verifyCredential(cleanSecret, DUMMY_HASH);
+    throw new HttpError(401, 'Invalid email or password.');
   }
 
-  const found = localUsersStore.find(
-    (u) => u.email.toLowerCase() === cleanId || u.id.toLowerCase() === cleanId
-  );
-  return found || null;
+  const passwordOk = verifyCredential(cleanSecret, row.password_hash);
+  const pinOk = !passwordOk && PIN_PATTERN.test(cleanSecret) && verifyCredential(cleanSecret, row.pin_hash);
+  if (!passwordOk && !pinOk) throw new HttpError(401, 'Invalid email or password.');
+
+  if (!row.active) {
+    throw new HttpError(403, 'This staff account has been deactivated. Please contact an Administrator.');
+  }
+
+  await pgPool.query(`UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = $1`, [row.id]);
+  return toUser({ ...row, last_login: new Date() });
 }
+
+// ---------------------------------------------------------------------------
+// Admin user management
+// ---------------------------------------------------------------------------
 
 export async function createUser(data: {
   name: string;
@@ -189,184 +165,77 @@ export async function createUser(data: {
   active?: boolean;
   created_by?: string;
 }): Promise<User> {
-  const cleanEmail = data.email.trim().toLowerCase();
-
-  // Validate duplicate email
-  const existing = await getUserAuthRecord(cleanEmail);
-  if (existing) {
-    throw new Error(`A user account with email "${cleanEmail}" already exists.`);
-  }
-
-  const defaultPassword = data.password || 'Giga@2026';
-  const defaultPin = data.pin || '1234';
-
-  const { combined: password_hash, salt } = hashCredential(defaultPassword);
-  const { combined: pin_hash } = hashCredential(defaultPin, salt);
-
-  const newUserRecord: ServerUserRecord = {
-    id: `usr-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-    name: data.name.trim(),
-    email: cleanEmail,
-    role: data.role,
-    phone: data.phone?.trim() || undefined,
-    active: data.active !== undefined ? data.active : true,
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
-    created_by: data.created_by,
-    password_hash,
-    pin_hash,
-    salt,
-  };
+  const name = requireName(data.name);
+  const email = requireEmail(data.email);
+  const role = requireRole(data.role);
+  const password = validatePassword(data.password);
+  const pinHash = data.pin ? hashCredential(validatePin(String(data.pin))).combined : unusablePinHash();
+  const phone = typeof data.phone === 'string' && data.phone.trim() ? data.phone.trim().slice(0, 50) : null;
 
   try {
-    await pgPool.query(
+    const res = await pgPool.query(
       `INSERT INTO users (id, name, email, role, phone, active, password_hash, pin_hash, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-       ON CONFLICT (email) DO UPDATE SET password_hash = $7, pin_hash = $8, active = $6, updated_at = $10`,
-      [
-        newUserRecord.id,
-        newUserRecord.name,
-        newUserRecord.email,
-        newUserRecord.role,
-        newUserRecord.phone,
-        newUserRecord.active,
-        newUserRecord.password_hash,
-        newUserRecord.pin_hash,
-        newUserRecord.created_at,
-        newUserRecord.updated_at,
-      ]
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+       RETURNING ${PUBLIC_COLUMNS}`,
+      [crypto.randomUUID(), name, email, role, phone, data.active !== false, hashCredential(password).combined, pinHash]
     );
-  } catch (pgErr) {}
-
-  if (isSupabaseConfigured) {
-    try {
-      await supabaseAdmin.from('users').insert({
-        id: newUserRecord.id,
-        name: newUserRecord.name,
-        email: newUserRecord.email,
-        role: newUserRecord.role,
-        phone: newUserRecord.phone,
-        active: newUserRecord.active,
-        password_hash: newUserRecord.password_hash,
-        pin_hash: newUserRecord.pin_hash,
-        created_at: newUserRecord.created_at,
-      });
-    } catch (err) {
-      console.warn('[Server DB] Supabase user insert failed:', err);
-    }
+    return toUser(res.rows[0]);
+  } catch (err: any) {
+    if (uniqueViolation(err)) throw new HttpError(409, `A user account with email "${email}" already exists.`);
+    throw err;
   }
-
-  localUsersStore.push(newUserRecord);
-  return sanitizeUser(newUserRecord);
 }
 
 export async function updateUser(
   id: string,
-  updates: Partial<{
-    name: string;
-    email: string;
-    role: UserRole;
-    phone: string;
-    active: boolean;
-    password?: string;
-    pin?: string;
-  }>,
-  updaterId?: string
+  updates: Partial<{ name: string; email: string; role: UserRole; phone: string; active: boolean }>,
+  actorId?: string
 ): Promise<User> {
-  const target = localUsersStore.find((u) => u.id === id);
+  if (!isValidUuid(id)) throw new HttpError(400, 'User id must be a valid UUID.');
+  const name = updates.name !== undefined ? requireName(updates.name) : undefined;
+  const email = updates.email !== undefined ? requireEmail(updates.email) : undefined;
+  const role = updates.role !== undefined ? requireRole(updates.role) : undefined;
+  const active = updates.active !== undefined ? Boolean(updates.active) : undefined;
+  const phone =
+    updates.phone !== undefined ? (String(updates.phone).trim().slice(0, 50) || null) : undefined;
 
-  const updatedFields: any = {
-    updated_at: new Date().toISOString(),
-    updated_by: updaterId,
-  };
+  return withTransaction(async (client) => {
+    const found = await client.query(`SELECT * FROM users WHERE id = $1 FOR UPDATE`, [id]);
+    const target: UserRow | undefined = found.rows[0];
+    if (!target) throw new HttpError(404, 'User not found.');
 
-  if (updates.name) updatedFields.name = updates.name.trim();
-  if (updates.role) updatedFields.role = updates.role;
-  if (updates.phone !== undefined) updatedFields.phone = updates.phone.trim();
-  if (updates.active !== undefined) updatedFields.active = updates.active;
-
-  if (updates.email) {
-    const cleanEmail = updates.email.trim().toLowerCase();
-    if (target && target.email.toLowerCase() !== cleanEmail) {
-      const duplicate = localUsersStore.find((u) => u.id !== id && u.email.toLowerCase() === cleanEmail);
-      if (duplicate) {
-        throw new Error(`Email "${cleanEmail}" is already in use by another staff member.`);
+    const losingAdmin =
+      target.role === 'ADMIN' && target.active && ((role !== undefined && role !== 'ADMIN') || active === false);
+    if (losingAdmin) {
+      if (actorId && actorId === id) {
+        throw new HttpError(409, 'You cannot remove your own Administrator role or deactivate your own account.');
       }
+      await assertAnotherActiveAdmin(client, id);
     }
-    updatedFields.email = cleanEmail;
-  }
 
-  if (updates.password || updates.pin) {
-    const salt = target?.salt || hashCredential('seed').salt;
-    if (updates.password) {
-      updatedFields.password_hash = hashCredential(updates.password, salt).combined;
-    }
-    if (updates.pin) {
-      updatedFields.pin_hash = hashCredential(updates.pin, salt).combined;
-    }
-    updatedFields.salt = salt;
-  }
-
-  try {
-    await pgPool.query(
-      `UPDATE users SET name = COALESCE($1, name), email = COALESCE($2, email), role = COALESCE($3, role),
-       phone = COALESCE($4, phone), active = COALESCE($5, active),
-       password_hash = COALESCE($6, password_hash), pin_hash = COALESCE($7, pin_hash), updated_at = $8
-       WHERE id::text = $9`,
-      [
-        updatedFields.name || null,
-        updatedFields.email || null,
-        updatedFields.role || null,
-        updatedFields.phone || null,
-        updatedFields.active !== undefined ? updatedFields.active : null,
-        updatedFields.password_hash || null,
-        updatedFields.pin_hash || null,
-        updatedFields.updated_at,
-        id,
-      ]
-    );
-  } catch (pgErr) {}
-
-  if (isSupabaseConfigured) {
     try {
-      await supabaseAdmin.from('users').update(updatedFields).eq('id', id);
-    } catch (err) {
-      console.warn('[Server DB] Supabase update user failed:', err);
+      const res = await client.query(
+        `UPDATE users SET
+           name = COALESCE($1, name),
+           email = COALESCE($2, email),
+           role = COALESCE($3, role),
+           phone = CASE WHEN $4::boolean THEN $5 ELSE phone END,
+           active = COALESCE($6, active),
+           updated_at = CURRENT_TIMESTAMP
+         WHERE id = $7
+         RETURNING ${PUBLIC_COLUMNS}`,
+        [name ?? null, email ?? null, role ?? null, phone !== undefined, phone ?? null, active ?? null, id]
+      );
+      return toUser(res.rows[0]);
+    } catch (err: any) {
+      if (uniqueViolation(err)) throw new HttpError(409, `Email "${email}" is already in use by another staff member.`);
+      throw err;
     }
-  }
-
-  if (target) {
-    Object.assign(target, updatedFields);
-    return sanitizeUser(target);
-  }
-
-  const updatedUser = await getUserById(id);
-  if (!updatedUser) throw new Error(`User with ID ${id} not found.`);
-  return updatedUser;
+  });
 }
 
-export async function toggleUserStatus(id: string, active: boolean, updaterId?: string): Promise<User> {
-  // Safeguard: Check if deactivating the last active Admin
-  if (active === false) {
-    const target = await getUserAuthRecord(id);
-    if (target && target.role === 'ADMIN') {
-      let otherAdminCount = 0;
-      try {
-        const res = await pgPool.query(
-          `SELECT COUNT(*)::int as count FROM users WHERE role = 'ADMIN' AND active = true AND id::text != $1`,
-          [id]
-        );
-        otherAdminCount = Number(res.rows[0]?.count) || 0;
-      } catch (err) {
-        otherAdminCount = localUsersStore.filter((u) => u.role === 'ADMIN' && u.active && u.id !== id).length;
-      }
-      if (otherAdminCount < 1) {
-        throw new Error('There must be at least one active Administrator. Cannot deactivate the last active Admin account.');
-      }
-    }
-  }
-
-  return updateUser(id, { active }, updaterId);
+export async function toggleUserStatus(id: string, active: boolean, actorId?: string): Promise<User> {
+  return updateUser(id, { active }, actorId);
 }
 
 export async function changeUserPassword(data: {
@@ -374,163 +243,50 @@ export async function changeUserPassword(data: {
   currentPassword: string;
   newPassword: string;
 }): Promise<{ success: boolean; message: string }> {
-  const { userId, currentPassword, newPassword } = data;
+  const newPassword = validatePassword(data.newPassword, 'New password');
+  if (!isValidUuid(data.userId)) throw new HttpError(400, 'Invalid user.');
 
-  if (!currentPassword || !newPassword) {
-    throw new Error('Current password and new password are required.');
+  const res = await pgPool.query(`SELECT password_hash FROM users WHERE id = $1`, [data.userId]);
+  if (!res.rows[0]) throw new HttpError(404, 'User not found.');
+  if (!verifyCredential(String(data.currentPassword || ''), res.rows[0].password_hash)) {
+    throw new HttpError(400, 'Incorrect current password.');
   }
-
-  if (newPassword.length < 6) {
-    throw new Error('New password must be at least 6 characters long.');
-  }
-
-  const userRecord = await getUserAuthRecord(userId);
-  if (!userRecord) {
-    throw new Error('User not found.');
-  }
-
-  // Verify current password with PBKDF2/SHA-512
-  const isCurrentValid = verifyCredential(currentPassword, userRecord.password_hash, userRecord.salt);
-  if (!isCurrentValid) {
-    throw new Error('Incorrect current password.');
-  }
-
-  // Hash new password using canonical PBKDF2/SHA-512
-  const { combined: password_hash, salt } = hashCredential(newPassword);
-
-  const now = new Date().toISOString();
-  try {
-    await pgPool.query(
-      `UPDATE users SET password_hash = $1, updated_at = $2 WHERE id::text = $3`,
-      [password_hash, now, userId]
-    );
-  } catch (pgErr) {}
-
-  if (isSupabaseConfigured) {
-    try {
-      await supabaseAdmin.from('users').update({ password_hash, updated_at: now }).eq('id', userId);
-    } catch (err) {}
-  }
-
-  userRecord.password_hash = password_hash;
-  userRecord.salt = salt;
-  userRecord.updated_at = now;
-
-  const memUser = localUsersStore.find((u) => u.id === userId);
-  if (memUser) {
-    memUser.password_hash = password_hash;
-    memUser.salt = salt;
-    memUser.updated_at = now;
-  }
-
+  await pgPool.query(
+    `UPDATE users SET password_hash = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+    [hashCredential(newPassword).combined, data.userId]
+  );
   return { success: true, message: 'Password changed successfully.' };
 }
 
 export async function adminResetUserPassword(data: {
   targetUserId: string;
   newPassword: string;
+  newPin?: string;
   adminUserId?: string;
   adminPassword?: string;
 }): Promise<{ success: boolean; message: string }> {
-  const { targetUserId, newPassword, adminUserId, adminPassword } = data;
+  if (!data.newPassword && !data.newPin) throw new HttpError(400, 'Provide a new password and/or a new PIN.');
+  const passwordHash = data.newPassword
+    ? hashCredential(validatePassword(data.newPassword, 'New password')).combined
+    : null;
+  if (!isValidUuid(data.targetUserId)) throw new HttpError(400, 'User id must be a valid UUID.');
 
-  if (!newPassword || newPassword.length < 6) {
-    throw new Error('New password must be at least 6 characters long.');
-  }
-
-  // If admin password confirmation is provided, verify admin identity first
-  if (adminUserId && adminPassword) {
-    const adminRecord = await getUserAuthRecord(adminUserId);
-    if (!adminRecord || adminRecord.role !== 'ADMIN') {
-      throw new Error('Only an authorized Administrator can reset user passwords.');
-    }
-    const isAdminValid = verifyCredential(adminPassword, adminRecord.password_hash, adminRecord.salt);
-    if (!isAdminValid) {
-      throw new Error('Administrator confirmation password incorrect.');
+  // Optional re-confirmation of the acting Administrator's own password.
+  if (data.adminPassword) {
+    const admin = await pgPool.query(`SELECT password_hash, role FROM users WHERE id = $1`, [data.adminUserId]);
+    if (!admin.rows[0] || admin.rows[0].role !== 'ADMIN' || !verifyCredential(data.adminPassword, admin.rows[0].password_hash)) {
+      throw new HttpError(403, 'Administrator confirmation password incorrect.');
     }
   }
 
-  const targetRecord = await getUserAuthRecord(targetUserId);
-  if (!targetRecord) {
-    throw new Error('Target user account not found.');
-  }
-
-  // Hash new password using PBKDF2/SHA-512
-  const { combined: password_hash, salt } = hashCredential(newPassword);
-  const now = new Date().toISOString();
-
-  try {
-    await pgPool.query(
-      `UPDATE users SET password_hash = $1, updated_at = $2 WHERE id::text = $3`,
-      [password_hash, now, targetUserId]
-    );
-  } catch (pgErr) {}
-
-  if (isSupabaseConfigured) {
-    try {
-      await supabaseAdmin.from('users').update({ password_hash, updated_at: now }).eq('id', targetUserId);
-    } catch (err) {}
-  }
-
-  targetRecord.password_hash = password_hash;
-  targetRecord.salt = salt;
-  targetRecord.updated_at = now;
-
-  const memUser = localUsersStore.find((u) => u.id === targetUserId);
-  if (memUser) {
-    memUser.password_hash = password_hash;
-    memUser.salt = salt;
-    memUser.updated_at = now;
-  }
-
-  return { success: true, message: `Password for ${targetRecord.name} was successfully reset.` };
-}
-
-export async function authenticateUser(identifier: string, secret: string): Promise<User> {
-  const cleanId = identifier.trim();
-  const cleanSecret = secret.trim();
-
-  let userRecord = await getUserAuthRecord(cleanId);
-
-  // If user identifier not found directly, also check if a user with given PIN matches
-  if (!userRecord) {
-    const allUsers = await getAllUsers();
-    for (const u of allUsers) {
-      const authRec = await getUserAuthRecord(u.email);
-      if (authRec && (verifyCredential(cleanSecret || cleanId, authRec.pin_hash, authRec.salt) || verifyCredential(cleanSecret || cleanId, authRec.password_hash, authRec.salt))) {
-        userRecord = authRec;
-        break;
-      }
-    }
-  }
-
-  if (!userRecord) {
-    throw new Error('Invalid credentials or account does not exist.');
-  }
-
-  if (!userRecord.active) {
-    throw new Error('This staff account has been deactivated. Please contact an Administrator.');
-  }
-
-  const isPasswordValid = verifyCredential(cleanSecret, userRecord.password_hash, userRecord.salt);
-  const isPinValid = verifyCredential(cleanSecret, userRecord.pin_hash, userRecord.salt);
-
-  if (!isPasswordValid && !isPinValid) {
-    throw new Error('Incorrect password or PIN.');
-  }
-
-  // Update last_login
-  userRecord.last_login = new Date().toISOString();
-  try {
-    await pgPool.query(`UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id::text = $1`, [userRecord.id]);
-  } catch (pgErr) {}
-
-  if (isSupabaseConfigured) {
-    void supabaseAdmin
-      .from('users')
-      .update({ last_login: userRecord.last_login })
-      .eq('id', userRecord.id);
-  }
-
-  return sanitizeUser(userRecord);
+  const pinHash = data.newPin ? hashCredential(validatePin(String(data.newPin))).combined : null;
+  const res = await pgPool.query(
+    `UPDATE users SET password_hash = COALESCE($1, password_hash), pin_hash = COALESCE($2, pin_hash),
+       updated_at = CURRENT_TIMESTAMP
+     WHERE id = $3 RETURNING name`,
+    [passwordHash, pinHash, data.targetUserId]
+  );
+  if (!res.rows[0]) throw new HttpError(404, 'Target user account not found.');
+  const what = passwordHash && pinHash ? 'Password and PIN' : passwordHash ? 'Password' : 'PIN';
+  return { success: true, message: `${what} for ${res.rows[0].name} was successfully reset.` };
 }

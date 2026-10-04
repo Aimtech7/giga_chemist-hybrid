@@ -3,7 +3,8 @@ import { Router, Request, Response, NextFunction } from 'express';
 import {
   getAllCategories,
   getAllMedicines,
-  upsertMedicine,
+  createMedicine,
+  updateMedicineDetails,
   adminUpdateMedicinePricing,
   getAllBatches,
   upsertBatch,
@@ -33,6 +34,7 @@ import {
   updatePharmacySettings,
   getAllUsers,
   getUserById,
+  getActiveUserForSession,
   createUser,
   updateUser,
   toggleUserStatus,
@@ -40,6 +42,7 @@ import {
   adminResetUserPassword,
   authenticateUser,
   registerDevice,
+  normalizeDeviceId,
   checkPgConnection,
   getAppMode,
   isSupabaseConfigured,
@@ -118,24 +121,32 @@ export function authMiddleware(req: AuthenticatedRequest, res: Response, next: N
     token = (req.headers['x-auth-token'] as string).trim();
   }
 
-  if (token) {
-    const { valid, payload } = verifyJwtToken(token);
-    if (valid && payload) {
-      req.tokenPayload = payload;
-      req.userId = payload.userId;
-      req.userRole = payload.role;
-      req.userName = payload.name;
-      req.userEmail = payload.email;
-      return next();
-    }
-  }
-
   // Authorization comes only from a verified token. x-user-* headers are never trusted.
-  // Unauthenticated / Anonymous default
   req.userRole = undefined;
   req.userId = undefined;
   req.userName = undefined;
-  next();
+  if (!token) return next();
+
+  const { valid, payload } = verifyJwtToken(token);
+  if (!valid || !payload) return next();
+
+  // Re-read the account on every request: a deactivated user or changed role takes effect
+  // immediately instead of when the 12-hour token expires.
+  getActiveUserForSession(payload.userId)
+    .then((user) => {
+      if (user) {
+        req.tokenPayload = payload;
+        req.userId = user.id;
+        req.userRole = user.role;
+        req.userName = user.name;
+        req.userEmail = user.email;
+      }
+      next();
+    })
+    .catch((err) => {
+      console.error('[API] Session lookup failed:', err.message);
+      res.status(503).json({ error: 'Database unavailable: cannot verify the session.' });
+    });
 }
 
 // 3. RBAC Guards & Middleware
@@ -222,256 +233,204 @@ apiRouter.get('/health', async (req, res) => {
 });
 
 // --- 2. DEVICE REGISTRATION ---
-apiRouter.post('/devices/register', async (req: Request, res: Response) => {
+apiRouter.post('/devices/register', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { device_id, name, device_type, app_version } = req.body;
-    if (!device_id) {
-      return res.status(400).json({ error: 'device_id is required' });
-    }
-    const device = await registerDevice({
-      device_id,
-      name,
-      device_type,
-      app_version,
-    });
-    res.json({
-      status: 'registered',
-      device,
-      server_time: new Date().toISOString(),
-    });
+    const { device_id, name, device_type, app_version } = req.body || {};
+    const device = await registerDevice({ device_id, name, device_type, app_version, user_id: req.userId });
+    res.json({ status: 'registered', device, server_time: new Date().toISOString() });
   } catch (err: any) {
-    res.status(500).json({ error: 'Failed to register device', details: err.message });
+    console.error('[API] /devices/register failed:', err.message);
+    res.status(errorStatus(err)).json({ error: err.message || 'Failed to register device.' });
   }
 });
 
 // --- 3. AUTHENTICATION & CENTRALIZED USER MANAGEMENT ---
 apiRouter.post('/auth/login', authRateLimiter, async (req: Request, res: Response) => {
   try {
-    const { email, username, pin, password } = req.body;
-    const identifier = email || username || pin || '';
-    const secret = password || pin || '';
-
+    const { email, username, password, pin } = req.body || {};
+    const identifier = String(email || username || '').trim();
+    const secret = String(password || pin || '').trim();
     if (!identifier || !secret) {
-      return res.status(400).json({ error: 'Identifier (email/username/pin) and secret are required.' });
+      return res.status(400).json({ error: 'Email and password (or PIN) are required.' });
     }
 
-    const authenticatedUser = await authenticateUser(identifier, secret);
-    const token = createJwtToken({
-      userId: authenticatedUser.id,
-      role: authenticatedUser.role,
-      email: authenticatedUser.email,
-      name: authenticatedUser.name,
-    });
+    const user = await authenticateUser(identifier, secret);
+    const token = createJwtToken({ userId: user.id, role: user.role, email: user.email, name: user.name });
 
     await recordAuditLog({
-      user_id: authenticatedUser.id,
-      user_name: authenticatedUser.name,
-      role: authenticatedUser.role,
+      user_id: user.id,
+      user_name: user.name,
+      role: user.role,
       action: 'SERVER_AUTH_LOGIN',
       entity: 'auth',
-      entity_id: authenticatedUser.id,
-      device_id: (req.headers['x-device-id'] as string) || 'REMOTE-CLIENT',
-      new_value: JSON.stringify({ email: authenticatedUser.email, role: authenticatedUser.role }),
+      entity_id: user.id,
+      device_id: normalizeDeviceId(req.headers['x-device-id']) || 'SERVER',
+      new_value: { email: user.email, role: user.role },
     });
 
-    res.json({
-      success: true,
-      user: authenticatedUser,
-      token,
-      permissions: ROLE_PERMISSIONS[authenticatedUser.role],
-    });
+    res.json({ success: true, user, token, permissions: ROLE_PERMISSIONS[user.role] });
   } catch (err: any) {
-    res.status(401).json({ error: err.message || 'Authentication failed.' });
+    const status = errorStatus(err);
+    if (status >= 500) console.error('[API] /auth/login failed:', err.message);
+    res.status(status === 400 && !err.status ? 401 : status).json({ error: err.message || 'Authentication failed.' });
   }
 });
 
+// Validates the caller's token against the database and returns the current account.
+apiRouter.get('/auth/me', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+  res.json({
+    user: { id: req.userId, name: req.userName, email: req.userEmail, role: req.userRole },
+    permissions: ROLE_PERMISSIONS[req.userRole!],
+    token_expires_at: req.tokenPayload?.exp ? req.tokenPayload.exp * 1000 : undefined,
+  });
+});
+
+function actorAudit(req: AuthenticatedRequest) {
+  return {
+    user_id: req.userId!,
+    user_name: req.userName || 'Admin',
+    role: req.userRole!,
+    device_id: normalizeDeviceId(req.headers['x-device-id']) || 'SERVER',
+  };
+}
+
 apiRouter.get('/users', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const users = await getAllUsers();
-    res.json(users);
+    res.json(await getAllUsers());
   } catch (err: any) {
+    console.error('[API] GET /users failed:', err.message);
     res.status(500).json({ error: 'Failed to retrieve users directory.' });
   }
 });
 
 apiRouter.post('/users', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { name, email, role, password, pin, phone, active } = req.body;
-    if (!name || !email || !role) {
-      return res.status(400).json({ error: 'Name, email, and role are required.' });
-    }
-
-    const created = await createUser({
-      name,
-      email,
-      role,
-      password,
-      pin,
-      phone,
-      active,
-      created_by: req.userId,
-    });
-
+    const { name, email, role, password, pin, phone, active } = req.body || {};
+    const created = await createUser({ name, email, role, password, pin, phone, active, created_by: req.userId });
     await recordAuditLog({
-      user_id: req.userId || 'admin',
-      user_name: req.userName || 'Admin',
-      role: req.userRole || 'ADMIN',
+      ...actorAudit(req),
       action: 'USER_CREATED',
       entity: 'user',
       entity_id: created.id,
-      new_value: JSON.stringify({ name: created.name, role: created.role, email: created.email }),
+      new_value: { name: created.name, role: created.role, email: created.email, active: created.active },
     });
-
     res.status(201).json({ success: true, user: created });
   } catch (err: any) {
-    res.status(400).json({ error: err.message || 'Failed to create user.' });
+    res.status(errorStatus(err)).json({ error: err.message || 'Failed to create user.' });
   }
 });
 
 apiRouter.put('/users/:id', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
-    const updates = req.body;
-
-    const updated = await updateUser(id, updates, req.userId);
-
+    // Credentials are never changed through this endpoint (see reset-password / change-password).
+    const { name, email, role, phone, active } = req.body || {};
+    const before = await getUserById(id);
+    const updated = await updateUser(id, { name, email, role, phone, active }, req.userId);
     await recordAuditLog({
-      user_id: req.userId || 'admin',
-      user_name: req.userName || 'Admin',
-      role: req.userRole || 'ADMIN',
+      ...actorAudit(req),
       action: 'USER_UPDATED',
       entity: 'user',
       entity_id: id,
-      new_value: JSON.stringify(updates),
+      previous_value: before ? { name: before.name, email: before.email, role: before.role, active: before.active } : undefined,
+      new_value: { name: updated.name, email: updated.email, role: updated.role, active: updated.active },
     });
-
     res.json({ success: true, user: updated });
   } catch (err: any) {
-    res.status(400).json({ error: err.message || 'Failed to update user.' });
+    res.status(errorStatus(err)).json({ error: err.message || 'Failed to update user.' });
   }
 });
 
 apiRouter.patch('/users/:id/role', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
-    const { role } = req.body;
-    if (!role || !['ADMIN', 'MANAGER', 'CASHIER'].includes(role)) {
-      return res.status(400).json({ error: 'Valid role (ADMIN, MANAGER, CASHIER) is required.' });
-    }
-
-    const updated = await updateUser(id, { role }, req.userId);
-
+    const before = await getUserById(id);
+    const updated = await updateUser(id, { role: req.body?.role }, req.userId);
     await recordAuditLog({
-      user_id: req.userId || 'admin',
-      user_name: req.userName || 'Admin',
-      role: req.userRole || 'ADMIN',
+      ...actorAudit(req),
       action: 'USER_ROLE_CHANGED',
       entity: 'user',
       entity_id: id,
-      new_value: JSON.stringify({ role: updated.role }),
+      previous_value: before ? { role: before.role } : undefined,
+      new_value: { role: updated.role },
     });
-
     res.json({ success: true, user: updated });
   } catch (err: any) {
-    res.status(400).json({ error: err.message || 'Failed to change user role.' });
+    res.status(errorStatus(err)).json({ error: err.message || 'Failed to change user role.' });
   }
 });
 
 apiRouter.patch('/users/:id/status', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
-    const { active } = req.body;
-    if (active === undefined) {
-      return res.status(400).json({ error: 'active boolean status required.' });
+    const { active } = req.body || {};
+    if (typeof active !== 'boolean') {
+      return res.status(400).json({ error: 'active must be true or false.' });
     }
-
-    if (id === req.userId && active === false) {
-      return res.status(400).json({ error: 'Cannot deactivate your own logged-in administrator account.' });
-    }
-
-    const updated = await toggleUserStatus(id, Boolean(active), req.userId);
-
+    const updated = await toggleUserStatus(id, active, req.userId);
     await recordAuditLog({
-      user_id: req.userId || 'admin',
-      user_name: req.userName || 'Admin',
-      role: req.userRole || 'ADMIN',
+      ...actorAudit(req),
       action: active ? 'USER_ACTIVATED' : 'USER_DEACTIVATED',
       entity: 'user',
       entity_id: id,
-      new_value: JSON.stringify({ active: updated.active }),
+      new_value: { active: updated.active },
     });
-
     res.json({ success: true, user: updated });
   } catch (err: any) {
-    res.status(400).json({ error: err.message || 'Failed to toggle user status.' });
+    res.status(errorStatus(err)).json({ error: err.message || 'Failed to change user status.' });
   }
 });
 
-// Admin Reset Another User's Password (ADMIN ONLY)
+// Admin resets another user's password (and optionally PIN). ADMIN ONLY.
 apiRouter.post('/users/:id/reset-password', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
-    const { new_password, admin_password } = req.body;
-
-    if (!new_password) {
-      return res.status(400).json({ error: 'new_password is required.' });
-    }
-
+    const { new_password, new_pin, admin_password } = req.body || {};
     const result = await adminResetUserPassword({
       targetUserId: id,
       newPassword: new_password,
+      newPin: new_pin,
       adminUserId: req.userId,
       adminPassword: admin_password,
     });
-
     await recordAuditLog({
-      user_id: req.userId || 'admin',
-      user_name: req.userName || 'Admin',
-      role: req.userRole || 'ADMIN',
+      ...actorAudit(req),
       action: 'USER_PASSWORD_RESET',
       entity: 'user',
       entity_id: id,
-      new_value: JSON.stringify({ reset_by: req.userName }),
+      new_value: { reset_by: req.userName, pin_reset: Boolean(new_pin) },
     });
-
     res.json(result);
   } catch (err: any) {
-    res.status(400).json({ error: err.message || 'Failed to reset user password.' });
+    res.status(errorStatus(err)).json({ error: err.message || 'Failed to reset user password.' });
   }
 });
 
-// Change Own Password (Any authenticated Cashier / Admin)
+// Any authenticated user changes their OWN password.
 apiRouter.post('/users/change-password', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { current_password, new_password, confirm_password } = req.body;
-
+    const { current_password, new_password, confirm_password } = req.body || {};
     if (!current_password || !new_password) {
       return res.status(400).json({ error: 'current_password and new_password are required.' });
     }
-
-    if (confirm_password && new_password !== confirm_password) {
+    if (confirm_password !== undefined && new_password !== confirm_password) {
       return res.status(400).json({ error: 'New password and confirmation do not match.' });
     }
-
     const result = await changeUserPassword({
       userId: req.userId!,
       currentPassword: current_password,
       newPassword: new_password,
     });
-
     await recordAuditLog({
-      user_id: req.userId || 'user',
-      user_name: req.userName || 'User',
-      role: req.userRole || 'CASHIER',
-      action: req.userRole === 'ADMIN' ? 'ADMIN_PASSWORD_CHANGED' : 'USER_PASSWORD_CHANGED',
+      ...actorAudit(req),
+      action: 'USER_PASSWORD_CHANGED',
       entity: 'user',
-      entity_id: req.userId || 'self',
-      new_value: JSON.stringify({ action: 'Self password change' }),
+      entity_id: req.userId!,
+      new_value: { action: 'Self password change' },
     });
-
     res.json(result);
   } catch (err: any) {
-    res.status(400).json({ error: err.message || 'Failed to change password.' });
+    res.status(errorStatus(err)).json({ error: err.message || 'Failed to change password.' });
   }
 });
 
@@ -496,108 +455,45 @@ apiRouter.get('/medicines', requirePermission('medicine.view'), async (req: Auth
 
 apiRouter.post('/medicines', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const medData: Medicine = req.body;
-    if (!medData.name || !medData.selling_price) {
-      return res.status(400).json({ error: 'Medicine name and selling price are required.' });
-    }
-
-    const saved = await upsertMedicine(medData);
-    await recordAuditLog({
-      user_id: req.userId || 'admin',
-      user_name: req.userName || 'Admin',
-      role: req.userRole || 'ADMIN',
-      action: 'CREATE_MEDICINE',
-      entity: 'medicine',
-      entity_id: saved.id,
-      new_value: JSON.stringify(saved),
-    });
-
+    const saved = await createMedicine(req.body || {}, actorAudit(req));
     res.status(201).json({ success: true, medicine: saved });
   } catch (err: any) {
-    res.status(400).json({ error: err.message || 'Failed to create medicine.' });
+    console.error('[API] POST /medicines failed:', err.message);
+    res.status(errorStatus(err)).json({ error: err.message || 'Failed to create medicine.' });
   }
 });
 
 apiRouter.put('/medicines/:id', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { id } = req.params;
-    const updates: Partial<Medicine> = req.body;
-
-    const saved = await upsertMedicine({ ...updates, id, name: updates.name || 'Unnamed' });
-    await recordAuditLog({
-      user_id: req.userId || 'admin',
-      user_name: req.userName || 'Admin',
-      role: req.userRole || 'ADMIN',
-      action: 'UPDATE_MEDICINE',
-      entity: 'medicine',
-      entity_id: id,
-      new_value: JSON.stringify(updates),
-    });
-
+    const saved = await updateMedicineDetails(req.params.id, req.body || {}, actorAudit(req));
     res.json({ success: true, medicine: saved });
   } catch (err: any) {
-    res.status(400).json({ error: err.message || 'Failed to update medicine.' });
+    console.error('[API] PUT /medicines/:id failed:', err.message);
+    res.status(errorStatus(err)).json({ error: err.message || 'Failed to update medicine.' });
   }
 });
 
-// Admin Update Medicine Pricing (ADMIN ONLY)
-apiRouter.patch('/medicines/:id/pricing', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+// Admin Update Medicine Pricing (ADMIN ONLY). Historical sale_items are never rewritten.
+async function handlePricingUpdate(req: AuthenticatedRequest, res: Response) {
   try {
-    const { id } = req.params;
-    const { selling_price, purchase_price, min_selling_price, wholesale_price, reorder_level } = req.body;
-
-    if (
-      selling_price === undefined &&
-      purchase_price === undefined &&
-      min_selling_price === undefined &&
-      wholesale_price === undefined &&
-      reorder_level === undefined
-    ) {
-      return res.status(400).json({ error: 'At least one pricing field (selling_price, purchase_price, reorder_level) must be provided.' });
-    }
-
+    const { selling_price, purchase_price, min_selling_price, wholesale_price, reorder_level } = req.body || {};
     const saved = await adminUpdateMedicinePricing({
-      id,
-      selling_price: selling_price !== undefined ? Number(selling_price) : undefined,
-      purchase_price: purchase_price !== undefined ? Number(purchase_price) : undefined,
-      min_selling_price: min_selling_price !== undefined ? Number(min_selling_price) : undefined,
-      wholesale_price: wholesale_price !== undefined ? Number(wholesale_price) : undefined,
-      reorder_level: reorder_level !== undefined ? Number(reorder_level) : undefined,
-      user_id: req.userId || 'admin',
-      user_name: req.userName || 'Admin',
-      role: req.userRole || 'ADMIN',
-      device_id: (req.headers['x-device-id'] as string) || 'SERVER',
+      id: req.params.id,
+      selling_price,
+      purchase_price,
+      min_selling_price,
+      wholesale_price,
+      reorder_level,
+      ...actorAudit(req),
     });
-
     res.json({ success: true, medicine: saved });
   } catch (err: any) {
-    res.status(400).json({ error: err.message || 'Failed to update pricing.' });
+    console.error('[API] medicine pricing update failed:', err.message);
+    res.status(errorStatus(err)).json({ error: err.message || 'Failed to update pricing.' });
   }
-});
-
-apiRouter.patch('/medicines/:id/price', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
-  try {
-    const { id } = req.params;
-    const { selling_price, purchase_price, min_selling_price, wholesale_price, reorder_level } = req.body;
-
-    const saved = await adminUpdateMedicinePricing({
-      id,
-      selling_price: selling_price !== undefined ? Number(selling_price) : undefined,
-      purchase_price: purchase_price !== undefined ? Number(purchase_price) : undefined,
-      min_selling_price: min_selling_price !== undefined ? Number(min_selling_price) : undefined,
-      wholesale_price: wholesale_price !== undefined ? Number(wholesale_price) : undefined,
-      reorder_level: reorder_level !== undefined ? Number(reorder_level) : undefined,
-      user_id: req.userId || 'admin',
-      user_name: req.userName || 'Admin',
-      role: req.userRole || 'ADMIN',
-      device_id: (req.headers['x-device-id'] as string) || 'SERVER',
-    });
-
-    res.json({ success: true, medicine: saved });
-  } catch (err: any) {
-    res.status(400).json({ error: err.message || 'Failed to update price.' });
-  }
-});
+}
+apiRouter.patch('/medicines/:id/pricing', requireRole('ADMIN'), handlePricingUpdate);
+apiRouter.patch('/medicines/:id/price', requireRole('ADMIN'), handlePricingUpdate);
 
 // Medicine categories (formulary metadata; same access as the medicine list)
 apiRouter.get('/categories', requirePermission('medicine.view'), async (req: AuthenticatedRequest, res: Response) => {
@@ -1081,17 +977,19 @@ apiRouter.get('/settings', async (req, res) => {
   try {
     const settings = await getPharmacySettings();
     res.json(settings);
-  } catch (err) {
+  } catch (err: any) {
+    console.error('[API] GET /settings failed:', err.message);
     res.status(500).json({ error: 'Failed to fetch settings.' });
   }
 });
 
-apiRouter.put('/settings', requireRole('ADMIN'), async (req, res) => {
+apiRouter.put('/settings', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const saved = await updatePharmacySettings(req.body);
+    const saved = await updatePharmacySettings(req.body || {}, actorAudit(req));
     res.json({ success: true, settings: saved });
   } catch (err: any) {
-    res.status(400).json({ error: err.message || 'Failed to update settings.' });
+    console.error('[API] PUT /settings failed:', err.message);
+    res.status(errorStatus(err)).json({ error: err.message || 'Failed to update settings.' });
   }
 });
 

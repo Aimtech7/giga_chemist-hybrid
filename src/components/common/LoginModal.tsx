@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { Lock, User, KeyRound, AlertCircle, X, ShieldCheck } from 'lucide-react';
-import { loginWithPinOrEmail, INITIAL_USERS } from '../../services/auth';
+import { loginWithPinOrEmail } from '../../services/auth';
 import type { User as UserType } from '../../types';
 
 interface LoginModalProps {
@@ -23,22 +23,6 @@ export const LoginModal: React.FC<LoginModalProps> = ({ isOpen, onClose, onSucce
     setLoading(true);
     try {
       const user = await loginWithPinOrEmail(identifier, secret);
-      onSuccess(user);
-      onClose();
-    } catch (err: any) {
-      setError(err?.message || 'Login failed.');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleQuickLogin = async (u: typeof INITIAL_USERS[0]) => {
-    setIdentifier(u.email);
-    setSecret(u.pin);
-    setError(null);
-    setLoading(true);
-    try {
-      const user = await loginWithPinOrEmail(u.email, u.pin);
       onSuccess(user);
       onClose();
     } catch (err: any) {
@@ -121,34 +105,6 @@ export const LoginModal: React.FC<LoginModalProps> = ({ isOpen, onClose, onSucce
             </button>
           </form>
 
-          {/* Quick Demo Switcher Section (Development Only) */}
-          {import.meta.env.DEV && (
-            <div className="border-t border-slate-200 pt-3">
-              <div className="text-[11px] font-bold text-amber-600 uppercase tracking-wider mb-2">
-                DEV ONLY: Quick Demo Accounts:
-              </div>
-              <div className="grid grid-cols-3 gap-2">
-                {INITIAL_USERS.map((u) => (
-                  <button
-                    key={u.id}
-                    type="button"
-                    onClick={() => handleQuickLogin(u)}
-                    className="p-2 rounded border border-slate-200 hover:border-teal-500 hover:bg-teal-50/50 text-left transition flex flex-col cursor-pointer"
-                  >
-                    <span className="text-[10px] font-bold uppercase text-slate-500">
-                      {u.role}
-                    </span>
-                    <span className="text-xs font-bold text-slate-800 truncate">
-                      {u.name.split(' ')[0]}
-                    </span>
-                    <span className="text-[10px] font-mono text-teal-700 font-semibold mt-1">
-                      PIN: {u.pin}
-                    </span>
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
         </div>
       </div>
     </div>

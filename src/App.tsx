@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { db, getSettings } from './db/dexie';
-import { getCachedUser, setCachedUser, INITIAL_USERS, logoutUser } from './services/auth';
+import { getCachedUser, setCachedUser, logoutUser, verifySession } from './services/auth';
+import { SESSION_EXPIRED_EVENT } from './services/session';
 import { getOrRegisterDevice } from './services/device';
 import { refreshNetworkStatus } from './services/network';
 import { syncFromLocalApiToDexie, syncFromSupabaseToDexie } from './services/syncEngine';
@@ -160,19 +161,16 @@ export default function App() {
         const loadedSettings = await getSettings();
         setSettings(loadedSettings);
 
-        // Load cached user session
-        const cached = getCachedUser();
-        if (cached) {
-          setCurrentUser(cached);
-          if (isCashier(cached) && !canAccessModule(cached, currentModule)) {
+        // Restore the session only if the server still accepts its token (role/active from the DB).
+        const verified = await verifySession();
+        if (verified) {
+          setCurrentUser(verified);
+          if (isCashier(verified) && !canAccessModule(verified, currentModule)) {
             setCurrentModule('pos');
           }
-          // Hydrate Dexie in background for cached session
-          syncFromLocalApiToDexie().catch((e) => console.warn('[App] Local sync notice:', e));
+          syncFromLocalApiToDexie().catch((e) => console.warn('[App] Local sync failed:', e));
         } else {
           setCurrentUser(null);
-          // Initial catalog hydration for guest / public lookup
-          syncFromLocalApiToDexie().catch((e) => console.warn('[App] Local initial sync notice:', e));
         }
 
         // Initialize network and sync monitoring
@@ -195,17 +193,16 @@ export default function App() {
     navigateToLanding();
   };
 
-  const handleRoleQuickSwitch = (role: 'ADMIN' | 'MANAGER' | 'CASHIER') => {
-    const targetUser = INITIAL_USERS.find((u) => u.role === role) || INITIAL_USERS[0];
-    setCachedUser(targetUser);
-    setCurrentUser(targetUser);
-
-    // If switching to a role that cannot access current module, switch to POS
-    if (!canAccessModule(targetUser, currentModule)) {
-      setCurrentModule('pos');
-    }
-    syncFromLocalApiToDexie().catch((e) => console.warn('[App] Quick switch sync notice:', e));
-  };
+  // Any 401 from the API (or an expired token) ends the session and returns to the login screen.
+  useEffect(() => {
+    const onExpired = () => {
+      setCurrentUser(null);
+      setViewMode('login');
+      window.location.hash = '#login';
+    };
+    window.addEventListener(SESSION_EXPIRED_EVENT, onExpired);
+    return () => window.removeEventListener(SESSION_EXPIRED_EVENT, onExpired);
+  }, []);
 
   if (!isInitialized || !settings) {
     return (
@@ -274,7 +271,6 @@ export default function App() {
       settings={settings}
       onOpenLogin={() => setIsLoginOpen(true)}
       onLogout={handleLogout}
-      onFastRoleSwitch={handleRoleQuickSwitch}
       onViewLandingPage={navigateToLanding}
     >
       {/* EXECUTIVE & OPERATIONAL DASHBOARD */}

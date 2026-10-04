@@ -1,0 +1,174 @@
+import 'dotenv/config';
+import crypto from 'crypto';
+import { spawn, type ChildProcess } from 'child_process';
+import pg from 'pg';
+import { getDatabaseConnectionConfig } from '../../server/db/client';
+import { hashCredential } from '../../server/auth';
+
+/**
+ * Shared harness for the local integration suite. It starts its OWN server process (default port
+ * 3199) against the configured PostgreSQL database, and refuses to run unless that database is the
+ * PC2 development database.
+ */
+export const REQUIRED_DB = 'giga_chemist_dev';
+export const PORT = Number(process.env.ITEST_PORT || 3199);
+export const BASE = `http://127.0.0.1:${PORT}`;
+
+export const pool = new pg.Pool(getDatabaseConnectionConfig());
+
+export async function assertDevDatabase(): Promise<void> {
+  const res = await pool.query('SELECT current_database() AS db');
+  if (res.rows[0].db !== REQUIRED_DB) {
+    throw new Error(`Refusing to run integration tests against "${res.rows[0].db}" (only ${REQUIRED_DB}).`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Assertions
+// ---------------------------------------------------------------------------
+let passed = 0;
+let failed = 0;
+const failures: string[] = [];
+let currentSection = '';
+
+export function section(name: string) {
+  currentSection = name;
+  console.log(`\n=== ${name} ===`);
+}
+
+export function check(cond: boolean, label: string, detail?: unknown) {
+  if (cond) {
+    passed++;
+    console.log(`  PASS  ${label}`);
+  } else {
+    failed++;
+    const msg = `${currentSection} :: ${label}${detail !== undefined ? ` -> ${JSON.stringify(detail).slice(0, 400)}` : ''}`;
+    failures.push(msg);
+    console.log(`  FAIL  ${label}${detail !== undefined ? ` -> ${JSON.stringify(detail).slice(0, 400)}` : ''}`);
+  }
+}
+
+export function summary(): number {
+  console.log(`\n=============================================================`);
+  console.log(`  RESULT: ${passed} passed, ${failed} failed`);
+  if (failures.length) {
+    console.log('  Failures:');
+    for (const f of failures) console.log(`   - ${f}`);
+  }
+  console.log(`=============================================================`);
+  return failed;
+}
+
+export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// ---------------------------------------------------------------------------
+// Server process
+// ---------------------------------------------------------------------------
+let server: ChildProcess | null = null;
+let serverLog = '';
+
+export async function startServer(): Promise<void> {
+  serverLog = '';
+  server = spawn(process.execPath, ['--import', 'tsx', 'server.ts'], {
+    env: { ...process.env, PORT: String(PORT) },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  server.stdout!.on('data', (d) => (serverLog += d.toString()));
+  server.stderr!.on('data', (d) => (serverLog += d.toString()));
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
+    if (server.exitCode !== null) throw new Error(`Server exited early:\n${serverLog}`);
+    try {
+      const r = await fetch(`${BASE}/api/health`);
+      if (r.ok) return;
+    } catch {}
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  throw new Error(`Server did not become healthy:\n${serverLog}`);
+}
+
+export async function stopServer(): Promise<void> {
+  if (!server || server.exitCode !== null) return;
+  const exited = new Promise((r) => server!.once('exit', r));
+  server.kill();
+  await Promise.race([exited, new Promise((r) => setTimeout(r, 10_000))]);
+  server = null;
+}
+
+export function getServerLog(): string {
+  return serverLog;
+}
+
+// ---------------------------------------------------------------------------
+// HTTP
+// ---------------------------------------------------------------------------
+export interface ApiResult {
+  status: number;
+  data: any;
+  contentType: string;
+}
+
+export async function api(method: string, path: string, token?: string | null, body?: unknown, extraHeaders: Record<string, string> = {}): Promise<ApiResult> {
+  const headers: Record<string, string> = { 'X-Device-Id': 'ITEST-TERMINAL', ...extraHeaders };
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const res = await fetch(`${BASE}${path}`, { method, headers, body: body !== undefined ? JSON.stringify(body) : undefined });
+  const contentType = res.headers.get('content-type') || '';
+  const data = contentType.includes('application/json') ? await res.json().catch(() => null) : await res.text();
+  return { status: res.status, data, contentType };
+}
+
+export async function login(email: string, password: string): Promise<string> {
+  const r = await api('POST', '/api/auth/login', null, { email, password });
+  if (r.status !== 200 || !r.data?.token) throw new Error(`Login failed for ${email}: ${r.status} ${JSON.stringify(r.data)}`);
+  return r.data.token;
+}
+
+// ---------------------------------------------------------------------------
+// Fixtures (dev database only). Passwords are random per run and never printed.
+// ---------------------------------------------------------------------------
+export interface Fixture {
+  id: string;
+  email: string;
+  password: string;
+  role: 'ADMIN' | 'CASHIER';
+}
+
+export function randomPassword(): string {
+  return `It-${crypto.randomBytes(12).toString('base64url')}`;
+}
+
+export async function upsertFixtureUser(email: string, name: string, role: 'ADMIN' | 'CASHIER'): Promise<Fixture> {
+  const password = randomPassword();
+  const hash = hashCredential(password).combined;
+  const pin = hashCredential(crypto.randomBytes(16).toString('hex')).combined;
+  const res = await pool.query(
+    `INSERT INTO users (id, name, email, role, active, password_hash, pin_hash)
+     VALUES ($1, $2, $3, $4, true, $5, $6)
+     ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name, role = EXCLUDED.role, active = true,
+       password_hash = EXCLUDED.password_hash, pin_hash = EXCLUDED.pin_hash, updated_at = CURRENT_TIMESTAMP
+     RETURNING id`,
+    [crypto.randomUUID(), name, email, role, hash, pin]
+  );
+  return { id: res.rows[0].id, email, password, role };
+}
+
+/** Test medicines are identified by barcode; created once, re-activated per run, priced fresh. */
+export async function upsertFixtureMedicine(barcode: string, name: string, selling: number, cost: number): Promise<string> {
+  const existing = await pool.query('SELECT id FROM medicines WHERE barcode = $1 LIMIT 1', [barcode]);
+  if (existing.rows[0]) {
+    await pool.query(
+      `UPDATE medicines SET name = $2, selling_price = $3, purchase_price = $4, status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+      [existing.rows[0].id, name, selling, cost]
+    );
+    return existing.rows[0].id;
+  }
+  const id = crypto.randomUUID();
+  await pool.query(
+    `INSERT INTO medicines (id, name, generic_name, sku, barcode, dosage_strength, dosage_form,
+       purchase_price, selling_price, current_stock, reorder_level, unit, status)
+     VALUES ($1, $2, $2, $3, $3, '1 unit', 'Tablet', $4, $5, 0, 5, 'Unit', 'active')`,
+    [id, name, barcode, cost, selling]
+  );
+  return id;
+}

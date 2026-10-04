@@ -19,10 +19,10 @@ import { isExpired, normalizeExpiryDate } from '../../utils/expiry';
 import { downloadCSV } from '../../services/exportUtils';
 import { ReceiptModal } from '../pos/ReceiptModal';
 import { canViewCostData, isCashier, isAdmin, isManager } from '../../services/permissions';
-import { INITIAL_USERS } from '../../services/auth';
 import { enqueueSyncItem, runSync } from '../../services/syncEngine';
 import { apiUrl } from '../../services/api';
 import type { Sale, CustomerReturn, ReturnAction, PharmacySettings, User, SaleItem } from '../../types';
+import { apiFetch } from '../../services/http';
 
 interface SalesHistoryProps {
   currentUser: User | null;
@@ -73,72 +73,23 @@ export const SalesHistory: React.FC<SalesHistoryProps> = ({ currentUser, setting
   const [supervisorPin, setSupervisorPin] = useState<string>('');
   const [supervisorError, setSupervisorError] = useState<string | null>(null);
 
+  // Totals are aggregated by PostgreSQL (server decides Cashier vs Admin scope from the token).
+  // Never summed from cached/visible Dexie rows: an unavailable server shows an error instead.
+  const [summaryError, setSummaryError] = useState<string | null>(null);
   const loadSummary = async () => {
     try {
-      const res = await fetch(apiUrl('/api/sales/today-summary'), {
-        headers: {
-          'x-user-id': currentUser?.id || '',
-          'x-user-role': currentUser?.role || 'CASHIER',
-          'x-user-name': currentUser?.name || 'Cashier',
-        },
+      const data = await apiFetch<typeof todaySummary>('/api/sales/today-summary');
+      setTodaySummary({
+        totalSales: Number(data.totalSales) || 0,
+        cashTotal: Number(data.cashTotal) || 0,
+        mpesaTotal: Number(data.mpesaTotal) || 0,
+        transactionCount: Number(data.transactionCount) || 0,
+        refundsTotal: Number(data.refundsTotal) || 0,
       });
-      if (res.ok) {
-        const data = await res.json();
-        setTodaySummary({
-          totalSales: Number(data.totalSales) || 0,
-          cashTotal: Number(data.cashTotal) || 0,
-          mpesaTotal: Number(data.mpesaTotal) || 0,
-          transactionCount: Number(data.transactionCount) || 0,
-          refundsTotal: Number(data.refundsTotal) || 0,
-        });
-        return;
-      }
-    } catch (e) {
-      // Offline fallback
+      setSummaryError(null);
+    } catch (err: any) {
+      setSummaryError(err?.message || 'Today\'s summary is unavailable.');
     }
-
-    // Fallback: calculate directly from Dexie local sales
-    const todayStr = new Date().toISOString().split('T')[0];
-    const todaySales = await db.sales
-      .filter((s) => {
-        const isToday = s.date === todayStr;
-        const isCompleted = s.status === 'completed' || s.status === 'partially_returned';
-        if (!isToday || !isCompleted) return false;
-        if (isCashierUser) {
-          return !s.cashier_id || s.cashier_id === currentUser?.id;
-        }
-        return true;
-      })
-      .toArray();
-
-    let totalSales = 0;
-    let cashTotal = 0;
-    let mpesaTotal = 0;
-
-    for (const s of todaySales) {
-      const saleAmt = Number(s.total) || 0;
-      totalSales += saleAmt;
-
-      if (s.split_payments && s.split_payments.length > 0) {
-        for (const sp of s.split_payments) {
-          const m = sp.method.toLowerCase();
-          if (m.includes('cash')) cashTotal += Number(sp.amount) || 0;
-          else if (m.includes('mpesa') || m.includes('m-pesa') || m.includes('m_pesa')) mpesaTotal += Number(sp.amount) || 0;
-        }
-      } else {
-        const m = (s.payment_method || '').toLowerCase();
-        if (m.includes('cash')) cashTotal += saleAmt;
-        else if (m.includes('mpesa') || m.includes('m-pesa') || m.includes('m_pesa')) mpesaTotal += saleAmt;
-      }
-    }
-
-    setTodaySummary({
-      totalSales: Math.round(totalSales * 100) / 100,
-      cashTotal: Math.round(cashTotal * 100) / 100,
-      mpesaTotal: Math.round(mpesaTotal * 100) / 100,
-      transactionCount: todaySales.length,
-      refundsTotal: 0,
-    });
   };
 
   const loadSales = async () => {
@@ -426,22 +377,12 @@ export const SalesHistory: React.FC<SalesHistoryProps> = ({ currentUser, setting
       return;
     }
 
-    let authorizingUser: User | null = null;
-
-    if (currentUser.role === 'ADMIN') {
-      authorizingUser = currentUser;
-    } else {
-      // Find manager or admin with matching PIN
-      const supervisor = INITIAL_USERS.find(
-        (u) => (u.role === 'ADMIN' || u.role === 'MANAGER') && u.pin === supervisorPin
-      );
-
-      if (!supervisor) {
-        setSupervisorError('Manager or Administrator authorization required. Invalid PIN.');
-        return;
-      }
-      authorizingUser = supervisor;
+    // Only a logged-in Administrator may void (enforced again by the server).
+    if (currentUser.role !== 'ADMIN') {
+      setSupervisorError('Only an Administrator can void a sale. Ask an Administrator to log in.');
+      return;
     }
+    const authorizingUser: User = currentUser;
 
     const deviceId = await getDeviceId();
     const now = new Date();
@@ -691,6 +632,11 @@ export const SalesHistory: React.FC<SalesHistoryProps> = ({ currentUser, setting
           </span>
         </div>
 
+        {summaryError && (
+          <div className="mb-2.5 px-3 py-2 rounded border border-rose-200 bg-rose-50 text-xs text-rose-800">
+            Summary unavailable — figures below are not current. {summaryError}
+          </div>
+        )}
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
           {/* Card 1: Today's Total Sales */}
           <div className="p-3.5 rounded border border-teal-200 bg-teal-50/60 flex flex-col justify-between shadow-2xs">

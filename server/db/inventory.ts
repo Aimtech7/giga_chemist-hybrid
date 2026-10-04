@@ -1,7 +1,8 @@
 import crypto from 'crypto';
 import type pg from 'pg';
-import { pgPool, isLocalMode, supabaseAdmin, isSupabaseConfigured, cleanUuid, ensureUuid, HttpError, requireUuid } from './client';
+import { pgPool, isLocalMode, supabaseAdmin, isSupabaseConfigured, cleanUuid, ensureUuid, HttpError, requireUuid, withTransaction } from './client';
 import { serverDb } from '../db';
+import { ensureDevice } from './devices';
 import type { InventoryMovement } from '../../src/types';
 
 export async function getAllMovements(): Promise<InventoryMovement[]> {
@@ -105,7 +106,7 @@ export function normalizeExpiryDate(value: unknown): string | null {
   return trimmed;
 }
 
-function requireWholeNumber(value: unknown, field: string, { allowZero }: { allowZero: boolean }): number {
+export function requireWholeNumber(value: unknown, field: string, { allowZero }: { allowZero: boolean }): number {
   const n = Number(value);
   if (!Number.isInteger(n) || n < 0 || (!allowZero && n === 0)) {
     throw new HttpError(400, `${field} must be a ${allowZero ? 'non-negative' : 'positive'} whole number.`);
@@ -113,32 +114,13 @@ function requireWholeNumber(value: unknown, field: string, { allowZero }: { allo
   return n;
 }
 
-export async function withTransaction<T>(fn: (client: pg.PoolClient) => Promise<T>): Promise<T> {
-  const client = await pgPool.connect();
-  try {
-    await client.query('BEGIN');
-    const result = await fn(client);
-    await client.query('COMMIT');
-    return result;
-  } catch (err) {
-    try {
-      await client.query('ROLLBACK');
-    } catch (rbErr: any) {
-      console.error('[Server DB] ROLLBACK failed:', rbErr.message);
-    }
-    throw err;
-  } finally {
-    client.release();
-  }
-}
-
-async function lockMedicine(client: pg.PoolClient, medicineId: string) {
+export async function lockMedicine(client: pg.PoolClient, medicineId: string) {
   const res = await client.query('SELECT * FROM medicines WHERE id = $1 FOR UPDATE', [medicineId]);
   if (res.rows.length === 0) throw new HttpError(404, `Medicine ${medicineId} not found.`);
   return res.rows[0];
 }
 
-async function lockBatch(client: pg.PoolClient, batchId: string, medicineId: string) {
+export async function lockBatch(client: pg.PoolClient, batchId: string, medicineId: string) {
   const res = await client.query(
     'SELECT * FROM medicine_batches WHERE id = $1 AND medicine_id = $2 FOR UPDATE',
     [batchId, medicineId]
@@ -151,7 +133,7 @@ async function lockBatch(client: pg.PoolClient, batchId: string, medicineId: str
  * Recomputes medicines.current_stock as the SUM of its active, unexpired batches —
  * the same predicate as the trg_update_medicine_stock trigger, so both always agree.
  */
-async function reconcileMedicineStock(client: pg.PoolClient, medicineId: string) {
+export async function reconcileMedicineStock(client: pg.PoolClient, medicineId: string) {
   const res = await client.query(`
     UPDATE medicines
     SET current_stock = COALESCE((
@@ -168,23 +150,19 @@ async function reconcileMedicineStock(client: pg.PoolClient, medicineId: string)
   return res.rows[0];
 }
 
-/** Falls back to the 'SERVER' device when the caller's device is not registered (devices FK). */
+/** Persists the calling terminal in devices (FK target) on this transaction; unusable ids map to SERVER. */
 async function resolveDeviceId(client: pg.PoolClient, deviceId?: string): Promise<string> {
-  if (deviceId && deviceId !== 'SERVER') {
-    const res = await client.query('SELECT 1 FROM devices WHERE id = $1', [deviceId]);
-    if (res.rows.length > 0) return deviceId;
-  }
-  return 'SERVER';
+  return ensureDevice(client, deviceId);
 }
 
-interface StockActor {
+export interface StockActor {
   user_id: string;
   user_name: string;
   role?: string;
   device_id?: string;
 }
 
-async function insertMovement(
+export async function insertMovement(
   client: pg.PoolClient,
   m: {
     medicine_id: string;
@@ -214,7 +192,7 @@ async function insertMovement(
   return { id, batch_id: m.batch_id, previous_quantity: m.previous_quantity, new_quantity: m.new_quantity, delta: m.new_quantity - m.previous_quantity };
 }
 
-async function insertAudit(
+export async function insertAudit(
   client: pg.PoolClient,
   a: { action: string; entity: string; entity_id: string; previous_value?: unknown; new_value?: unknown },
   actor: StockActor,

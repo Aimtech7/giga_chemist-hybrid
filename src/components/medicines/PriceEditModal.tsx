@@ -12,7 +12,7 @@ import {
   Package,
 } from 'lucide-react';
 import { db } from '../../db/dexie';
-import { apiUrl } from '../../services/api';
+import { apiFetch } from '../../services/http';
 import { MedicineSelector } from '../common/MedicineSelector';
 import type { Medicine, PharmacySettings, User } from '../../types';
 
@@ -152,46 +152,25 @@ export const PriceEditModal: React.FC<PriceEditModalProps> = ({
       const roundedPurchase = Math.round(numPurchase * 100) / 100;
       const roundedMinSelling = minSellingPrice ? Math.round(parseFloat(minSellingPrice) * 100) / 100 : roundedSelling;
 
-      // 1. Send update to Backend API
-      const res = await fetch(apiUrl(`/api/medicines/${selectedMed.id}/pricing`), {
+      // 1. Send update to Backend API (Admin token; the server enforces ADMIN-only)
+      const resData = await apiFetch<{ medicine: Medicine }>(`/api/medicines/${selectedMed.id}/pricing`, {
         method: 'PATCH',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-user-id': currentUser?.id || '',
-          'x-user-role': currentUser?.role || 'ADMIN',
-          'x-user-name': currentUser?.name || 'Admin',
-        },
-        body: JSON.stringify({
+        body: {
           selling_price: roundedSelling,
           purchase_price: roundedPurchase,
           reorder_level: numReorder,
           min_selling_price: roundedMinSelling,
-        }),
+        },
       });
-
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.error || `HTTP ${res.status}: Failed to update medicine pricing.`);
-      }
-
-      const resData = await res.json();
-      const updatedMedicine: Medicine = resData.medicine || {
-        ...selectedMed,
-        selling_price: roundedSelling,
-        purchase_price: roundedPurchase,
-        reorder_level: numReorder,
-        min_selling_price: roundedMinSelling,
-        version: (selectedMed.version || 1) + 1,
-        updated_at: new Date().toISOString(),
-        updated_by: currentUser?.name || 'Admin',
-      };
+      // The committed PostgreSQL record is authoritative for the cache and the POS.
+      const updatedMedicine: Medicine = { ...selectedMed, ...resData.medicine };
 
       // 2. Immediately update Dexie IndexedDB cache for POS & UI instantaneous sync
       await db.medicines.update(selectedMed.id, {
-        selling_price: roundedSelling,
-        purchase_price: roundedPurchase,
-        reorder_level: numReorder,
-        min_selling_price: roundedMinSelling,
+        selling_price: updatedMedicine.selling_price,
+        purchase_price: updatedMedicine.purchase_price,
+        reorder_level: updatedMedicine.reorder_level,
+        min_selling_price: updatedMedicine.min_selling_price,
         version: updatedMedicine.version,
         updated_at: updatedMedicine.updated_at,
         updated_by: updatedMedicine.updated_by,

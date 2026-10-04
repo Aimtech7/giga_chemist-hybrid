@@ -148,3 +148,43 @@ export function requireUuid(id: unknown, field: string): string {
   return id.trim();
 }
 
+
+/** Anything that can run a query: the pool or a client inside a transaction. */
+export type Queryable = Pick<pg.PoolClient, 'query'>;
+
+/** Runs fn inside BEGIN/COMMIT on one pooled client; any error triggers ROLLBACK and is rethrown. */
+export async function withTransaction<T>(fn: (client: pg.PoolClient) => Promise<T>): Promise<T> {
+  const client = await pgPool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await fn(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (rbErr: any) {
+      console.error('[Server DB] ROLLBACK failed:', rbErr.message);
+    }
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/** Rounds a money amount to 2 decimal places (half away from zero). */
+export function roundMoney(value: number): number {
+  return Math.round((value + Number.EPSILON) * 100) / 100;
+}
+
+/**
+ * Current business date/time from PostgreSQL (timezone Africa/Nairobi), so day boundaries never
+ * depend on the Node process or browser clock.
+ */
+export async function businessNow(q: Queryable = pgPool): Promise<{ date: string; time: string }> {
+  const res = await q.query(
+    `SELECT to_char(now() AT TIME ZONE 'Africa/Nairobi', 'YYYY-MM-DD') AS date,
+            to_char(now() AT TIME ZONE 'Africa/Nairobi', 'HH24:MI:SS') AS time`
+  );
+  return { date: res.rows[0].date, time: res.rows[0].time };
+}

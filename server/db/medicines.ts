@@ -1,253 +1,226 @@
-import { pgPool, isLocalMode, supabaseAdmin, isSupabaseConfigured, cleanUuid, ensureUuid } from './client';
-import { serverDb } from '../db';
+import crypto from 'crypto';
+import type pg from 'pg';
+import { pgPool, HttpError, requireUuid, withTransaction, roundMoney } from './client';
 import { recordAuditLog } from './audit';
 import type { Medicine, UserRole } from '../../src/types';
 
+const MEDICINE_SELECT = `
+  SELECT
+    m.id, m.branch_id, m.name, m.generic_name, m.brand_name, m.sku, m.barcode,
+    COALESCE(c.name, m.medicine_type, 'General') AS category,
+    m.medicine_type, m.dosage_strength, m.dosage_form, m.manufacturer, m.description,
+    COALESCE(m.purchase_price, 0)::float AS purchase_price,
+    COALESCE(m.selling_price, 0)::float AS selling_price,
+    COALESCE(m.wholesale_price, m.selling_price, 0)::float AS wholesale_price,
+    COALESCE(m.min_selling_price, m.selling_price, 0)::float AS min_selling_price,
+    COALESCE(m.current_stock, 0)::int AS current_stock,
+    COALESCE(m.reorder_level, 20)::int AS reorder_level,
+    COALESCE(m.unit, 'Unit') AS unit,
+    COALESCE(m.prescription_required, false) AS prescription_required,
+    COALESCE(m.status, 'active') AS status,
+    COALESCE(m.version, 1)::int AS version,
+    m.created_at, m.updated_at
+  FROM medicines m
+  LEFT JOIN categories c ON m.category_id = c.id`;
+
+export function toMedicine(r: any): Medicine {
+  return {
+    id: r.id,
+    branch_id: r.branch_id || undefined,
+    name: r.name,
+    generic_name: r.generic_name || r.name,
+    brand_name: r.brand_name || '',
+    sku: r.sku || '',
+    barcode: r.barcode || '',
+    category: r.category || 'General',
+    medicine_type: r.medicine_type || '',
+    dosage_strength: r.dosage_strength || '',
+    dosage_form: r.dosage_form || 'Tablet',
+    manufacturer: r.manufacturer || '',
+    description: r.description || '',
+    purchase_price: Number(r.purchase_price) || 0,
+    selling_price: Number(r.selling_price) || 0,
+    wholesale_price: Number(r.wholesale_price) || 0,
+    min_selling_price: Number(r.min_selling_price) || 0,
+    current_stock: Number(r.current_stock) || 0,
+    reorder_level: Number(r.reorder_level) || 0,
+    unit: r.unit || 'Unit',
+    prescription_required: Boolean(r.prescription_required),
+    status: r.status || 'active',
+    version: Number(r.version) || 1,
+    created_at: r.created_at ? new Date(r.created_at).toISOString() : '',
+    updated_at: r.updated_at ? new Date(r.updated_at).toISOString() : '',
+    created_by: 'Admin',
+    updated_by: 'Admin',
+  } as Medicine;
+}
 
 export async function getAllMedicines(): Promise<Medicine[]> {
-  try {
-    const res = await pgPool.query(`
-      SELECT 
-        m.id,
-        m.branch_id,
-        m.name,
-        m.generic_name,
-        m.brand_name,
-        m.sku,
-        m.barcode,
-        COALESCE(c.name, m.medicine_type, 'General') as category,
-        m.medicine_type,
-        m.dosage_strength,
-        m.dosage_form,
-        m.manufacturer,
-        m.description,
-        COALESCE(m.purchase_price, 0)::float as purchase_price,
-        COALESCE(m.selling_price, 0)::float as selling_price,
-        COALESCE(m.wholesale_price, m.selling_price, 0)::float as wholesale_price,
-        COALESCE(m.min_selling_price, m.selling_price, 0)::float as min_selling_price,
-        COALESCE(m.current_stock, 0)::int as current_stock,
-        COALESCE(m.reorder_level, 20)::int as reorder_level,
-        COALESCE(m.unit, 'Strips (10 tabs)') as unit,
-        COALESCE(m.prescription_required, false) as prescription_required,
-        COALESCE(m.status, 'active') as status,
-        COALESCE(m.version, 1)::int as version,
-        m.created_at,
-        m.updated_at
-      FROM medicines m
-      LEFT JOIN categories c ON m.category_id = c.id
-      ORDER BY m.name ASC
-    `);
-
-    if (isLocalMode || (res.rows && res.rows.length > 0)) {
-      return res.rows.map((r) => ({
-        id: r.id,
-        branch_id: r.branch_id,
-        name: r.name,
-        generic_name: r.generic_name || r.name,
-        brand_name: r.brand_name || '',
-        sku: r.sku || '',
-        barcode: r.barcode || '',
-        category: r.category || 'General',
-        medicine_type: r.medicine_type || '',
-        dosage_strength: r.dosage_strength || '',
-        dosage_form: r.dosage_form || 'Tablet',
-        manufacturer: r.manufacturer || '',
-        description: r.description || '',
-        purchase_price: Number(r.purchase_price) || 0,
-        selling_price: Number(r.selling_price) || 0,
-        wholesale_price: Number(r.wholesale_price) || 0,
-        min_selling_price: Number(r.min_selling_price) || 0,
-        current_stock: Number(r.current_stock) || 0,
-        reorder_level: Number(r.reorder_level) || 20,
-        unit: r.unit || 'Strips (10 tabs)',
-        prescription_required: Boolean(r.prescription_required),
-        status: r.status || 'active',
-        version: Number(r.version) || 1,
-        created_at: r.created_at ? new Date(r.created_at).toISOString() : new Date().toISOString(),
-        updated_at: r.updated_at ? new Date(r.updated_at).toISOString() : new Date().toISOString(),
-        created_by: 'Admin',
-        updated_by: 'Admin',
-      }));
-    }
-  } catch (err: any) {
-    if (isLocalMode) {
-      console.error('[Server DB] getAllMedicines PostgreSQL error:', err.message);
-      throw err;
-    }
-  }
-
-  if (!isLocalMode && isSupabaseConfigured) {
-    try {
-      const { data, error } = await supabaseAdmin
-        .from('medicines')
-        .select('*')
-        .order('name');
-      if (!error && data && data.length > 0) return data as Medicine[];
-    } catch (err) {}
-  }
-
-  return serverDb.get().medicines;
+  const res = await pgPool.query(`${MEDICINE_SELECT} ORDER BY m.name ASC`);
+  return res.rows.map(toMedicine);
 }
 
-export async function getMedicineById(id: string): Promise<Medicine | null> {
-  try {
-    const res = await pgPool.query(
-      `SELECT m.*, COALESCE(c.name, 'General') as category_name 
-       FROM medicines m 
-       LEFT JOIN categories c ON m.category_id = c.id 
-       WHERE m.id::text = $1 LIMIT 1`,
-      [id]
+export async function getMedicineById(id: string, q: Pick<pg.PoolClient, 'query'> = pgPool): Promise<Medicine | null> {
+  const res = await q.query(`${MEDICINE_SELECT} WHERE m.id = $1`, [requireUuid(id, 'medicine id')]);
+  return res.rows[0] ? toMedicine(res.rows[0]) : null;
+}
+
+export interface MedicineActor {
+  user_id: string;
+  user_name: string;
+  role: UserRole;
+  device_id?: string;
+}
+
+function optionalMoney(value: unknown, field: string): number | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) throw new HttpError(400, `${field} must be a non-negative number.`);
+  return roundMoney(n);
+}
+
+function optionalWholeNumber(value: unknown, field: string): number | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 0) throw new HttpError(400, `${field} must be a non-negative whole number.`);
+  return n;
+}
+
+function text(value: unknown, max: number): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  return String(value).trim().slice(0, max);
+}
+
+/** Resolves a category name (case-insensitive) to its id, creating the category if it is new. */
+async function resolveCategoryId(client: pg.PoolClient, name: unknown): Promise<string | null> {
+  const clean = text(name, 100);
+  if (!clean) return null;
+  const found = await client.query('SELECT id FROM categories WHERE LOWER(name) = LOWER($1) LIMIT 1', [clean]);
+  if (found.rows[0]) return found.rows[0].id;
+  const created = await client.query(
+    `INSERT INTO categories (id, name) VALUES ($1, $2)
+     ON CONFLICT (name) DO UPDATE SET updated_at = categories.updated_at RETURNING id`,
+    [crypto.randomUUID(), clean]
+  );
+  return created.rows[0].id;
+}
+
+function uniqueViolation(err: any, what: string): never {
+  if (err?.code === '23505') throw new HttpError(409, `${what} is already used by another medicine.`);
+  throw err;
+}
+
+/** ADMIN: creates a medicine. Stock always starts at 0 — it is added via Add Stock / Physical Count. */
+export async function createMedicine(data: Partial<Medicine>, actor: MedicineActor): Promise<Medicine> {
+  const name = text(data.name, 255);
+  if (!name) throw new HttpError(400, 'Medicine name is required.');
+  const selling = optionalMoney(data.selling_price, 'Selling price');
+  if (selling === undefined || selling <= 0) throw new HttpError(400, 'Selling price must be greater than zero.');
+  const purchase = optionalMoney(data.purchase_price, 'Purchase price') ?? 0;
+
+  return withTransaction(async (client) => {
+    const categoryId = await resolveCategoryId(client, data.category);
+    const id = crypto.randomUUID();
+    try {
+      await client.query(
+        `INSERT INTO medicines (
+           id, name, generic_name, brand_name, sku, barcode, category_id, medicine_type,
+           dosage_strength, dosage_form, manufacturer, description,
+           purchase_price, selling_price, wholesale_price, min_selling_price,
+           current_stock, reorder_level, unit, prescription_required, status, version,
+           created_by, updated_by
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,0,$17,$18,$19,'active',1,$20,$20)`,
+        [
+          id, name, text(data.generic_name, 255) || name, text(data.brand_name, 255) || null,
+          text(data.sku, 100) || `SKU-${id.slice(0, 8).toUpperCase()}`,
+          text(data.barcode, 100) || `GC${id.replace(/-/g, '').slice(0, 12).toUpperCase()}`,
+          categoryId, text(data.medicine_type, 100) || null,
+          text(data.dosage_strength, 100) || '', text(data.dosage_form, 100) || 'Tablet',
+          text(data.manufacturer, 255) || null, text(data.description, 2000) || null,
+          purchase, selling,
+          optionalMoney(data.wholesale_price, 'Wholesale price') ?? selling,
+          optionalMoney(data.min_selling_price, 'Minimum selling price') ?? selling,
+          optionalWholeNumber(data.reorder_level, 'Reorder level') ?? 20,
+          text(data.unit, 50) || 'Unit', Boolean(data.prescription_required),
+          actor.user_id,
+        ]
+      );
+    } catch (err) {
+      uniqueViolation(err, 'This barcode');
+    }
+    const saved = (await getMedicineById(id, client))!;
+    await recordAuditLog(
+      { ...actor, action: 'CREATE_MEDICINE', entity: 'medicine', entity_id: id, new_value: saved },
+      client
     );
-    if (res.rows && res.rows.length > 0) {
-      const r = res.rows[0];
-      return {
-        id: r.id,
-        branch_id: r.branch_id,
-        name: r.name,
-        generic_name: r.generic_name || r.name,
-        brand_name: r.brand_name || '',
-        sku: r.sku || '',
-        barcode: r.barcode || '',
-        category: r.category_name || r.category || 'General',
-        medicine_type: r.medicine_type || '',
-        dosage_strength: r.dosage_strength || '',
-        dosage_form: r.dosage_form || 'Tablet',
-        manufacturer: r.manufacturer || '',
-        description: r.description || '',
-        purchase_price: Number(r.purchase_price) || 0,
-        selling_price: Number(r.selling_price) || 0,
-        wholesale_price: Number(r.wholesale_price) || 0,
-        min_selling_price: Number(r.min_selling_price) || 0,
-        current_stock: Number(r.current_stock) || 0,
-        reorder_level: Number(r.reorder_level) || 20,
-        unit: r.unit || 'Strips (10 tabs)',
-        prescription_required: Boolean(r.prescription_required),
-        status: r.status || 'active',
-        version: Number(r.version) || 1,
-        created_at: r.created_at,
-        updated_at: r.updated_at,
-        created_by: 'Admin',
-        updated_by: 'Admin',
-      };
-    }
-  } catch (pgErr: any) {
-    if (isLocalMode) {
-      console.error('[Server DB] getMedicineById PostgreSQL error:', pgErr.message);
-      throw pgErr;
-    }
-  }
-  if (isLocalMode) return null;
-
-  if (!isLocalMode && isSupabaseConfigured) {
-    try {
-      const { data, error } = await supabaseAdmin
-        .from('medicines')
-        .select('*')
-        .eq('id', id)
-        .single();
-      if (!error && data) return data as Medicine;
-    } catch (err) {}
-  }
-
-  return serverDb.get().medicines.find((m) => m.id === id) || null;
+    return saved;
+  });
 }
 
-export async function upsertMedicine(medicine: Partial<Medicine> & { name: string }): Promise<Medicine> {
-  const now = new Date().toISOString();
-  const id = ensureUuid(medicine.id);
-  const fullMed: Medicine = {
-    id,
-    name: medicine.name,
-    generic_name: medicine.generic_name || medicine.name,
-    brand_name: medicine.brand_name || '',
-    sku: medicine.sku || `SKU-${Date.now().toString().slice(-6)}`,
-    barcode: medicine.barcode || `${Math.floor(100000000000 + Math.random() * 900000000000)}`,
-    category: medicine.category || 'General',
-    medicine_type: medicine.medicine_type || '',
-    dosage_strength: medicine.dosage_strength || '',
-    dosage_form: medicine.dosage_form || 'Tablet',
-    manufacturer: medicine.manufacturer || '',
-    description: medicine.description || '',
-    purchase_price: Number(medicine.purchase_price) || 0,
-    selling_price: Number(medicine.selling_price) || 0,
-    wholesale_price: Number(medicine.wholesale_price) || Number(medicine.selling_price) || 0,
-    min_selling_price: Number(medicine.min_selling_price) || Number(medicine.selling_price) || 0,
-    current_stock: Number(medicine.current_stock) || 0,
-    reorder_level: Number(medicine.reorder_level) || 20,
-    unit: medicine.unit || 'Strips (10 tabs)',
-    prescription_required: Boolean(medicine.prescription_required),
-    status: medicine.status || 'active',
-    version: (medicine.version || 0) + 1,
-    created_at: medicine.created_at || now,
-    updated_at: now,
-    created_by: medicine.created_by || 'Admin',
-    updated_by: medicine.updated_by || 'Admin',
-  };
+/**
+ * ADMIN: updates descriptive fields. current_stock is NEVER written here (stock changes only through
+ * the audited stock operations). Price fields, if present and changed, go through the audited
+ * pricing update inside the same transaction.
+ */
+export async function updateMedicineDetails(id: string, data: Partial<Medicine>, actor: MedicineActor): Promise<Medicine> {
+  requireUuid(id, 'medicine id');
+  return withTransaction(async (client) => {
+    const locked = await client.query('SELECT id FROM medicines WHERE id = $1 FOR UPDATE', [id]);
+    if (!locked.rows[0]) throw new HttpError(404, 'Medicine not found.');
+    const before = (await getMedicineById(id, client))!;
 
-  try {
-    await pgPool.query(`
-      INSERT INTO medicines (
-        id, name, generic_name, brand_name, sku, barcode,
-        medicine_type, dosage_strength, dosage_form, manufacturer,
-        description, purchase_price, selling_price, wholesale_price,
-        min_selling_price, current_stock, reorder_level, unit,
-        prescription_required, status, version, created_at, updated_at
-      ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23
-      )
-      ON CONFLICT (id) DO UPDATE SET
-        name = EXCLUDED.name,
-        generic_name = EXCLUDED.generic_name,
-        brand_name = EXCLUDED.brand_name,
-        sku = EXCLUDED.sku,
-        barcode = EXCLUDED.barcode,
-        medicine_type = EXCLUDED.medicine_type,
-        dosage_strength = EXCLUDED.dosage_strength,
-        dosage_form = EXCLUDED.dosage_form,
-        manufacturer = EXCLUDED.manufacturer,
-        description = EXCLUDED.description,
-        purchase_price = EXCLUDED.purchase_price,
-        selling_price = EXCLUDED.selling_price,
-        wholesale_price = EXCLUDED.wholesale_price,
-        min_selling_price = EXCLUDED.min_selling_price,
-        current_stock = EXCLUDED.current_stock,
-        reorder_level = EXCLUDED.reorder_level,
-        unit = EXCLUDED.unit,
-        prescription_required = EXCLUDED.prescription_required,
-        status = EXCLUDED.status,
-        version = EXCLUDED.version,
-        updated_at = EXCLUDED.updated_at
-    `, [
-      fullMed.id, fullMed.name, fullMed.generic_name, fullMed.brand_name, fullMed.sku, fullMed.barcode,
-      fullMed.medicine_type, fullMed.dosage_strength, fullMed.dosage_form, fullMed.manufacturer,
-      fullMed.description, fullMed.purchase_price, fullMed.selling_price, fullMed.wholesale_price,
-      fullMed.min_selling_price, fullMed.current_stock, fullMed.reorder_level, fullMed.unit,
-      fullMed.prescription_required, fullMed.status, fullMed.version, fullMed.created_at, fullMed.updated_at
-    ]);
-  } catch (pgErr: any) {
-    console.error('[Server DB] upsertMedicine PostgreSQL error:', pgErr.message);
-    if (isLocalMode) {
-      throw pgErr;
+    const categoryId = data.category !== undefined ? await resolveCategoryId(client, data.category) : undefined;
+    const status = data.status !== undefined ? String(data.status) : undefined;
+    if (status !== undefined && !['active', 'inactive'].includes(status)) {
+      throw new HttpError(400, 'status must be "active" or "inactive".');
     }
-  }
+    if (data.name !== undefined && !text(data.name, 255)) throw new HttpError(400, 'Medicine name cannot be empty.');
 
-
-  if (!isLocalMode && isSupabaseConfigured) {
     try {
-      await supabaseAdmin.from('medicines').upsert(fullMed);
-    } catch (err) {}
-  }
+      await client.query(
+        `UPDATE medicines SET
+           name = COALESCE($2, name), generic_name = COALESCE($3, generic_name),
+           brand_name = COALESCE($4, brand_name), sku = COALESCE($5, sku), barcode = COALESCE($6, barcode),
+           category_id = CASE WHEN $7::boolean THEN $8::uuid ELSE category_id END,
+           medicine_type = COALESCE($9, medicine_type), dosage_strength = COALESCE($10, dosage_strength),
+           dosage_form = COALESCE($11, dosage_form), manufacturer = COALESCE($12, manufacturer),
+           description = COALESCE($13, description), unit = COALESCE($14, unit),
+           prescription_required = COALESCE($15, prescription_required), status = COALESCE($16, status),
+           updated_by = $17, version = version + 1, updated_at = CURRENT_TIMESTAMP
+         WHERE id = $1`,
+        [
+          id, text(data.name, 255) || null, text(data.generic_name, 255) || null, text(data.brand_name, 255) ?? null,
+          text(data.sku, 100) || null, text(data.barcode, 100) || null,
+          categoryId !== undefined, categoryId ?? null,
+          text(data.medicine_type, 100) ?? null, text(data.dosage_strength, 100) ?? null,
+          text(data.dosage_form, 100) || null, text(data.manufacturer, 255) ?? null,
+          text(data.description, 2000) ?? null, text(data.unit, 50) || null,
+          data.prescription_required !== undefined ? Boolean(data.prescription_required) : null,
+          status ?? null, actor.user_id,
+        ]
+      );
+    } catch (err) {
+      uniqueViolation(err, 'This barcode');
+    }
 
-  // Update in-memory fallback
-  const store = serverDb.get();
-  const index = store.medicines.findIndex((m) => m.id === fullMed.id);
-  if (index >= 0) {
-    store.medicines[index] = fullMed;
-  } else {
-    store.medicines.push(fullMed);
-  }
-  serverDb.persist();
-  return fullMed;
+    await recordAuditLog(
+      {
+        ...actor,
+        action: 'UPDATE_MEDICINE',
+        entity: 'medicine',
+        entity_id: id,
+        previous_value: { name: before.name, sku: before.sku, barcode: before.barcode, category: before.category, status: before.status },
+        new_value: { name: data.name, sku: data.sku, barcode: data.barcode, category: data.category, status: data.status },
+      },
+      client
+    );
+
+    const priceFields = ['selling_price', 'purchase_price', 'min_selling_price', 'wholesale_price', 'reorder_level'] as const;
+    if (priceFields.some((f) => data[f] !== undefined && Number(data[f]) !== Number(before[f]))) {
+      return applyPricingUpdate(client, id, data as any, actor);
+    }
+    return (await getMedicineById(id, client))!;
+  });
 }
 
 export interface UpdatePricingParams {
@@ -257,155 +230,84 @@ export interface UpdatePricingParams {
   min_selling_price?: number;
   wholesale_price?: number;
   reorder_level?: number;
-  user_id?: string;
-  user_name?: string;
-  role?: string;
+  user_id: string;
+  user_name: string;
+  role: UserRole;
   device_id?: string;
 }
 
-export async function adminUpdateMedicinePricing(params: UpdatePricingParams): Promise<Medicine> {
-  const { id } = params;
-  if (!id) {
-    throw new Error('Medicine ID is required.');
-  }
+async function applyPricingUpdate(
+  client: pg.PoolClient,
+  id: string,
+  p: Partial<UpdatePricingParams>,
+  actor: MedicineActor
+): Promise<Medicine> {
+  const selling = optionalMoney(p.selling_price, 'Selling price');
+  if (selling !== undefined && selling <= 0) throw new HttpError(400, 'Selling price must be greater than zero.');
+  const purchase = optionalMoney(p.purchase_price, 'Purchase/cost price');
+  const minSelling = optionalMoney(p.min_selling_price, 'Minimum selling price');
+  const wholesale = optionalMoney(p.wholesale_price, 'Wholesale price');
+  const reorder = optionalWholeNumber(p.reorder_level, 'Reorder level');
 
-  // Domain & numerical validation
-  if (params.selling_price !== undefined) {
-    const sp = Number(params.selling_price);
-    if (isNaN(sp) || !isFinite(sp)) {
-      throw new Error('Selling price must be a valid numeric value.');
-    }
-    if (sp < 0) {
-      throw new Error('Selling price cannot be negative.');
-    }
-  }
+  const locked = await client.query(
+    `SELECT selling_price::float, purchase_price::float, min_selling_price::float, wholesale_price::float,
+            reorder_level, name FROM medicines WHERE id = $1 FOR UPDATE`,
+    [id]
+  );
+  const old = locked.rows[0];
+  if (!old) throw new HttpError(404, `Medicine "${id}" was not found.`);
 
-  if (params.purchase_price !== undefined) {
-    const pp = Number(params.purchase_price);
-    if (isNaN(pp) || !isFinite(pp)) {
-      throw new Error('Purchase/cost price must be a valid numeric value.');
-    }
-    if (pp < 0) {
-      throw new Error('Purchase/cost price cannot be negative.');
-    }
-  }
+  await client.query(
+    `UPDATE medicines SET
+       selling_price = COALESCE($2, selling_price), purchase_price = COALESCE($3, purchase_price),
+       min_selling_price = COALESCE($4, min_selling_price), wholesale_price = COALESCE($5, wholesale_price),
+       reorder_level = COALESCE($6, reorder_level), updated_by = $7,
+       version = version + 1, updated_at = CURRENT_TIMESTAMP
+     WHERE id = $1`,
+    [id, selling ?? null, purchase ?? null, minSelling ?? null, wholesale ?? null, reorder ?? null, actor.user_id]
+  );
+  const saved = (await getMedicineById(id, client))!;
 
-  if (params.min_selling_price !== undefined) {
-    const msp = Number(params.min_selling_price);
-    if (isNaN(msp) || !isFinite(msp) || msp < 0) {
-      throw new Error('Minimum selling price must be a non-negative numeric value.');
-    }
-  }
-
-  if (params.wholesale_price !== undefined) {
-    const wp = Number(params.wholesale_price);
-    if (isNaN(wp) || !isFinite(wp) || wp < 0) {
-      throw new Error('Wholesale price must be a non-negative numeric value.');
-    }
-  }
-
-  if (params.reorder_level !== undefined) {
-    const rl = Number(params.reorder_level);
-    if (isNaN(rl) || !isFinite(rl) || rl < 0) {
-      throw new Error('Reorder level must be a non-negative integer.');
-    }
-  }
-
-  // Fetch current medicine record
-  const existing = await getMedicineById(id);
-  if (!existing) {
-    throw new Error(`Medicine with ID "${id}" was not found.`);
-  }
-
-  const old_selling_price = existing.selling_price;
-  const old_purchase_price = existing.purchase_price;
-  const old_reorder_level = existing.reorder_level;
-
-  const new_selling_price = params.selling_price !== undefined ? Math.round(Number(params.selling_price) * 100) / 100 : existing.selling_price;
-  const new_purchase_price = params.purchase_price !== undefined ? Math.round(Number(params.purchase_price) * 100) / 100 : existing.purchase_price;
-  const new_min_selling_price = params.min_selling_price !== undefined ? Math.round(Number(params.min_selling_price) * 100) / 100 : existing.min_selling_price;
-  const new_wholesale_price = params.wholesale_price !== undefined ? Math.round(Number(params.wholesale_price) * 100) / 100 : existing.wholesale_price;
-  const new_reorder_level = params.reorder_level !== undefined ? Math.max(0, parseInt(String(params.reorder_level), 10)) : existing.reorder_level;
-
-  const updatedMed: Medicine = {
-    ...existing,
-    selling_price: new_selling_price,
-    purchase_price: new_purchase_price,
-    min_selling_price: new_min_selling_price,
-    wholesale_price: new_wholesale_price,
-    reorder_level: new_reorder_level,
-    version: (existing.version || 1) + 1,
-    updated_at: new Date().toISOString(),
-    updated_by: params.user_name || 'Admin',
-  };
-
-  // 1. PostgreSQL ACID Update
-  try {
-    const client = await pgPool.connect();
-    try {
-      await client.query('BEGIN');
-      await client.query(`
-        UPDATE medicines
-        SET selling_price = $1,
-            purchase_price = $2,
-            min_selling_price = $3,
-            wholesale_price = $4,
-            reorder_level = $5,
-            version = version + 1,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE id::text = $6
-      `, [
-        new_selling_price,
-        new_purchase_price,
-        new_min_selling_price,
-        new_wholesale_price,
-        new_reorder_level,
-        id,
-      ]);
-      await client.query('COMMIT');
-    } catch (txErr) {
-      await client.query('ROLLBACK');
-      throw txErr;
-    } finally {
-      client.release();
-    }
-  } catch (pgErr) {}
-
-  // 2. Audit Logging
-  await recordAuditLog({
-    user_id: params.user_id || 'admin',
-    user_name: params.user_name || 'Admin',
-    role: (params.role as UserRole) || 'ADMIN',
-    action: 'ADMIN_PRICE_UPDATE',
-    entity: 'medicine',
-    entity_id: id,
-    device_id: params.device_id || 'SERVER',
-    previous_value: JSON.stringify({
-      purchase_price: old_purchase_price,
-      selling_price: old_selling_price,
-      reorder_level: old_reorder_level,
-    }),
-    new_value: JSON.stringify({
-      medicine_id: id,
-      medicine_name: existing.name,
-      old_purchase_price,
-      new_purchase_price,
-      old_selling_price,
-      new_selling_price,
-      old_reorder_level,
-      new_reorder_level,
-      performed_by: params.user_name || 'Admin',
-    }),
-  });
-
-  // 3. In-memory fallback
-  const store = serverDb.get();
-  const idx = store.medicines.findIndex((m) => m.id === id);
-  if (idx >= 0) {
-    store.medicines[idx] = updatedMed;
-  }
-  serverDb.persist();
-
-  return updatedMed;
+  // Historical sale_items keep their own unit_price snapshot; nothing here touches them.
+  await recordAuditLog(
+    {
+      ...actor,
+      action: 'ADMIN_PRICE_UPDATE',
+      entity: 'medicine',
+      entity_id: id,
+      previous_value: {
+        selling_price: old.selling_price,
+        purchase_price: old.purchase_price,
+        min_selling_price: old.min_selling_price,
+        wholesale_price: old.wholesale_price,
+        reorder_level: old.reorder_level,
+      },
+      new_value: {
+        medicine_name: old.name,
+        selling_price: saved.selling_price,
+        purchase_price: saved.purchase_price,
+        min_selling_price: saved.min_selling_price,
+        wholesale_price: saved.wholesale_price,
+        reorder_level: saved.reorder_level,
+      },
+    },
+    client
+  );
+  return saved;
 }
 
+/** ADMIN: updates selling/cost price and reorder level atomically with an audit row. */
+export async function adminUpdateMedicinePricing(params: UpdatePricingParams): Promise<Medicine> {
+  const id = requireUuid(params.id, 'medicine id');
+  const fields = ['selling_price', 'purchase_price', 'min_selling_price', 'wholesale_price', 'reorder_level'] as const;
+  if (!fields.some((f) => params[f] !== undefined)) {
+    throw new HttpError(400, 'At least one of selling_price, purchase_price, min_selling_price, wholesale_price or reorder_level is required.');
+  }
+  const actor: MedicineActor = {
+    user_id: params.user_id,
+    user_name: params.user_name,
+    role: params.role,
+    device_id: params.device_id,
+  };
+  return withTransaction((client) => applyPricingUpdate(client, id, params, actor));
+}

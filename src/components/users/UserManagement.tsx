@@ -13,8 +13,9 @@ import {
   Edit2,
 } from 'lucide-react';
 import { db } from '../../db/dexie';
-import { getAuthHeaders } from '../../services/auth';
-import { apiUrl } from '../../services/api';
+import { apiFetch } from '../../services/http';
+
+const PIN_RE = /^\d{4,6}$/;
 import type { UserRole, User as UserType } from '../../types';
 
 interface UserManagementProps {
@@ -52,26 +53,16 @@ export const UserManagement: React.FC<UserManagementProps> = ({ currentUser }) =
     setIsLoading(true);
     setErrorMessage(null);
     try {
-      const res = await fetch(apiUrl('/api/users'), {
-        headers: getAuthHeaders(),
-      });
-      if (res.ok) {
-        const data: UserType[] = await res.json();
-        setUsers(data);
-        // Cache users in Dexie for offline lookup
-        await db.meta.put({ key: 'system_users', value: data });
-      } else {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.error || `Server responded with ${res.status}`);
-      }
+      const data = await apiFetch<UserType[]>('/api/users');
+      setUsers(data);
+      // Read-only cache so the directory can still be viewed if the server is briefly unreachable
+      await db.meta.put({ key: 'system_users', value: data });
     } catch (err: any) {
-      console.warn('[UserManagement] Could not fetch server users, falling back to local cache:', err);
       const cached = await db.meta.get('system_users');
-      if (cached && Array.isArray(cached.value)) {
-        setUsers(cached.value);
-      } else {
-        setErrorMessage(err.message || 'Failed to load user directory from server.');
-      }
+      if (cached && Array.isArray(cached.value)) setUsers(cached.value);
+      setErrorMessage(
+        `${err.message || 'Failed to load user directory from server.'}${cached ? ' Showing the last cached list (read-only).' : ''}`
+      );
     } finally {
       setIsLoading(false);
     }
@@ -115,9 +106,10 @@ export const UserManagement: React.FC<UserManagementProps> = ({ currentUser }) =
       setName('');
       setEmail('');
       setRole('CASHIER');
-      setPin(Math.floor(1000 + Math.random() * 9000).toString());
-      setPassword('Giga@2026');
-      setConfirmPassword('Giga@2026');
+      // No default credentials: the Administrator sets the initial password (and optional PIN).
+      setPin('');
+      setPassword('');
+      setConfirmPassword('');
       setPhone('+254 ');
       setActive(true);
     }
@@ -128,8 +120,16 @@ export const UserManagement: React.FC<UserManagementProps> = ({ currentUser }) =
     e.preventDefault();
     if (!name.trim() || !email.trim()) return;
 
-    if (!editingUser && password && password !== confirmPassword) {
+    if (password && password !== confirmPassword) {
       setErrorMessage('Password and Confirm Password do not match.');
+      return;
+    }
+    if (!editingUser && password.length < 8) {
+      setErrorMessage('Set an initial password of at least 8 characters.');
+      return;
+    }
+    if (pin.trim() && !PIN_RE.test(pin.trim())) {
+      setErrorMessage('PIN must be 4 to 6 digits.');
       return;
     }
 
@@ -145,27 +145,18 @@ export const UserManagement: React.FC<UserManagementProps> = ({ currentUser }) =
         active,
       };
 
-      if (pin.trim()) payload.pin = pin.trim();
-      if (password.trim()) payload.password = password.trim();
-
-      let res: Response;
       if (editingUser) {
-        res = await fetch(apiUrl(`/api/users/${editingUser.id}`), {
-          method: 'PUT',
-          headers: getAuthHeaders(),
-          body: JSON.stringify(payload),
-        });
+        await apiFetch(`/api/users/${editingUser.id}`, { method: 'PUT', body: payload });
+        // Credentials change only through the audited reset endpoint.
+        if (password || pin.trim()) {
+          await apiFetch(`/api/users/${editingUser.id}/reset-password`, {
+            body: { new_password: password || undefined, new_pin: pin.trim() || undefined },
+          });
+        }
       } else {
-        res = await fetch(apiUrl('/api/users'), {
-          method: 'POST',
-          headers: getAuthHeaders(),
-          body: JSON.stringify(payload),
-        });
-      }
-
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        throw new Error(errData.error || 'Failed to save user.');
+        if (pin.trim()) payload.pin = pin.trim();
+        payload.password = password;
+        await apiFetch('/api/users', { body: payload });
       }
 
       setSuccessMessage(editingUser ? `Staff member ${name} updated successfully.` : `New user account for ${name} created successfully.`);
@@ -185,16 +176,7 @@ export const UserManagement: React.FC<UserManagementProps> = ({ currentUser }) =
     }
 
     try {
-      const res = await fetch(apiUrl(`/api/users/${u.id}/status`), {
-        method: 'PATCH',
-        headers: getAuthHeaders(),
-        body: JSON.stringify({ active: !u.active }),
-      });
-
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.error || 'Failed to update user status.');
-      }
+      await apiFetch(`/api/users/${u.id}/status`, { method: 'PATCH', body: { active: !u.active } });
 
       setSuccessMessage(`Account ${u.name} is now ${!u.active ? 'Active' : 'Disabled'}.`);
       await loadUsers();
@@ -215,8 +197,8 @@ export const UserManagement: React.FC<UserManagementProps> = ({ currentUser }) =
     e.preventDefault();
     if (!resetTargetUser) return;
 
-    if (resetNewPassword.length < 6) {
-      setErrorMessage('New password must be at least 6 characters.');
+    if (resetNewPassword.length < 8) {
+      setErrorMessage('New password must be at least 8 characters.');
       return;
     }
 
@@ -229,19 +211,12 @@ export const UserManagement: React.FC<UserManagementProps> = ({ currentUser }) =
     setErrorMessage(null);
 
     try {
-      const res = await fetch(apiUrl(`/api/users/${resetTargetUser.id}/reset-password`), {
-        method: 'POST',
-        headers: getAuthHeaders(),
-        body: JSON.stringify({
+      await apiFetch(`/api/users/${resetTargetUser.id}/reset-password`, {
+        body: {
           new_password: resetNewPassword,
           admin_password: adminAuthPassword || undefined,
-        }),
+        },
       });
-
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to reset password.');
-      }
 
       setSuccessMessage(`Password for ${resetTargetUser.name} (${resetTargetUser.email}) was reset successfully.`);
       setResetTargetUser(null);

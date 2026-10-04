@@ -17,6 +17,7 @@ import { getAuthHeaders } from '../../services/auth';
 import { applyServerStockResult, refreshCacheAfterCommit } from '../../services/stockCache';
 import { MedicineSelector } from '../common/MedicineSelector';
 import type { Medicine, MedicineBatch, PharmacySettings, User, Supplier } from '../../types';
+import { apiFetch } from '../../services/http';
 
 export type StockOperationTab = 'SET_STOCK' | 'ADD_STOCK' | 'REMOVE_STOCK' | 'EDIT_EXPIRY';
 
@@ -193,25 +194,16 @@ export const StockAdjustmentModal: React.FC<StockAdjustmentModalProps> = ({
     setIsSubmitting(true);
     try {
       // 1. Call server API
-      const res = await fetch(apiUrl('/api/inventory/set-stock'), {
-        method: 'POST',
-        headers: { ...getAuthHeaders(), 'x-device-id': await getDeviceId() },
-        body: JSON.stringify({
+      const res: any = await apiFetch('/api/inventory/set-stock', { method: 'POST', body: {
           medicine_id: activeMedicine.id,
           batch_id: selectedBatchId || undefined,
           new_stock: qty,
           reason: setStockReason,
           notes: setStockNotes.trim() || `Admin set stock to ${qty}`,
-        }),
-      });
-
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.error || 'Server rejected set stock operation.');
-      }
+        } });
 
       // 2. Apply the committed server result to the Dexie cache
-      const data = await res.json();
+      const data = res;
       const cacheWarning = await refreshCacheAfterCommit(() => applyServerStockResult(data));
 
       setSuccessMsg(`Stock successfully updated to exactly ${qty} units (medicine total: ${data.medicine?.current_stock ?? qty}).${cacheWarning ? ` ${cacheWarning}` : ''}`);
@@ -248,10 +240,7 @@ export const StockAdjustmentModal: React.FC<StockAdjustmentModalProps> = ({
 
     setIsSubmitting(true);
     try {
-      const res = await fetch(apiUrl('/api/inventory/add-stock'), {
-        method: 'POST',
-        headers: { ...getAuthHeaders(), 'x-device-id': await getDeviceId() },
-        body: JSON.stringify({
+      const res: any = await apiFetch('/api/inventory/add-stock', { method: 'POST', body: {
           medicine_id: activeMedicine.id,
           quantity: qty,
           batch_number: addBatchNum.trim(),
@@ -260,16 +249,10 @@ export const StockAdjustmentModal: React.FC<StockAdjustmentModalProps> = ({
           purchase_price: addPurchasePrice ? parseFloat(addPurchasePrice) : undefined,
           selling_price_override: addSellingPrice ? parseFloat(addSellingPrice) : undefined,
           notes: addNotes.trim() || undefined,
-        }),
-      });
-
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.error || 'Server rejected add stock operation.');
-      }
+        } });
 
       // Apply the committed server result to the Dexie cache
-      const data = await res.json();
+      const data = res;
       const cacheWarning = await refreshCacheAfterCommit(() => applyServerStockResult(data));
       const cleanBatch = data.batch?.batch_number || addBatchNum.trim().toUpperCase();
 
@@ -313,25 +296,16 @@ export const StockAdjustmentModal: React.FC<StockAdjustmentModalProps> = ({
 
     setIsSubmitting(true);
     try {
-      const res = await fetch(apiUrl('/api/inventory/remove-stock'), {
-        method: 'POST',
-        headers: { ...getAuthHeaders(), 'x-device-id': await getDeviceId() },
-        body: JSON.stringify({
+      const res: any = await apiFetch('/api/inventory/remove-stock', { method: 'POST', body: {
           medicine_id: activeMedicine.id,
           batch_id: targetBatch.id,
           quantity: qty,
           reason: removeReason,
           notes: removeNotes.trim() || undefined,
-        }),
-      });
-
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.error || 'Server rejected remove stock operation.');
-      }
+        } });
 
       // Apply the committed server result to the Dexie cache
-      const cacheWarning = await refreshCacheAfterCommit(async () => applyServerStockResult(await res.json()));
+      const cacheWarning = await refreshCacheAfterCommit(async () => applyServerStockResult(res));
 
       setSuccessMsg(`Removed ${qty} units from batch ${targetBatch.batch_number}.${cacheWarning ? ` ${cacheWarning}` : ''}`);
       setTimeout(() => {
@@ -364,21 +338,12 @@ export const StockAdjustmentModal: React.FC<StockAdjustmentModalProps> = ({
 
     setIsSubmitting(true);
     try {
-      const res = await fetch(apiUrl(`/api/batches/${targetBatch.id}/expiry`), {
-        method: 'PATCH',
-        headers: { ...getAuthHeaders(), 'x-device-id': await getDeviceId() },
-        body: JSON.stringify({
+      const res: any = await apiFetch(`/api/batches/${targetBatch.id}/expiry`, { method: 'PATCH', body: {
           expiry_date: expiryToSend,
-        }),
-      });
-
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.error || 'Server rejected expiry update.');
-      }
+        } });
 
       // Apply the committed server result to the Dexie cache
-      const cacheWarning = await refreshCacheAfterCommit(async () => applyServerStockResult(await res.json()));
+      const cacheWarning = await refreshCacheAfterCommit(async () => applyServerStockResult(res));
 
       setSuccessMsg(`Expiry date updated for batch ${targetBatch.batch_number}.${cacheWarning ? ` ${cacheWarning}` : ''}`);
       setTimeout(() => {

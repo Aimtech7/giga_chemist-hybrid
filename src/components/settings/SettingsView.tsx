@@ -1,7 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { Settings as SettingsIcon, Save, Download, RotateCcw, AlertTriangle, CheckCircle, ShieldCheck, Printer } from 'lucide-react';
-import { db, getDeviceId, getSettings, saveSettings, seedInitialData } from '../../db/dexie';
-import { apiUrl } from '../../services/api';
+import { db, getSettings, saveSettings, clearCachedServerData } from '../../db/dexie';
+import { apiFetch } from '../../services/http';
+import { syncFromLocalApiToDexie } from '../../services/syncEngine';
 import type { PharmacySettings, User } from '../../types';
 
 interface SettingsViewProps {
@@ -40,40 +41,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ currentUser, setting
     e.preventDefault();
     setIsSaving(true);
     try {
-      const updated: PharmacySettings = {
-        ...formData,
-        updated_at: new Date().toISOString(),
-      };
+      // PostgreSQL first (server writes the audit row); the local copy caches the saved values.
+      const { settings: saved } = await apiFetch<{ settings: PharmacySettings }>('/api/settings', {
+        method: 'PUT',
+        body: formData,
+      });
+      const updated: PharmacySettings = { ...formData, ...saved };
       await saveSettings(updated);
       onSettingsUpdated(updated);
-
-      // Audit log
-      const deviceId = await getDeviceId();
-      await db.audit_logs.put({
-        id: `aud-set-${Date.now()}`,
-        user_id: currentUser?.id || 'admin',
-        user_name: currentUser?.name || 'Admin',
-        role: 'ADMIN',
-        action: 'PHARMACY_SETTINGS_UPDATED',
-        entity: 'settings',
-        entity_id: 'pharmacy_settings',
-        new_value: JSON.stringify({ name: updated.pharmacy_name, printer: updated.printer_type }),
-        device_id: deviceId,
-        timestamp: Date.now(),
-        date: new Date().toISOString().split('T')[0],
-      });
-
-      // Call server PUT /api/settings if online
-      try {
-        await fetch(apiUrl('/api/settings'), {
-          method: 'PUT',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-user-role': 'ADMIN',
-          },
-          body: JSON.stringify(updated),
-        });
-      } catch (e) {}
 
       setSuccessMessage('Pharmacy settings updated successfully.');
       setTimeout(() => setSuccessMessage(null), 3000);
@@ -130,21 +105,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ currentUser, setting
     URL.revokeObjectURL(url);
   };
 
-  const handleResetDemoData = async () => {
-    if (
-      !confirm(
-        'Are you sure you want to reset all records to the clean initial demo dataset? This will clear all transactions.'
-      )
-    ) {
-      return;
-    }
-
+  // Clears ONLY this browser's cached copy and reloads it from PostgreSQL (the source of truth).
+  // Nothing on the server is changed.
+  const handleRebuildLocalCache = async () => {
+    if (!confirm('Rebuild this terminal\'s local cache from the server? Server data is not changed.')) return;
     setIsResetting(true);
     try {
-      await seedInitialData(true);
+      await clearCachedServerData();
+      await syncFromLocalApiToDexie();
       window.location.reload();
     } catch (err: any) {
-      alert(err?.message || 'Reset failed.');
+      alert(err?.message || 'Cache rebuild failed.');
       setIsResetting(false);
     }
   };
@@ -333,12 +304,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ currentUser, setting
         <div className="flex items-center justify-between pt-2">
           <button
             type="button"
-            onClick={handleResetDemoData}
+            onClick={handleRebuildLocalCache}
             disabled={isResetting}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded border border-rose-300 text-rose-700 hover:bg-rose-50 text-xs font-semibold transition cursor-pointer"
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded border border-slate-300 text-slate-700 hover:bg-slate-50 text-xs font-semibold transition cursor-pointer"
           >
             <RotateCcw className="w-3.5 h-3.5" />
-            <span>Reset Database to Clean Demo Records</span>
+            <span>{isResetting ? 'Rebuilding...' : 'Rebuild Local Cache from Server'}</span>
           </button>
 
           <button

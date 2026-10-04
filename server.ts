@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from 'express';
 import http from 'http';
 import path from 'path';
@@ -5,11 +6,15 @@ import { fileURLToPath } from 'url';
 import fs from 'fs';
 import { createServer as createViteServer } from 'vite';
 import { apiRouter } from './server/routes';
+import { assertAuthConfiguration } from './server/auth';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 async function startServer() {
+  // Refuse to start without a real JWT secret (there is no built-in fallback).
+  assertAuthConfiguration();
+
   const app = express();
   const httpServer = http.createServer(app);
   // Server port defaults to 3000

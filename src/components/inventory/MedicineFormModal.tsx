@@ -1,8 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { Pill, X, AlertTriangle, ShieldCheck } from 'lucide-react';
-import { db, getDeviceId } from '../../db/dexie';
-import { apiUrl } from '../../services/api';
-import type { Medicine, DosageForm, PharmacySettings, User } from '../../types';
+import { db } from '../../db/dexie';
+import { apiFetch } from '../../services/http';
+import type { Category, Medicine, DosageForm, PharmacySettings, User } from '../../types';
 
 interface MedicineFormModalProps {
   isOpen: boolean;
@@ -27,7 +27,7 @@ export const MedicineFormModal: React.FC<MedicineFormModalProps> = ({
     brand_name: '',
     sku: '',
     barcode: '',
-    category: 'Analgesics & Antipyretics',
+    category: '',
     medicine_type: 'Pain Relief',
     dosage_strength: '500mg',
     dosage_form: 'Tablet',
@@ -44,6 +44,12 @@ export const MedicineFormModal: React.FC<MedicineFormModalProps> = ({
   });
 
   const [error, setError] = useState<string | null>(null);
+  const [categories, setCategories] = useState<Category[]>([]);
+
+  // Category choices are the real PostgreSQL categories hydrated into Dexie.
+  useEffect(() => {
+    if (isOpen) db.categories.orderBy('name').toArray().then(setCategories).catch(() => setCategories([]));
+  }, [isOpen]);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   useEffect(() => {
@@ -56,7 +62,7 @@ export const MedicineFormModal: React.FC<MedicineFormModalProps> = ({
         brand_name: '',
         sku: `MED-${Math.floor(1000 + Math.random() * 9000)}`,
         barcode: `6164${Math.floor(10000000 + Math.random() * 90000000)}`,
-        category: 'Analgesics & Antipyretics',
+        category: '',
         medicine_type: 'General Medicine',
         dosage_strength: '500mg',
         dosage_form: 'Tablet',
@@ -129,93 +135,21 @@ export const MedicineFormModal: React.FC<MedicineFormModalProps> = ({
 
     setIsSubmitting(true);
     try {
-      const deviceId = await getDeviceId();
-      const todayStr = new Date().toISOString().split('T')[0];
-
-      if (medicine) {
-        // Edit existing
-        const updatedMed: Medicine = {
-          ...medicine,
-          ...formData,
-          purchase_price: Number(formData.purchase_price) || 0,
-          selling_price: Number(formData.selling_price) || 0,
-          wholesale_price: Number(formData.wholesale_price) || 0,
-          min_selling_price: Number(formData.min_selling_price) || 0,
-          reorder_level: Number(formData.reorder_level) || 0,
-          updated_at: todayStr,
-          updated_by: currentUser.name,
-          version: (medicine.version || 1) + 1,
-        } as Medicine;
-
-        await db.medicines.put(updatedMed);
-
-        // Audit log
-        await db.audit_logs.put({
-          id: `aud-med-upd-${Date.now()}`,
-          user_id: currentUser.id,
-          user_name: currentUser.name,
-          role: currentUser.role,
-          action: 'MEDICINE_UPDATED',
-          entity: 'medicine',
-          entity_id: updatedMed.id,
-          previous_value: JSON.stringify({ name: medicine.name, price: medicine.selling_price }),
-          new_value: JSON.stringify({ name: updatedMed.name, price: updatedMed.selling_price }),
-          device_id: deviceId,
-          timestamp: Date.now(),
-          date: todayStr,
-        });
-
-        // Also notify server via PATCH price check if online
-        try {
-          await fetch(apiUrl(`/api/medicines/${updatedMed.id}/price`), {
-            method: 'PATCH',
-            headers: {
-              'Content-Type': 'application/json',
-              'x-user-role': currentUser.role,
-              'x-user-id': currentUser.id,
-              'x-user-name': currentUser.name,
-            },
-            body: JSON.stringify({
-              selling_price: updatedMed.selling_price,
-              purchase_price: updatedMed.purchase_price,
-            }),
-          });
-        } catch (e) {}
-      } else {
-        // Create new
-        const newMed: Medicine = {
-          ...formData,
-          id: `med-${Date.now()}`,
-          current_stock: 0,
-          purchase_price: Number(formData.purchase_price) || 0,
-          selling_price: Number(formData.selling_price) || 0,
-          wholesale_price: Number(formData.wholesale_price) || 0,
-          min_selling_price: Number(formData.min_selling_price) || 0,
-          reorder_level: Number(formData.reorder_level) || 0,
-          created_at: todayStr,
-          updated_at: todayStr,
-          created_by: currentUser.name,
-          updated_by: currentUser.name,
-          version: 1,
-        } as Medicine;
-
-        await db.medicines.put(newMed);
-
-        // Audit log
-        await db.audit_logs.put({
-          id: `aud-med-add-${Date.now()}`,
-          user_id: currentUser.id,
-          user_name: currentUser.name,
-          role: currentUser.role,
-          action: 'MEDICINE_CREATED',
-          entity: 'medicine',
-          entity_id: newMed.id,
-          new_value: JSON.stringify({ name: newMed.name, price: newMed.selling_price }),
-          device_id: deviceId,
-          timestamp: Date.now(),
-          date: todayStr,
-        });
-      }
+      // PostgreSQL first: the cache only ever receives the committed server record.
+      const payload = {
+        ...formData,
+        purchase_price: Number(formData.purchase_price) || 0,
+        selling_price: Number(formData.selling_price) || 0,
+        wholesale_price: Number(formData.wholesale_price) || 0,
+        min_selling_price: Number(formData.min_selling_price) || 0,
+        reorder_level: Number(formData.reorder_level) || 0,
+      };
+      // Stock is never edited from this form (use Stock Management / Physical Count).
+      delete (payload as any).current_stock;
+      const { medicine: saved } = medicine
+        ? await apiFetch<{ medicine: Medicine }>(`/api/medicines/${medicine.id}`, { method: 'PUT', body: payload })
+        : await apiFetch<{ medicine: Medicine }>('/api/medicines', { method: 'POST', body: payload });
+      await db.medicines.put(saved);
 
       onSaved();
       onClose();
@@ -296,16 +230,15 @@ export const MedicineFormModal: React.FC<MedicineFormModalProps> = ({
                 onChange={(e) => setFormData({ ...formData, category: e.target.value })}
                 className="w-full p-2 border border-slate-300 rounded bg-white"
               >
-                <option value="Analgesics & Antipyretics">Analgesics & Antipyretics</option>
-                <option value="Antibiotics">Antibiotics</option>
-                <option value="Antihistamines">Antihistamines</option>
-                <option value="Antidiabetics">Antidiabetics</option>
-                <option value="Gastrointestinal">Gastrointestinal</option>
-                <option value="Respiratory">Respiratory</option>
-                <option value="Cardiovascular">Cardiovascular</option>
-                <option value="Dermatological">Dermatological</option>
-                <option value="Vitamins & Minerals">Vitamins & Minerals</option>
-                <option value="Other">Other</option>
+                <option value="">— Select category —</option>
+                {categories.map((c) => (
+                  <option key={c.id} value={c.name}>
+                    {c.name}
+                  </option>
+                ))}
+                {formData.category && !categories.some((c) => c.name === formData.category) && (
+                  <option value={formData.category}>{formData.category}</option>
+                )}
               </select>
             </div>
 

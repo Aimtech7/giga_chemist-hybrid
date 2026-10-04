@@ -25,6 +25,7 @@ import { applyServerStockResult, refreshCacheAfterCommit } from '../../services/
 import { MedicineSelector } from '../common/MedicineSelector';
 import { normalizeExpiryDate, isExpired, isExpiringSoon } from '../../utils/expiry';
 import type { Medicine, MedicineBatch, PharmacySettings, User, InventoryMovement } from '../../types';
+import { apiFetch } from '../../services/http';
 
 interface BatchCountRow {
   batch_id?: string;
@@ -281,19 +282,10 @@ export const PhysicalStockCount: React.FC<PhysicalStockCountProps> = ({ currentU
         })),
       };
 
-      const res = await fetch(apiUrl('/api/inventory/physical-count'), {
-        method: 'POST',
-        headers: getAuthHeaders(),
-        body: JSON.stringify(payload),
-      });
-
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        throw new Error(errData.error || `Server responded with ${res.status}`);
-      }
+      const res: any = await apiFetch('/api/inventory/physical-count', { method: 'POST', body: payload });
 
       // PostgreSQL has COMMITTED from here on. Nothing below may report the count as failed.
-      const data = await res.json();
+      const data = res;
       const movements: any[] = data.movements || [];
       const prevStock = Number(data.previous_stock ?? selectedMedicine.current_stock ?? 0);
       const newStock = Number(data.total_stock);

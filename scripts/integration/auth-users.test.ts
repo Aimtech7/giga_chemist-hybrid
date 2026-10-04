@@ -1,0 +1,172 @@
+import { updateUser } from '../../server/db/users';
+import { api, check, login, pool, section, startServer, stopServer, UUID_RE, randomPassword, type Fixture } from './harness';
+
+export interface Ctx {
+  admin: Fixture;
+  cashier: Fixture;
+  cashier2: Fixture;
+  adminToken: string;
+  cashierToken: string;
+  cashier2Token: string;
+}
+
+export async function authTests(ctx: Ctx) {
+  section('AUTH');
+  const health = await api('GET', '/api/health');
+  check(health.status === 200 && health.contentType.includes('json'), 'health endpoint returns JSON');
+
+  const unknown = await api('GET', '/api/definitely-not-a-route', ctx.adminToken);
+  check(unknown.status === 404 && unknown.contentType.includes('json'), 'unknown /api route -> JSON 404 (not SPA HTML)', unknown.status);
+
+  check(UUID_RE.test(ctx.admin.id) && UUID_RE.test(ctx.cashier.id), 'fixture user ids are UUIDs');
+  check(typeof ctx.adminToken === 'string' && ctx.adminToken.split('.').length === 3, 'Admin login returns a JWT');
+  check(typeof ctx.cashierToken === 'string' && ctx.cashierToken.split('.').length === 3, 'Cashier login returns a JWT');
+
+  const bad = await api('POST', '/api/auth/login', null, { email: ctx.admin.email, password: 'wrong-password-123' });
+  check(bad.status === 401, 'invalid password denied (401)', bad);
+  const ghost = await api('POST', '/api/auth/login', null, { email: 'nobody-here@gigachemist.local', password: 'whatever-123' });
+  check(ghost.status === 401 && ghost.data?.error === bad.data?.error, 'unknown email denied with the same generic message');
+  const empty = await api('POST', '/api/auth/login', null, { email: ctx.admin.email });
+  check(empty.status === 400, 'login without secret rejected (400)');
+
+  const noToken = await api('GET', '/api/users');
+  check(noToken.status === 401, 'unauthenticated protected endpoint -> 401', noToken.status);
+  const garbage = await api('GET', '/api/users', 'not.a.token');
+  check(garbage.status === 401, 'garbage token -> 401', garbage.status);
+  const spoof = await api('GET', '/api/users', null, undefined, { 'x-user-role': 'ADMIN', 'x-user-id': ctx.admin.id });
+  check(spoof.status === 401, 'x-user-role / x-user-id headers grant nothing (401)', spoof.status);
+
+  // Forge a token: same header/signature, payload changed to ADMIN
+  const [h, p, sig] = ctx.cashierToken.split('.');
+  const payload = JSON.parse(Buffer.from(p, 'base64url').toString());
+  const forged = `${h}.${Buffer.from(JSON.stringify({ ...payload, role: 'ADMIN' })).toString('base64url')}.${sig}`;
+  const forgedRes = await api('GET', '/api/users', forged);
+  check(forgedRes.status === 401, 'tampered token payload rejected (401)', forgedRes.status);
+
+  const cashierAdmin = await api('GET', '/api/users', ctx.cashierToken);
+  check(cashierAdmin.status === 403, 'Cashier on Admin endpoint -> 403', cashierAdmin.status);
+  const adminOk = await api('GET', '/api/users', ctx.adminToken);
+  check(adminOk.status === 200 && Array.isArray(adminOk.data), 'Admin permitted on Admin endpoint');
+  check(Array.isArray(adminOk.data) && adminOk.data.every((u: any) => !('password_hash' in u) && !('pin_hash' in u)), 'user list never exposes hashes');
+
+  const me = await api('GET', '/api/auth/me', ctx.cashierToken);
+  check(me.status === 200 && me.data?.user?.role === 'CASHIER' && me.data?.user?.id === ctx.cashier.id, '/auth/me returns DB identity');
+
+  // The three previously failing routes must not 401 with a valid Admin token
+  const summary = await api('GET', '/api/sales/today-summary', ctx.adminToken);
+  check(summary.status === 200, 'GET /sales/today-summary with Admin token -> 200', summary.status);
+}
+
+const NEW_ADMIN = 'itest-created-admin@gigachemist.local';
+const NEW_CASHIER = 'itest-created-cashier@gigachemist.local';
+
+export async function userTests(ctx: Ctx) {
+  section('USERS');
+  // Remove leftovers from a previous run (never referenced by sales).
+  await pool.query(`DELETE FROM users WHERE email = ANY($1) AND NOT EXISTS (SELECT 1 FROM sales s WHERE s.cashier_id = users.id)`, [[NEW_ADMIN, NEW_CASHIER]]);
+
+  const weak = await api('POST', '/api/users', ctx.adminToken, { name: 'Weak', email: 'weak-pass@gigachemist.local', role: 'CASHIER', password: 'short' });
+  check(weak.status === 400, 'create user with short password rejected (400)', weak.status);
+  const badRole = await api('POST', '/api/users', ctx.adminToken, { name: 'X', email: 'x-role@gigachemist.local', role: 'SUPERUSER', password: randomPassword() });
+  check(badRole.status === 400, 'invalid role rejected (400)', badRole.status);
+
+  const adminPw = randomPassword();
+  const createdAdmin = await api('POST', '/api/users', ctx.adminToken, { name: 'ITest Created Admin', email: NEW_ADMIN, role: 'ADMIN', password: adminPw });
+  check(createdAdmin.status === 201 && UUID_RE.test(createdAdmin.data?.user?.id), 'Admin creates an Admin (UUID id)', createdAdmin.data);
+
+  const cashierPw = randomPassword();
+  const createdCashier = await api('POST', '/api/users', ctx.adminToken, { name: 'ITest Created Cashier', email: NEW_CASHIER, role: 'CASHIER', password: cashierPw, pin: '4821' });
+  const newCashierId: string = createdCashier.data?.user?.id;
+  check(createdCashier.status === 201 && UUID_RE.test(newCashierId), 'Admin creates a Cashier (UUID id)', createdCashier.data);
+
+  const dup = await api('POST', '/api/users', ctx.adminToken, { name: 'Dup', email: NEW_CASHIER.toUpperCase(), role: 'CASHIER', password: randomPassword() });
+  check(dup.status === 409, 'duplicate email (case-insensitive) -> 409', dup.status);
+
+  const byCashier = await api('POST', '/api/users', ctx.cashierToken, { name: 'Nope', email: 'nope@gigachemist.local', role: 'ADMIN', password: randomPassword() });
+  check(byCashier.status === 403, 'Cashier cannot create users (403)', byCashier.status);
+
+  const row = await pool.query('SELECT password_hash, pin_hash FROM users WHERE id = $1', [newCashierId]);
+  check(row.rows[0]?.password_hash?.includes('$') && !row.rows[0].password_hash.includes(cashierPw), 'password stored only as salted PBKDF2 hash');
+
+  let token = await login(NEW_CASHIER, cashierPw).catch(() => '');
+  check(Boolean(token), 'new Cashier can log in with the set password');
+  const pinLogin = await api('POST', '/api/auth/login', null, { email: NEW_CASHIER, password: '4821' });
+  check(pinLogin.status === 200, 'new Cashier can log in with PIN');
+
+  // Edit name/email/role
+  const edited = await api('PUT', `/api/users/${newCashierId}`, ctx.adminToken, { name: 'ITest Cashier Renamed', phone: '0700000001' });
+  check(edited.status === 200 && edited.data?.user?.name === 'ITest Cashier Renamed', 'Admin edits user name/phone');
+  const promoted = await api('PATCH', `/api/users/${newCashierId}/role`, ctx.adminToken, { role: 'ADMIN' });
+  check(promoted.status === 200 && promoted.data?.user?.role === 'ADMIN', 'Admin changes role CASHIER -> ADMIN');
+  const meAfter = await api('GET', '/api/auth/me', token);
+  check(meAfter.data?.user?.role === 'ADMIN', 'role change takes effect on existing session immediately');
+  const demoted = await api('PATCH', `/api/users/${newCashierId}/role`, ctx.adminToken, { role: 'CASHIER' });
+  check(demoted.status === 200 && demoted.data?.user?.role === 'CASHIER', 'Admin changes role ADMIN -> CASHIER');
+
+  // Password reset by Admin
+  const newPw = randomPassword();
+  const reset = await api('POST', `/api/users/${newCashierId}/reset-password`, ctx.adminToken, { new_password: newPw });
+  check(reset.status === 200, 'Admin resets another user password', reset.data);
+  const oldLogin = await api('POST', '/api/auth/login', null, { email: NEW_CASHIER, password: cashierPw });
+  check(oldLogin.status === 401, 'old password no longer works');
+  token = await login(NEW_CASHIER, newPw).catch(() => '');
+  check(Boolean(token), 'new password works');
+  const resetByCashier = await api('POST', `/api/users/${ctx.admin.id}/reset-password`, ctx.cashierToken, { new_password: randomPassword() });
+  check(resetByCashier.status === 403, 'Cashier cannot reset passwords (403)', resetByCashier.status);
+
+  // Self password change
+  const selfPw = randomPassword();
+  const wrongCurrent = await api('POST', '/api/users/change-password', token, { current_password: 'not-it-123', new_password: selfPw });
+  check(wrongCurrent.status === 400, 'self password change requires the current password');
+  const selfChange = await api('POST', '/api/users/change-password', token, { current_password: newPw, new_password: selfPw, confirm_password: selfPw });
+  check(selfChange.status === 200, 'user changes own password', selfChange.data);
+  token = await login(NEW_CASHIER, selfPw).catch(() => '');
+  check(Boolean(token), 'login with self-changed password');
+
+  // Deactivate / reactivate
+  const deact = await api('PATCH', `/api/users/${newCashierId}/status`, ctx.adminToken, { active: false });
+  check(deact.status === 200 && deact.data?.user?.active === false, 'Admin deactivates user');
+  const deadSession = await api('GET', '/api/auth/me', token);
+  check(deadSession.status === 401, 'deactivated user existing token -> 401 immediately', deadSession.status);
+  const deadLogin = await api('POST', '/api/auth/login', null, { email: NEW_CASHIER, password: selfPw });
+  check(deadLogin.status === 403, 'deactivated user cannot log in (403)', deadLogin.status);
+  const react = await api('PATCH', `/api/users/${newCashierId}/status`, ctx.adminToken, { active: true });
+  check(react.status === 200 && react.data?.user?.active === true, 'Admin reactivates user');
+  check(Boolean(await login(NEW_CASHIER, selfPw).catch(() => '')), 'reactivated user can log in');
+
+  // Last-admin / self protection
+  const selfDeact = await api('PATCH', `/api/users/${ctx.admin.id}/status`, ctx.adminToken, { active: false });
+  check(selfDeact.status === 409, 'Admin cannot deactivate own account (409)', selfDeact.status);
+  const selfDemote = await api('PATCH', `/api/users/${ctx.admin.id}/role`, ctx.adminToken, { role: 'CASHIER' });
+  check(selfDemote.status === 409, 'Admin cannot remove own Admin role (409)', selfDemote.status);
+  await lastAdminProtection(ctx);
+
+  // Restart persistence: the account must survive a server restart (no in-memory store)
+  await stopServer();
+  await startServer();
+  check(Boolean(await login(NEW_CASHIER, selfPw).catch(() => '')), 'created user persists across server restart');
+  check(Boolean(await login(NEW_ADMIN, adminPw).catch(() => '')), 'created Admin persists across server restart');
+  ctx.adminToken = await login(ctx.admin.email, ctx.admin.password);
+  ctx.cashierToken = await login(ctx.cashier.email, ctx.cashier.password);
+  ctx.cashier2Token = await login(ctx.cashier2.email, ctx.cashier2.password);
+}
+
+/**
+ * Last active Admin guard, exercised for real: every OTHER active Admin is deactivated for a moment
+ * (restored in finally), then the repository is asked to deactivate / demote the remaining one.
+ */
+async function lastAdminProtection(ctx: Ctx) {
+  const others = await pool.query(`SELECT id FROM users WHERE role = 'ADMIN' AND active = true AND id <> $1`, [ctx.admin.id]);
+  const otherIds: string[] = others.rows.map((r) => r.id);
+  try {
+    await pool.query(`UPDATE users SET active = false WHERE id = ANY($1)`, [otherIds]);
+    const deact = await updateUser(ctx.admin.id, { active: false }).then(() => null, (e) => e);
+    check(deact?.status === 409, 'last active Admin cannot be deactivated (409)', deact?.message);
+    const demote = await updateUser(ctx.admin.id, { role: 'CASHIER' }).then(() => null, (e) => e);
+    check(demote?.status === 409, 'last active Admin cannot be demoted (409)', demote?.message);
+  } finally {
+    await pool.query(`UPDATE users SET active = true WHERE id = ANY($1)`, [otherIds]);
+  }
+  const still = await pool.query(`SELECT role, active FROM users WHERE id = $1`, [ctx.admin.id]);
+  check(still.rows[0]?.role === 'ADMIN' && still.rows[0]?.active === true, 'guarded Admin unchanged after refused attempts');
+}

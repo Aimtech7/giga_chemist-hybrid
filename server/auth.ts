@@ -1,8 +1,35 @@
 import crypto from 'crypto';
 import type { UserRole } from '../src/types';
 
-const JWT_SECRET = process.env.JWT_SECRET || 'giga_chemist_secure_production_jwt_secret_key_2026';
 const TOKEN_EXPIRY_SECONDS = 12 * 60 * 60; // 12 hours
+const MIN_JWT_SECRET_LENGTH = 32;
+
+/** JWT_SECRET is mandatory: there is deliberately no built-in fallback secret. */
+function getJwtSecret(): string {
+  const secret = process.env.JWT_SECRET?.trim();
+  if (!secret || secret.length < MIN_JWT_SECRET_LENGTH) {
+    throw new Error(
+      `JWT_SECRET is missing or shorter than ${MIN_JWT_SECRET_LENGTH} characters. ` +
+        'Set a long random JWT_SECRET in .env before starting the GIGA CHEMIST server.'
+    );
+  }
+  return secret;
+}
+
+/** Called once at startup so a missing secret stops the server instead of failing per request. */
+export function assertAuthConfiguration(): void {
+  getJwtSecret();
+}
+
+function signJwt(encodedHeader: string, encodedPayload: string): string {
+  return crypto
+    .createHmac('sha256', getJwtSecret())
+    .update(`${encodedHeader}.${encodedPayload}`)
+    .digest('base64')
+    .replace(/=/g, '')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_');
+}
 
 export interface JwtPayload {
   userId: string;
@@ -74,15 +101,7 @@ export function createJwtToken(payload: { userId: string; role: UserRole; email:
   const encodedHeader = base64UrlEncode(JSON.stringify(header));
   const encodedPayload = base64UrlEncode(JSON.stringify(fullPayload));
 
-  const signature = crypto
-    .createHmac('sha256', JWT_SECRET)
-    .update(`${encodedHeader}.${encodedPayload}`)
-    .digest('base64')
-    .replace(/=/g, '')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_');
-
-  return `${encodedHeader}.${encodedPayload}.${signature}`;
+  return `${encodedHeader}.${encodedPayload}.${signJwt(encodedHeader, encodedPayload)}`;
 }
 
 export function verifyJwtToken(token: string): { valid: boolean; payload?: JwtPayload; error?: string } {
@@ -97,15 +116,9 @@ export function verifyJwtToken(token: string): { valid: boolean; payload?: JwtPa
 
   const [encodedHeader, encodedPayload, signature] = parts;
 
-  const expectedSignature = crypto
-    .createHmac('sha256', JWT_SECRET)
-    .update(`${encodedHeader}.${encodedPayload}`)
-    .digest('base64')
-    .replace(/=/g, '')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_');
-
-  if (signature !== expectedSignature) {
+  const expected = Buffer.from(signJwt(encodedHeader, encodedPayload));
+  const actual = Buffer.from(signature);
+  if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) {
     return { valid: false, error: 'Invalid token signature' };
   }
 

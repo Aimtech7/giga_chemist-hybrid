@@ -1,7 +1,6 @@
 import React, { useState } from 'react';
 import { Lock, X, Check, AlertCircle, KeyRound } from 'lucide-react';
-import { getAuthHeaders } from '../../services/auth';
-import { apiUrl } from '../../services/api';
+import { apiFetch } from '../../services/http';
 import type { User } from '../../types';
 
 interface ChangePasswordModalProps {
@@ -34,8 +33,8 @@ export const ChangePasswordModal: React.FC<ChangePasswordModalProps> = ({
       return;
     }
 
-    if (newPassword.length < 6) {
-      setErrorMessage('New password must be at least 6 characters long.');
+    if (newPassword.length < 8) {
+      setErrorMessage('New password must be at least 8 characters long.');
       return;
     }
 
@@ -47,21 +46,13 @@ export const ChangePasswordModal: React.FC<ChangePasswordModalProps> = ({
     setIsLoading(true);
 
     try {
-      const res = await fetch(apiUrl('/api/users/change-password'), {
-        method: 'POST',
-        headers: getAuthHeaders(),
-        body: JSON.stringify({
+      await apiFetch('/api/users/change-password', {
+        body: {
           current_password: currentPassword,
           new_password: newPassword,
           confirm_password: confirmPassword,
-        }),
+        },
       });
-
-      const data = await res.json();
-
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to change password.');
-      }
 
       setSuccessMessage('Password changed successfully! Please use your new password next time you sign in.');
       setCurrentPassword('');

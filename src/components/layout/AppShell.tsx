@@ -57,7 +57,6 @@ interface AppShellProps {
   settings: PharmacySettings;
   onOpenLogin: () => void;
   onLogout: () => void;
-  onFastRoleSwitch?: (role: 'ADMIN' | 'MANAGER' | 'CASHIER') => void;
   onViewLandingPage?: () => void;
   children: React.ReactNode;
 }
@@ -69,7 +68,6 @@ export const AppShell: React.FC<AppShellProps> = ({
   settings,
   onOpenLogin,
   onLogout,
-  onFastRoleSwitch,
   onViewLandingPage,
   children,
 }) => {
@@ -249,30 +247,6 @@ export const AppShell: React.FC<AppShellProps> = ({
                     <KeyRound className="w-3.5 h-3.5 text-teal-700" />
                     <span>Change My Password</span>
                   </button>
-
-                  {import.meta.env.DEV && onFastRoleSwitch && (
-                    <div className="px-3 py-1.5 border-b border-slate-100 bg-slate-50/50">
-                      <div className="text-[10px] uppercase font-bold text-amber-600 mb-1">DEV ONLY: Switch Role</div>
-                      <div className="grid grid-cols-3 gap-1">
-                        {(['CASHIER', 'MANAGER', 'ADMIN'] as const).map((r) => (
-                          <button
-                            key={r}
-                            onClick={() => {
-                              onFastRoleSwitch(r);
-                              setShowUserMenu(false);
-                            }}
-                            className={`px-1.5 py-0.5 rounded text-[10px] font-semibold transition cursor-pointer ${
-                              currentUser.role === r
-                                ? 'bg-teal-700 text-white'
-                                : 'bg-white border border-slate-200 text-slate-700 hover:bg-slate-100'
-                            }`}
-                          >
-                            {r === 'CASHIER' ? 'Cashier' : r === 'MANAGER' ? 'Manager' : 'Admin'}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  )}
 
                   {onViewLandingPage && (
                     <button
