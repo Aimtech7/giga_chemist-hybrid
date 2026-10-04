@@ -20,7 +20,7 @@ import { PriceEditModal } from '../medicines/PriceEditModal';
 import { downloadCSV } from '../../services/exportUtils';
 import { searchMedicines } from '../../services/searchEngine';
 import { canViewCostData, isCashier } from '../../services/permissions';
-import type { Medicine, PharmacySettings, User } from '../../types';
+import type { Category, Medicine, PharmacySettings, User } from '../../types';
 
 interface MedicineListProps {
   currentUser: User | null;
@@ -31,6 +31,7 @@ export const MedicineList: React.FC<MedicineListProps> = ({ currentUser, setting
   const [medicines, setMedicines] = useState<Medicine[]>([]);
   const [search, setSearch] = useState('');
   const [selectedCategory, setSelectedCategory] = useState('All');
+  const [categories, setCategories] = useState<Category[]>([]);
   const [stockFilter, setStockFilter] = useState<'all' | 'low' | 'out'>('all');
 
   // Modals
@@ -45,8 +46,9 @@ export const MedicineList: React.FC<MedicineListProps> = ({ currentUser, setting
   const isCashierUser = isCashier(currentUser);
 
   const loadMedicines = async () => {
-    const list = await db.medicines.toArray();
+    const [list, cats] = await Promise.all([db.medicines.toArray(), db.categories.orderBy('name').toArray()]);
     setMedicines(list);
+    setCategories(cats);
   };
 
   useEffect(() => {
@@ -206,12 +208,12 @@ export const MedicineList: React.FC<MedicineListProps> = ({ currentUser, setting
             className="py-1.5 px-2.5 border border-slate-300 rounded bg-white text-xs text-slate-700 font-medium"
           >
             <option value="All">All Categories</option>
-            <option value="Analgesics & Antipyretics">Analgesics & Antipyretics</option>
-            <option value="Antibiotics">Antibiotics</option>
-            <option value="Antihistamines">Antihistamines</option>
-            <option value="Antidiabetics">Antidiabetics</option>
-            <option value="Gastrointestinal">Gastrointestinal</option>
-            <option value="Respiratory">Respiratory</option>
+            {/* Hydrated from PostgreSQL categories; medicines carry the category name */}
+            {categories.map((c) => (
+              <option key={c.id} value={c.name}>
+                {c.name}
+              </option>
+            ))}
           </select>
 
           {/* Stock state filter */}

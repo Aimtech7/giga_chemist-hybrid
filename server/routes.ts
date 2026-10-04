@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import { Router, Request, Response, NextFunction } from 'express';
 import {
+  getAllCategories,
   getAllMedicines,
   upsertMedicine,
   adminUpdateMedicinePricing,
@@ -598,6 +599,17 @@ apiRouter.patch('/medicines/:id/price', requireRole('ADMIN'), async (req: Authen
   }
 });
 
+// Medicine categories (formulary metadata; same access as the medicine list)
+apiRouter.get('/categories', requirePermission('medicine.view'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const categories = await getAllCategories();
+    res.json(categories);
+  } catch (err: any) {
+    console.error('[API] /categories failed:', err.message);
+    res.status(500).json({ error: 'Failed to fetch categories.' });
+  }
+});
+
 // --- 5. BATCHES ---
 apiRouter.get('/batches', requirePermission('medicine.view'), async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -1081,4 +1093,9 @@ apiRouter.put('/settings', requireRole('ADMIN'), async (req, res) => {
   } catch (err: any) {
     res.status(400).json({ error: err.message || 'Failed to update settings.' });
   }
+});
+
+// Unknown /api paths return JSON 404 instead of falling through to the SPA index.html fallback.
+apiRouter.use((req: Request, res: Response) => {
+  res.status(404).json({ error: `API route not found: ${req.method} ${req.originalUrl}` });
 });

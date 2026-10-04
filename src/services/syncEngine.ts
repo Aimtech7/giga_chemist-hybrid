@@ -359,15 +359,21 @@ export async function syncFromLocalApiToDexie(): Promise<boolean> {
     // 1. Fetch Categories
     try {
       const resCat = await fetch(apiUrl('/api/categories'), { headers: authHeaders });
-      if (resCat.ok) {
+      if (!resCat.ok) {
+        const body = await resCat.json().catch(() => ({}));
+        console.error(`[SyncEngine] Categories hydration failed: HTTP ${resCat.status}`, body.error || '');
+      } else {
         const categories = await resCat.json();
-        if (Array.isArray(categories) && categories.length > 0) {
+        if (!Array.isArray(categories)) {
+          console.error('[SyncEngine] Categories hydration failed: expected a JSON array from /api/categories.');
+        } else {
+          // bulkPut is keyed by category id, so re-hydration never duplicates rows.
           await db.categories.bulkPut(categories);
           console.log(`[SyncEngine] Hydrated ${categories.length} categories into Dexie.`);
         }
       }
     } catch (e) {
-      console.warn('[SyncEngine] Categories hydration notice:', e);
+      console.error('[SyncEngine] Categories hydration failed:', e);
     }
 
     // 2. Fetch Suppliers
