@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import type pg from 'pg';
 import { pgPool, HttpError, requireUuid, withTransaction, roundMoney } from './client';
 import { recordAuditLog } from './audit';
+import { enqueueSyncEvent, medicineJson } from '../sync/outbox';
 import type { Medicine, UserRole } from '../../src/types';
 
 const MEDICINE_SELECT = `
@@ -174,6 +175,11 @@ export async function createMedicine(data: Partial<Medicine>, actor: MedicineAct
       { ...actor, action: 'CREATE_MEDICINE', entity: 'medicine', entity_id: id, new_value: saved },
       client
     );
+    await enqueueSyncEvent(client, {
+      event_type: 'MEDICINE_CREATED', entity_type: 'medicine', entity_id: id, operation: 'CREATE',
+      data: async () => ({ medicine: await medicineJson(client, id) }),
+      actor,
+    });
     return saved;
   });
 }
@@ -186,63 +192,74 @@ export async function createMedicine(data: Partial<Medicine>, actor: MedicineAct
 export async function updateMedicineDetails(id: string, data: Partial<Medicine>, actor: MedicineActor): Promise<Medicine> {
   requireUuid(id, 'medicine id');
   return withTransaction(async (client) => {
-    const locked = await client.query('SELECT id FROM medicines WHERE id = $1 FOR UPDATE', [id]);
-    if (!locked.rows[0]) throw new HttpError(404, 'Medicine not found.');
-    const before = (await getMedicineById(id, client))!;
-
-    const categoryId = data.category !== undefined ? await resolveCategoryId(client, data.category) : undefined;
-    if (data.barcode !== undefined) await assertBarcodeFree(client, text(data.barcode, 100), id);
-    const status = data.status !== undefined ? String(data.status) : undefined;
-    if (status !== undefined && !['active', 'inactive'].includes(status)) {
-      throw new HttpError(400, 'status must be "active" or "inactive".');
-    }
-    if (data.name !== undefined && !text(data.name, 255)) throw new HttpError(400, 'Medicine name cannot be empty.');
-
-    try {
-      await client.query(
-        `UPDATE medicines SET
-           name = COALESCE($2, name), generic_name = COALESCE($3, generic_name),
-           brand_name = COALESCE($4, brand_name), sku = COALESCE($5, sku), barcode = COALESCE($6, barcode),
-           category_id = CASE WHEN $7::boolean THEN $8::uuid ELSE category_id END,
-           medicine_type = COALESCE($9, medicine_type), dosage_strength = COALESCE($10, dosage_strength),
-           dosage_form = COALESCE($11, dosage_form), manufacturer = COALESCE($12, manufacturer),
-           description = COALESCE($13, description), unit = COALESCE($14, unit),
-           prescription_required = COALESCE($15, prescription_required), status = COALESCE($16, status),
-           updated_by = $17, version = version + 1, updated_at = CURRENT_TIMESTAMP
-         WHERE id = $1`,
-        [
-          id, text(data.name, 255) || null, text(data.generic_name, 255) || null, text(data.brand_name, 255) ?? null,
-          text(data.sku, 100) || null, text(data.barcode, 100) || null,
-          categoryId !== undefined, categoryId ?? null,
-          text(data.medicine_type, 100) ?? null, text(data.dosage_strength, 100) ?? null,
-          text(data.dosage_form, 100) || null, text(data.manufacturer, 255) ?? null,
-          text(data.description, 2000) ?? null, text(data.unit, 50) || null,
-          data.prescription_required !== undefined ? Boolean(data.prescription_required) : null,
-          status ?? null, actor.user_id,
-        ]
-      );
-    } catch (err) {
-      uniqueViolation(err, 'This barcode');
-    }
-
-    await recordAuditLog(
-      {
-        ...actor,
-        action: 'UPDATE_MEDICINE',
-        entity: 'medicine',
-        entity_id: id,
-        previous_value: { name: before.name, sku: before.sku, barcode: before.barcode, category: before.category, status: before.status },
-        new_value: { name: data.name, sku: data.sku, barcode: data.barcode, category: data.category, status: data.status },
-      },
-      client
-    );
-
-    const priceFields = ['selling_price', 'purchase_price', 'min_selling_price', 'wholesale_price', 'reorder_level'] as const;
-    if (priceFields.some((f) => data[f] !== undefined && Number(data[f]) !== Number(before[f]))) {
-      return applyPricingUpdate(client, id, data as any, actor);
-    }
-    return (await getMedicineById(id, client))!;
+    const saved = await updateMedicineDetailsTx(client, id, data, actor);
+    await enqueueSyncEvent(client, {
+      event_type: 'MEDICINE_UPDATED', entity_type: 'medicine', entity_id: id, operation: 'UPDATE',
+      data: async () => ({ medicine: await medicineJson(client, id) }),
+      actor,
+    });
+    return saved;
   });
+}
+
+/** updateMedicineDetails on the caller's transaction (no outbox event; the caller enqueues one). */
+export async function updateMedicineDetailsTx(client: pg.PoolClient, id: string, data: Partial<Medicine>, actor: MedicineActor): Promise<Medicine> {
+  const locked = await client.query('SELECT id FROM medicines WHERE id = $1 FOR UPDATE', [id]);
+  if (!locked.rows[0]) throw new HttpError(404, 'Medicine not found.');
+  const before = (await getMedicineById(id, client))!;
+
+  const categoryId = data.category !== undefined ? await resolveCategoryId(client, data.category) : undefined;
+  if (data.barcode !== undefined) await assertBarcodeFree(client, text(data.barcode, 100), id);
+  const status = data.status !== undefined ? String(data.status) : undefined;
+  if (status !== undefined && !['active', 'inactive'].includes(status)) {
+    throw new HttpError(400, 'status must be "active" or "inactive".');
+  }
+  if (data.name !== undefined && !text(data.name, 255)) throw new HttpError(400, 'Medicine name cannot be empty.');
+
+  try {
+    await client.query(
+      `UPDATE medicines SET
+         name = COALESCE($2, name), generic_name = COALESCE($3, generic_name),
+         brand_name = COALESCE($4, brand_name), sku = COALESCE($5, sku), barcode = COALESCE($6, barcode),
+         category_id = CASE WHEN $7::boolean THEN $8::uuid ELSE category_id END,
+         medicine_type = COALESCE($9, medicine_type), dosage_strength = COALESCE($10, dosage_strength),
+         dosage_form = COALESCE($11, dosage_form), manufacturer = COALESCE($12, manufacturer),
+         description = COALESCE($13, description), unit = COALESCE($14, unit),
+         prescription_required = COALESCE($15, prescription_required), status = COALESCE($16, status),
+         updated_by = $17, version = version + 1, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1`,
+      [
+        id, text(data.name, 255) || null, text(data.generic_name, 255) || null, text(data.brand_name, 255) ?? null,
+        text(data.sku, 100) || null, text(data.barcode, 100) || null,
+        categoryId !== undefined, categoryId ?? null,
+        text(data.medicine_type, 100) ?? null, text(data.dosage_strength, 100) ?? null,
+        text(data.dosage_form, 100) || null, text(data.manufacturer, 255) ?? null,
+        text(data.description, 2000) ?? null, text(data.unit, 50) || null,
+        data.prescription_required !== undefined ? Boolean(data.prescription_required) : null,
+        status ?? null, actor.user_id,
+      ]
+    );
+  } catch (err) {
+    uniqueViolation(err, 'This barcode');
+  }
+
+  await recordAuditLog(
+    {
+      ...actor,
+      action: 'UPDATE_MEDICINE',
+      entity: 'medicine',
+      entity_id: id,
+      previous_value: { name: before.name, sku: before.sku, barcode: before.barcode, category: before.category, status: before.status },
+      new_value: { name: data.name, sku: data.sku, barcode: data.barcode, category: data.category, status: data.status },
+    },
+    client
+  );
+
+  const priceFields = ['selling_price', 'purchase_price', 'min_selling_price', 'wholesale_price', 'reorder_level'] as const;
+  if (priceFields.some((f) => data[f] !== undefined && Number(data[f]) !== Number(before[f]))) {
+    return applyPricingUpdate(client, id, data as any, actor);
+  }
+  return (await getMedicineById(id, client))!;
 }
 
 export interface UpdatePricingParams {
@@ -258,7 +275,7 @@ export interface UpdatePricingParams {
   device_id?: string;
 }
 
-async function applyPricingUpdate(
+export async function applyPricingUpdate(
   client: pg.PoolClient,
   id: string,
   p: Partial<UpdatePricingParams>,
@@ -332,5 +349,13 @@ export async function adminUpdateMedicinePricing(params: UpdatePricingParams): P
     role: params.role,
     device_id: params.device_id,
   };
-  return withTransaction((client) => applyPricingUpdate(client, id, params, actor));
+  return withTransaction(async (client) => {
+    const saved = await applyPricingUpdate(client, id, params, actor);
+    await enqueueSyncEvent(client, {
+      event_type: 'MEDICINE_PRICE_CHANGED', entity_type: 'medicine', entity_id: id, operation: 'PRICE',
+      data: async () => ({ medicine: await medicineJson(client, id) }),
+      actor,
+    });
+    return saved;
+  });
 }

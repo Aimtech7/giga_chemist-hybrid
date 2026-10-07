@@ -1,6 +1,8 @@
+import type pg from 'pg';
 import { pgPool, HttpError, withTransaction, type Queryable } from './client';
 import { recordAuditLog, type AuditEntry } from './audit';
 import type { PharmacySettings } from '../../src/types';
+import { enqueueSyncEvent } from '../sync/outbox';
 
 /** The settings table is one row per branch; this local install uses the MAIN branch row. */
 const MAIN_BRANCH_ID = '00000000-0000-0000-0000-000000000001';
@@ -90,6 +92,15 @@ export async function updatePharmacySettings(
   changes: Partial<PharmacySettings>,
   actor: Omit<AuditEntry, 'action' | 'entity' | 'entity_id'>
 ): Promise<PharmacySettings> {
+  return withTransaction((client) => updatePharmacySettingsTx(client, changes, actor));
+}
+
+/** updatePharmacySettings on the caller's transaction (audit + outbox event included). */
+export async function updatePharmacySettingsTx(
+  client: pg.PoolClient,
+  changes: Partial<PharmacySettings>,
+  actor: Omit<AuditEntry, 'action' | 'entity' | 'entity_id'>
+): Promise<PharmacySettings> {
   const columns: string[] = [];
   const values: any[] = [];
   for (const [key, validate] of Object.entries(EDITABLE)) {
@@ -99,26 +110,33 @@ export async function updatePharmacySettings(
     }
   }
   if (columns.length === 0) throw new HttpError(400, 'No editable settings were provided.');
-
-  return withTransaction(async (client) => {
-    const before = await ensureSettingsRow(client);
-    const assignments = columns.map((c, i) => `${c} = $${i + 2}`).join(', ');
-    const res = await client.query(
-      `UPDATE settings SET ${assignments}, updated_at = CURRENT_TIMESTAMP WHERE branch_id = $1 RETURNING *`,
-      [before.branch_id, ...values]
-    );
-    const after = toSettings(res.rows[0]);
-    await recordAuditLog(
-      {
-        ...actor,
-        action: 'PHARMACY_SETTINGS_UPDATED',
-        entity: 'settings',
-        entity_id: String(before.branch_id),
-        previous_value: Object.fromEntries(columns.map((c) => [c, before[c]])),
-        new_value: Object.fromEntries(columns.map((c) => [c, (after as any)[c]])),
-      },
-      client
-    );
-    return after;
+  const before = await ensureSettingsRow(client);
+  const assignments = columns.map((c, i) => `${c} = $${i + 2}`).join(', ');
+  const res = await client.query(
+    `UPDATE settings SET ${assignments}, updated_at = CURRENT_TIMESTAMP WHERE branch_id = $1 RETURNING *`,
+    [before.branch_id, ...values]
+  );
+  const after = toSettings(res.rows[0]);
+  await recordAuditLog(
+    {
+      ...actor,
+      action: 'PHARMACY_SETTINGS_UPDATED',
+      entity: 'settings',
+      entity_id: String(before.branch_id),
+      previous_value: Object.fromEntries(columns.map((c) => [c, before[c]])),
+      new_value: Object.fromEntries(columns.map((c) => [c, (after as any)[c]])),
+    },
+    client
+  );
+  await enqueueSyncEvent(client, {
+    event_type: 'SETTINGS_UPDATED',
+    entity_type: 'settings',
+    entity_id: String(before.branch_id),
+    operation: 'UPDATE',
+    data: async () => ({
+      settings: (await client.query('SELECT to_jsonb(s) AS j FROM settings s WHERE branch_id = $1', [before.branch_id])).rows[0]?.j ?? null,
+    }),
+    actor,
   });
+  return after;
 }

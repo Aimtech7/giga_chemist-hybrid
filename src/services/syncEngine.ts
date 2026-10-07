@@ -108,12 +108,9 @@ export async function getPendingCount(): Promise<number> {
 
 export async function refreshPendingCount(): Promise<number> {
   const count = await getPendingCount();
-  const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
 
   currentSummary.pendingCount = count;
-  if (!isOnline) {
-    currentSummary.state = 'offline';
-  } else if (count === 0 && currentSummary.state !== 'error') {
+  if (count === 0 && currentSummary.state !== 'error') {
     currentSummary.state = 'synced';
   }
   notifyListeners();
@@ -122,21 +119,16 @@ export async function refreshPendingCount(): Promise<number> {
 }
 
 /**
- * Local-mode synchronization. PostgreSQL is authoritative and every sale / return / expense is
- * completed online against it, so there is nothing to "push": a sync is a refresh of this
- * browser's cache from the server.
+ * Browser cache refresh. PostgreSQL (behind the local server) is authoritative and every sale /
+ * return / expense is completed against it, so there is nothing to "push" from the browser: a sync
+ * is a refresh of this browser's cache from the local server. Cloud sync (hybrid mode) is done by
+ * the server's own worker, never by the browser. Internet status is irrelevant here: the local
+ * server is reachable without internet, so navigator.onLine is not consulted.
  *
  * Items left in the old offline queue (from earlier versions) are NEVER replayed and never marked
  * synced: they are marked 'failed' with a reason so the operator can see and re-enter them.
  */
-export async function runSync(force = false): Promise<boolean> {
-  const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
-  if (!isOnline && !force) {
-    currentSummary.state = 'offline';
-    notifyListeners();
-    return false;
-  }
-
+export async function runSync(_force = false): Promise<boolean> {
   currentSummary.state = 'syncing';
   currentSummary.errorMessage = undefined;
   setSyncingState(true);
@@ -160,7 +152,7 @@ export async function runSync(force = false): Promise<boolean> {
     return stranded === 0;
   } catch (error: any) {
     console.warn('[SyncEngine] Sync failed:', error);
-    currentSummary.state = isOnline ? 'error' : 'offline';
+    currentSummary.state = error?.status === 0 ? 'offline' : 'error';
     currentSummary.pendingCount = await getPendingCount();
     currentSummary.errorMessage = error?.message || 'Sync failed.';
     setSyncingState(false, currentSummary.errorMessage);
@@ -329,8 +321,6 @@ if (typeof window !== 'undefined') {
   });
 
   window.addEventListener('offline', () => {
-    currentSummary.state = 'offline';
-    notifyListeners();
     refreshNetworkStatus();
   });
 

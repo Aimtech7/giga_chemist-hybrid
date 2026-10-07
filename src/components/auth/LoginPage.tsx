@@ -11,6 +11,7 @@ import {
   WifiOff,
 } from 'lucide-react';
 import { loginWithPinOrEmail } from '../../services/auth';
+import { verifyServerReachability } from '../../services/network';
 import type { User as UserType } from '../../types';
 
 interface LoginPageProps {
@@ -24,16 +25,21 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onSuccess, onBackToHome })
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
-  const [isOnline, setIsOnline] = useState(navigator.onLine);
+  // Login needs the LOCAL POS server only (never the internet), so that is what is shown here.
+  const [isOnline, setIsOnline] = useState(true);
 
   useEffect(() => {
-    const handleOnline = () => setIsOnline(true);
-    const handleOffline = () => setIsOnline(false);
-    window.addEventListener('online', handleOnline);
-    window.addEventListener('offline', handleOffline);
+    let alive = true;
+    const check = () => verifyServerReachability().then((ok) => alive && setIsOnline(ok));
+    check();
+    const t = setInterval(check, 10_000);
+    window.addEventListener('online', check);
+    window.addEventListener('offline', check);
     return () => {
-      window.removeEventListener('online', handleOnline);
-      window.removeEventListener('offline', handleOffline);
+      alive = false;
+      clearInterval(t);
+      window.removeEventListener('online', check);
+      window.removeEventListener('offline', check);
     };
   }, []);
 
@@ -72,13 +78,13 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onSuccess, onBackToHome })
             <>
               <span className="w-2 h-2 rounded-full bg-emerald-500" />
               <Wifi className="w-3.5 h-3.5 text-slate-600" />
-              <span>Online</span>
+              <span>POS server connected</span>
             </>
           ) : (
             <>
               <span className="w-2 h-2 rounded-full bg-amber-500" />
               <WifiOff className="w-3.5 h-3.5 text-amber-600" />
-              <span>Offline Mode</span>
+              <span>POS server unreachable</span>
             </>
           )}
         </div>

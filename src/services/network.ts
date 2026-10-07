@@ -9,10 +9,11 @@ const listeners = new Set<NetworkListener>();
 let currentState: NetworkState = 'ONLINE_SYNCED';
 let currentPendingCount = 0;
 
+/**
+ * Is the LOCAL POS server reachable? Deliberately ignores navigator.onLine: losing the internet
+ * does not stop this browser from reaching the shop's server (same PC or LAN).
+ */
 export async function verifyServerReachability(): Promise<boolean> {
-  if (typeof navigator !== 'undefined' && !navigator.onLine) {
-    return false;
-  }
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 2500);
@@ -80,9 +81,7 @@ export function subscribeNetworkStatus(listener: NetworkListener): () => void {
 
 if (typeof window !== 'undefined') {
   window.addEventListener('online', () => refreshNetworkStatus());
-  window.addEventListener('offline', () => {
-    currentState = 'OFFLINE';
-    notify();
-  });
+  // "offline" only means the OS lost a network; re-check the local server instead of assuming.
+  window.addEventListener('offline', () => refreshNetworkStatus());
   setInterval(() => refreshNetworkStatus(), 15000);
 }

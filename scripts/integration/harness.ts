@@ -66,16 +66,43 @@ export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 // ---------------------------------------------------------------------------
 let server: ChildProcess | null = null;
 let serverLog = '';
+let serverEnv: Record<string, string> = {};
+
+/**
+ * Mode of the private test server. Never inherited from .env: the regular suite runs APP_MODE=local
+ * (or ITEST_MODE=hybrid: outbox on, worker off). The hybrid suite sets its own cloud env here.
+ */
+export function setServerEnv(env: Record<string, string>): void {
+  serverEnv = env;
+}
+
+function modeEnv(): Record<string, string> {
+  const hybrid = (process.env.ITEST_MODE || '').toLowerCase() === 'hybrid';
+  return {
+    APP_MODE: hybrid ? 'hybrid' : 'local',
+    SYNC_ENABLED: 'false',
+    SUPABASE_URL: '',
+    SUPABASE_ANON_KEY: '',
+    SUPABASE_SERVICE_ROLE_KEY: '',
+    SYNC_SHOP_TOKEN: '',
+    SHOP_ID: '',
+  };
+}
 
 export async function startServer(): Promise<void> {
   serverLog = '';
   server = spawn(process.execPath, ['--import', 'tsx', 'server.ts'], {
     // Higher login rate limit for this private test server only (the suite logs in many times).
-    env: { ...process.env, PORT: String(PORT), AUTH_RATE_LIMIT_PER_MINUTE: '1000' },
+    env: { ...process.env, ...modeEnv(), ...serverEnv, PORT: String(PORT), AUTH_RATE_LIMIT_PER_MINUTE: '1000' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  server.stdout!.on('data', (d) => (serverLog += d.toString()));
-  server.stderr!.on('data', (d) => (serverLog += d.toString()));
+  const stream = Boolean(process.env.ITEST_STREAM_SERVER_LOG);
+  const onData = (d: Buffer) => {
+    serverLog += d.toString();
+    if (stream) process.stdout.write(d.toString().replace(/^(?=.)/gm, '    [server] '));
+  };
+  server.stdout!.on('data', onData);
+  server.stderr!.on('data', onData);
   const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {
     if (server.exitCode !== null) throw new Error(`Server exited early:\n${serverLog}`);
@@ -191,6 +218,17 @@ export async function cleanupFixtures(): Promise<Record<string, number>> {
   const counts: Record<string, number> = {};
   try {
     await client.query('BEGIN');
+    // Outbox rows produced by test actions (hybrid runs): never left behind to reach a real cloud.
+    const itestUsers = `SELECT id FROM users WHERE email LIKE 'itest-%@gigachemist.local'`;
+    const itestMeds = `SELECT id::text FROM medicines WHERE barcode LIKE 'ITEST-%'`;
+    counts.sync_events = (await client.query(
+      `DELETE FROM sync_events WHERE actor_user_id IN (${itestUsers})
+         OR (entity_type = 'medicine' AND entity_id IN (${itestMeds}))
+         OR (entity_type = 'user' AND entity_id IN (SELECT id::text FROM users WHERE email LIKE 'itest-%@gigachemist.local'))`
+    )).rowCount || 0;
+    counts.sync_inbound_commands = (await client.query(
+      `DELETE FROM sync_inbound_commands WHERE payload->>'medicine_id' IN (${itestMeds}) OR payload->>'name' LIKE 'ZZ ITEST%'`
+    )).rowCount || 0;
     const testSales = `
       SELECT s.id FROM sales s JOIN users u ON u.id = s.cashier_id
       WHERE u.email LIKE 'itest-%@gigachemist.local'

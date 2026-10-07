@@ -457,7 +457,7 @@ export async function commerceTests(ctx: Ctx) {
   const regNoAuth = await api('POST', '/api/devices/register', null, { device_id: devId });
   check(regNoAuth.status === 401, 'device registration requires login (401)');
   persisted.deviceId = devId;
-  for (const action of ['SALE_COMPLETED', 'SALE_VOIDED', 'RETURN_PROCESSED', 'PURCHASE_GOODS_RECEIVED', 'EXPENSE_RECORDED', 'SUPPLIER_CREATED', 'CUSTOMER_CREATED', 'CREATE_MEDICINE']) {
+  for (const action of ['SALE_COMPLETED', 'SALE_VOIDED', 'RETURN_REQUESTED', 'RETURN_APPROVED', 'PURCHASE_GOODS_RECEIVED', 'EXPENSE_RECORDED', 'SUPPLIER_CREATED', 'CUSTOMER_CREATED', 'CREATE_MEDICINE']) {
     const n = await count(`SELECT COUNT(*) n FROM audit_logs WHERE action = $1 AND created_at > now() - interval '15 minutes'`, [action]);
     check(n > 0, `audit row written: ${action}`, n);
   }

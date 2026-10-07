@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import { pgPool, HttpError, withTransaction, businessNow, roundMoney } from './client';
 import { recordAuditLog } from './audit';
+import { enqueueSyncEvent, rowJson } from '../sync/outbox';
 import type { SaleActor } from './sales';
 import type { Expense } from '../../src/types';
 
@@ -72,6 +73,14 @@ export async function recordExpense(input: Partial<Expense>, actor: SaleActor): 
       },
       client
     );
+    await enqueueSyncEvent(client, {
+      event_type: 'EXPENSE_RECORDED',
+      entity_type: 'expense',
+      entity_id: id,
+      operation: 'CREATE',
+      data: async () => ({ expense: await rowJson(client, 'expenses', id) }),
+      actor,
+    });
     return toExpense({ ...res.rows[0], user_name: actor.user_name });
   });
 }

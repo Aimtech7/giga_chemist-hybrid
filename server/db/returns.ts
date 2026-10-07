@@ -3,6 +3,7 @@ import type pg from 'pg';
 import { pgPool, HttpError, requireUuid, withTransaction, businessNow } from './client';
 import { ensureDevice } from './devices';
 import { recordAuditLog } from './audit';
+import { enqueueSyncEvent, rowJson } from '../sync/outbox';
 import {
   deriveBatchStatus,
   insertMovement,
@@ -232,6 +233,16 @@ export async function requestReturn(input: ReturnRequestInput, actor: SaleActor)
       },
       client
     );
+    await enqueueSyncEvent(client, {
+      event_type: 'RETURN_REQUESTED',
+      entity_type: 'return',
+      entity_id: id,
+      operation: 'CREATE',
+      data: async () => ({ return: await rowJson(client, 'returns', id) }),
+      actor,
+      device_id: deviceId,
+      business_ref: sale.receipt_number,
+    });
     return { success: true, return: (await getReturnById(client, id))!, sale: (await getSaleById(saleId, client))! };
   });
 }
@@ -361,6 +372,20 @@ export async function approveReturn(returnIdRaw: string, input: ApproveReturnInp
       },
       client
     );
+    await enqueueSyncEvent(client, {
+      event_type: 'RETURN_APPROVED',
+      entity_type: 'return',
+      entity_id: returnId,
+      operation: 'APPROVE',
+      data: async () => ({
+        return: await rowJson(client, 'returns', returnId),
+        sale: await rowJson(client, 'sales', ret.sale_id),
+        customer: sale.customer_id ? await rowJson(client, 'customers', sale.customer_id) : null,
+      }),
+      actor,
+      device_id: deviceId,
+      business_ref: ret.receipt_number,
+    });
 
     return {
       success: true,
@@ -403,6 +428,16 @@ export async function rejectReturn(returnIdRaw: string, notesRaw: unknown, actor
       },
       client
     );
+    await enqueueSyncEvent(client, {
+      event_type: 'RETURN_REJECTED',
+      entity_type: 'return',
+      entity_id: returnId,
+      operation: 'REJECT',
+      data: async () => ({ return: await rowJson(client, 'returns', returnId) }),
+      actor,
+      device_id: deviceId,
+      business_ref: ret.receipt_number,
+    });
     return { success: true, return: (await getReturnById(client, returnId))!, sale: (await getSaleById(ret.sale_id, client))! };
   });
 }

@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import { pgPool, HttpError, requireUuid, withTransaction } from './client';
 import { recordAuditLog } from './audit';
+import { enqueueSyncEvent, rowJson } from '../sync/outbox';
 import type { SaleActor } from './sales';
 import type { Customer } from '../../src/types';
 
@@ -71,6 +72,14 @@ export async function upsertCustomer(input: Partial<Customer>, actor: SaleActor)
       },
       client
     );
+    await enqueueSyncEvent(client, {
+      event_type: 'CUSTOMER_UPSERTED',
+      entity_type: 'customer',
+      entity_id: row.id,
+      operation: created ? 'CREATE' : 'UPDATE',
+      data: async () => ({ customer: await rowJson(client, 'customers', row.id) }),
+      actor,
+    });
     return toCustomer(row);
   });
 }

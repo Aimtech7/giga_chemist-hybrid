@@ -16,16 +16,15 @@ import {
   ShieldCheck,
   FileText,
   Settings as SettingsIcon,
-  Wifi,
-  WifiOff,
-  RefreshCw,
   LogOut,
   ChevronDown,
   KeyRound,
 } from 'lucide-react';
 import { PWAInstallButton } from '../common/PWAInstallButton';
 import { ChangePasswordModal } from '../users/ChangePasswordModal';
-import { subscribeNetworkStatus, type NetworkState, refreshNetworkStatus } from '../../services/network';
+import { refreshNetworkStatus } from '../../services/network';
+import { refreshCloudSyncStatus } from '../../services/cloudSync';
+import { SyncIndicator } from '../common/SyncIndicator';
 import { runSync, subscribeToSyncStatus } from '../../services/syncEngine';
 import { getOrRegisterDevice } from '../../services/device';
 import { canAccessModule, isCashier } from '../../services/permissions';
@@ -71,8 +70,6 @@ export const AppShell: React.FC<AppShellProps> = ({
   onViewLandingPage,
   children,
 }) => {
-  const [networkState, setNetworkState] = useState<NetworkState>('ONLINE_SYNCED');
-  const [pendingCount, setPendingCount] = useState<number>(0);
   const [device, setDevice] = useState<DeviceInfo | null>(null);
   const [isSyncing, setIsSyncing] = useState<boolean>(false);
   const [showUserMenu, setShowUserMenu] = useState<boolean>(false);
@@ -81,13 +78,8 @@ export const AppShell: React.FC<AppShellProps> = ({
   useEffect(() => {
     getOrRegisterDevice().then(setDevice);
     
-    // Subscribe to both network connectivity and sync queue status
-    const unsubNetwork = subscribeNetworkStatus((state) => {
-      setNetworkState(state);
-    });
-
+    // Browser cache refresh state (the cloud sync status comes from the server: SyncIndicator)
     const unsubSync = subscribeToSyncStatus((summary) => {
-      setPendingCount(summary.pendingCount);
       if (summary.state === 'syncing') {
         setIsSyncing(true);
       } else {
@@ -96,7 +88,6 @@ export const AppShell: React.FC<AppShellProps> = ({
     });
 
     return () => {
-      unsubNetwork();
       unsubSync();
     };
   }, []);
@@ -105,6 +96,7 @@ export const AppShell: React.FC<AppShellProps> = ({
     setIsSyncing(true);
     await runSync(true);
     await refreshNetworkStatus();
+    await refreshCloudSyncStatus();
     setTimeout(() => setIsSyncing(false), 500);
   };
 
@@ -154,48 +146,8 @@ export const AppShell: React.FC<AppShellProps> = ({
           </div>
         </div>
 
-        {/* Center: Unboxed Status Indicator */}
-        <div className="flex items-center gap-2 text-xs">
-          <div className="flex items-center gap-1.5 text-slate-300">
-            {networkState === 'OFFLINE' ? (
-              <>
-                <span className="w-2 h-2 rounded-full bg-amber-500" />
-                <WifiOff className="w-3.5 h-3.5 text-amber-400" />
-                <span className="text-amber-300 font-medium">
-                  {pendingCount > 0 ? `Offline (${pendingCount} pending)` : 'Offline'}
-                </span>
-              </>
-            ) : pendingCount > 0 ? (
-              <>
-                <span className="w-2 h-2 rounded-full bg-amber-400" />
-                <Wifi className="w-3.5 h-3.5 text-slate-300" />
-                <span className="text-slate-300 font-medium">Online ({pendingCount} pending)</span>
-              </>
-            ) : isSyncing ? (
-              <>
-                <span className="w-2 h-2 rounded-full bg-teal-400 animate-pulse" />
-                <RefreshCw className="w-3.5 h-3.5 text-teal-400 animate-spin" />
-                <span className="text-teal-300 font-medium">Syncing...</span>
-              </>
-            ) : (
-              <>
-                <span className="w-2 h-2 rounded-full bg-emerald-500" />
-                <Wifi className="w-3.5 h-3.5 text-slate-300" />
-                <span className="text-slate-300 font-medium">Online</span>
-              </>
-            )}
-
-            <button
-              onClick={handleManualSync}
-              disabled={isSyncing}
-              className="p-1 hover:bg-slate-800 rounded text-slate-400 hover:text-white transition cursor-pointer"
-              title="Synchronize local changes"
-              aria-label="Synchronize data"
-            >
-              <RefreshCw className={`w-3 h-3 ${isSyncing ? 'animate-spin text-teal-400' : ''}`} />
-            </button>
-          </div>
-        </div>
+        {/* Center: local POS server vs cloud sync status (kept separate) */}
+        <SyncIndicator currentUser={currentUser} onRefreshCache={handleManualSync} isRefreshing={isSyncing} />
 
         {/* Right: Actions & User Menu */}
         <div className="flex items-center gap-2 sm:gap-3">

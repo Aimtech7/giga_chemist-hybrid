@@ -4,6 +4,8 @@ import { db, getSettings, saveSettings, clearCachedServerData } from '../../db/d
 import { apiFetch } from '../../services/http';
 import { syncFromLocalApiToDexie } from '../../services/syncEngine';
 import type { PharmacySettings, User } from '../../types';
+import { EmailReportsPanel } from './EmailReportsPanel';
+import { SystemHealthPanel } from './SystemHealthPanel';
 
 interface SettingsViewProps {
   currentUser: User | null;
@@ -16,6 +18,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ currentUser, setting
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
   const [isResetting, setIsResetting] = useState(false);
+  const [tab, setTab] = useState<'general' | 'email' | 'health'>('general');
 
   const isAdmin = currentUser?.role === 'ADMIN';
 
@@ -150,6 +153,19 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ currentUser, setting
         </div>
       )}
 
+      <div className="px-4 pt-3 flex gap-1 text-xs shrink-0">
+        {([['general', 'General'], ['email', 'Email Reports'], ['health', 'System Health']] as const).map(([id, label]) => (
+          <button key={id} type="button" onClick={() => setTab(id)}
+            className={`px-3 py-1.5 rounded-t border border-b-0 font-semibold cursor-pointer ${tab === id ? 'bg-white text-slate-900 border-slate-200' : 'bg-slate-100 text-slate-500 border-transparent hover:text-slate-800'}`}>
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {tab === 'email' && <EmailReportsPanel />}
+      {tab === 'health' && <SystemHealthPanel />}
+
+      {tab === 'general' && (
       <form onSubmit={handleSave} className="flex-1 overflow-auto p-4 md:p-6 space-y-4 text-xs max-w-4xl">
         {/* Pharmacy Details */}
         <div className="bg-white p-5 rounded border border-slate-200 space-y-4">
@@ -322,6 +338,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ currentUser, setting
           </button>
         </div>
       </form>
+      )}
     </div>
   );
 };

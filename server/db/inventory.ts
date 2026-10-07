@@ -2,6 +2,8 @@ import crypto from 'crypto';
 import type pg from 'pg';
 import { pgPool, cleanUuid, HttpError, requireUuid, withTransaction } from './client';
 import { ensureDevice } from './devices';
+import { collectAudit, collectMovement } from '../sync/collector';
+import { enqueueSyncEvent, rowJson } from '../sync/outbox';
 import type { InventoryMovement } from '../../src/types';
 
 export async function getAllMovements(): Promise<InventoryMovement[]> {
@@ -166,6 +168,12 @@ export async function insertMovement(
     m.movement_type, m.reason, m.reference_id || null, m.notes || null,
     cleanUuid(actor.user_id), deviceId, localDateStr(), now,
   ]);
+  collectMovement(client, {
+    id, medicine_id: m.medicine_id, batch_id: m.batch_id, previous_quantity: m.previous_quantity,
+    new_quantity: m.new_quantity, delta: m.new_quantity - m.previous_quantity, movement_type: m.movement_type,
+    reason: m.reason, reference_id: m.reference_id || null, notes: m.notes || null,
+    user_id: cleanUuid(actor.user_id), device_id: deviceId, occurred_at: new Date(now).toISOString(),
+  });
   return { id, batch_id: m.batch_id, previous_quantity: m.previous_quantity, new_quantity: m.new_quantity, delta: m.new_quantity - m.previous_quantity };
 }
 
@@ -175,18 +183,25 @@ export async function insertAudit(
   actor: StockActor,
   deviceId: string
 ) {
+  const auditId = crypto.randomUUID();
+  const at = Date.now();
   await client.query(`
     INSERT INTO audit_logs (
       id, user_id, user_name, role, action, entity, entity_id,
       previous_value, new_value, device_id, timestamp
     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
   `, [
-    crypto.randomUUID(), cleanUuid(actor.user_id), actor.user_name || 'Admin', actor.role || 'ADMIN',
+    auditId, cleanUuid(actor.user_id), actor.user_name || 'Admin', actor.role || 'ADMIN',
     a.action, a.entity, a.entity_id,
     a.previous_value !== undefined ? JSON.stringify(a.previous_value) : null,
     a.new_value !== undefined ? JSON.stringify(a.new_value) : null,
-    deviceId, Date.now(),
+    deviceId, at,
   ]);
+  collectAudit(client, {
+    id: auditId, user_id: cleanUuid(actor.user_id), user_name: actor.user_name || 'Admin', role: actor.role || 'ADMIN',
+    action: a.action, entity: a.entity, entity_id: a.entity_id, previous_value: a.previous_value ?? null,
+    new_value: a.new_value ?? null, device_id: deviceId, occurred_at: new Date(at).toISOString(),
+  });
 }
 
 /** Normalizes a medicine_batches row into the client MedicineBatch shape. */
@@ -311,6 +326,11 @@ export async function adminSetStock(params: AdminSetStockParams) {
         movement_id: movement.id,
       },
     }, params, deviceId);
+    await enqueueSyncEvent(client, {
+      event_type: 'STOCK_SET', entity_type: 'medicine', entity_id: medicineId, operation: 'ADJUST',
+      data: { medicine_id: medicineId, batch_id: saved.id, reason: params.reason || 'SET_EXACT_STOCK', notes: params.notes || null },
+      actor: params, device_id: deviceId,
+    });
 
     return {
       success: true,
@@ -424,6 +444,11 @@ export async function adminAddStock(params: AdminAddStockParams) {
         movement_id: movement.id,
       },
     }, params, deviceId);
+    await enqueueSyncEvent(client, {
+      event_type: 'STOCK_ADDED', entity_type: 'medicine', entity_id: medicineId, operation: 'ADJUST',
+      data: { medicine_id: medicineId, batch_id: saved.id, quantity_added: quantity, notes: params.notes || null },
+      actor: params, device_id: deviceId,
+    });
 
     return {
       success: true,
@@ -493,6 +518,11 @@ export async function adminRemoveStock(params: AdminRemoveStockParams) {
         movement_id: movement.id,
       },
     }, params, deviceId);
+    await enqueueSyncEvent(client, {
+      event_type: 'STOCK_REMOVED', entity_type: 'medicine', entity_id: medicineId, operation: 'ADJUST',
+      data: { medicine_id: medicineId, batch_id: batchId, quantity_removed: quantity, reason, notes: params.notes || null },
+      actor: params, device_id: deviceId,
+    });
 
     return {
       success: true,
@@ -542,6 +572,11 @@ export async function adminEditBatchExpiry(params: AdminEditExpiryParams) {
       previous_value: { expiry_date: previous.expiry_date, expiry_status: previous.expiry_status, status: previous.status },
       new_value: { expiry_date: expiryDate, expiry_status: expiryStatus, status: newStatus },
     }, params, deviceId);
+    await enqueueSyncEvent(client, {
+      event_type: 'BATCH_EXPIRY_CHANGED', entity_type: 'medicine_batch', entity_id: batchId, operation: 'UPDATE',
+      data: async () => ({ batch: await rowJson(client, 'medicine_batches', batchId) }),
+      actor: params, device_id: deviceId,
+    });
 
     return {
       success: true,
@@ -676,6 +711,11 @@ export async function adminPhysicalStockCount(params: AdminPhysicalStockCountPar
       previous_value: { current_stock: previousTotal },
       new_value: { current_stock: newTotal, delta: newTotal - previousTotal, batches: movements, notes },
     }, params, deviceId);
+    await enqueueSyncEvent(client, {
+      event_type: 'PHYSICAL_COUNT', entity_type: 'medicine', entity_id: medicineId, operation: 'COUNT',
+      data: { medicine_id: medicineId, notes: notes || null },
+      actor: params, device_id: deviceId,
+    });
 
     return {
       success: true,

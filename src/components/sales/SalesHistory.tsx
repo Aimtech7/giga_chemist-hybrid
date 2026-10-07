@@ -89,14 +89,61 @@ export const SalesHistory: React.FC<SalesHistoryProps> = ({ currentUser, setting
     }
   };
 
+  // Server-side pagination/search over ALL sales in PostgreSQL (not the browser's cached subset).
+  const PAGE_SIZE = 50;
+  const [page, setPage] = useState(1);
+  const [pageInfo, setPageInfo] = useState({ total: 0, totalPages: 1 });
+  const [startDate, setStartDate] = useState('');
+  const [endDate, setEndDate] = useState('');
+  const [paymentFilter, setPaymentFilter] = useState('');
+  const [priceModeFilter, setPriceModeFilter] = useState('');
+  const [statusFilter, setStatusFilter] = useState('');
+  const [cashierFilter, setCashierFilter] = useState('');
+  const [cashierOptions, setCashierOptions] = useState<{ id: string; name: string }[]>([]);
+  const [listNotice, setListNotice] = useState<string | null>(null);
+  const nairobiToday = () => new Date().toLocaleDateString('en-CA', { timeZone: 'Africa/Nairobi' });
+
   const loadSales = async () => {
-    const list = await db.sales.reverse().sortBy('timestamp');
-    setSales(list);
+    const qs = new URLSearchParams({ page: String(page), limit: String(PAGE_SIZE) });
+    let from = startDate;
+    let to = endDate;
+    if (isCashierUser && cashierFilterMode === 'today') from = to = nairobiToday();
+    if (from) qs.set('startDate', from);
+    if (to) qs.set('endDate', to);
+    if (search.trim()) qs.set('search', search.trim());
+    if (paymentFilter) qs.set('paymentMethod', paymentFilter);
+    if (priceModeFilter) qs.set('priceMode', priceModeFilter);
+    if (statusFilter) qs.set('status', statusFilter);
+    if (!isCashierUser && cashierFilter) qs.set('cashierId', cashierFilter);
+    try {
+      const r = await apiFetch<{ sales: Sale[]; total: number; totalPages: number }>(`/api/sales?${qs}`);
+      setSales(r.sales);
+      setPageInfo({ total: r.total, totalPages: r.totalPages });
+      setListNotice(null);
+    } catch (err: any) {
+      // Server unreachable: show this browser's cached recent sales, clearly marked as incomplete.
+      const cached = await db.sales.reverse().sortBy('timestamp');
+      setSales(cached.slice(0, PAGE_SIZE));
+      setPageInfo({ total: cached.length, totalPages: 1 });
+      setListNotice(`${err?.message || 'POS server unreachable.'} Showing cached recent sales only (may be incomplete).`);
+    }
     await loadSummary();
   };
 
   useEffect(() => {
-    loadSales();
+    const t = setTimeout(() => void loadSales(), search ? 350 : 0);
+    return () => clearTimeout(t);
+  }, [currentUser, page, search, startDate, endDate, paymentFilter, priceModeFilter, statusFilter, cashierFilter, cashierFilterMode]);
+
+  useEffect(() => {
+    setPage(1);
+  }, [search, startDate, endDate, paymentFilter, priceModeFilter, statusFilter, cashierFilter, cashierFilterMode]);
+
+  useEffect(() => {
+    if (isCashierUser) return;
+    apiFetch<{ id: string; name: string; role: string }[]>('/api/users')
+      .then((u) => setCashierOptions(u.map((x) => ({ id: x.id, name: x.name }))))
+      .catch(() => setCashierOptions([]));
   }, [currentUser]);
 
   const handleOpenReturn = async (s: Sale) => {
@@ -251,31 +298,9 @@ export const SalesHistory: React.FC<SalesHistoryProps> = ({ currentUser, setting
     downloadCSV(`giga-chemist-sales-${new Date().toISOString().split('T')[0]}.csv`, headers, rows);
   };
 
-  // Filter sales based on role and cashier filter modes
-  const todayStr = new Date().toISOString().split('T')[0];
 
-  const filteredSales = sales.filter((s) => {
-    if (isCashierUser) {
-      if (cashierFilterMode === 'today') {
-        const isToday = s.date === todayStr;
-        const isMine = !s.cashier_id || s.cashier_id === currentUser?.id;
-        if (!isToday || !isMine) return false;
-      } else if (cashierFilterMode === 'all_mine') {
-        const isMine = !s.cashier_id || s.cashier_id === currentUser?.id;
-        if (!isMine) return false;
-      }
-    }
-
-    if (!search.trim()) return true;
-    const q = search.toLowerCase();
-    return (
-      s.sale_number.toLowerCase().includes(q) ||
-      s.receipt_number.toLowerCase().includes(q) ||
-      s.cashier_name.toLowerCase().includes(q) ||
-      (s.customer_name && s.customer_name.toLowerCase().includes(q)) ||
-      (s.payment_reference && s.payment_reference.toLowerCase().includes(q))
-    );
-  });
+  // Role scope and filters are applied by the server (a Cashier only ever receives own sales).
+  const filteredSales = sales;
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden bg-slate-50">
@@ -413,8 +438,50 @@ export const SalesHistory: React.FC<SalesHistoryProps> = ({ currentUser, setting
             className="w-full pl-9 pr-3 py-1.5 border border-slate-300 rounded text-xs focus:ring-1 focus:ring-teal-700 focus:border-teal-700 focus:outline-hidden"
           />
         </div>
-        <div className="text-slate-500 font-medium">{filteredSales.length} transactions</div>
+        <div className="text-slate-500 font-medium">{pageInfo.total} transactions</div>
       </div>
+
+      <div className="px-3 py-2 bg-white border-b border-slate-200 flex flex-wrap items-center gap-2 text-xs shrink-0">
+        {!(isCashierUser && cashierFilterMode === 'today') && (
+          <>
+            <label className="flex items-center gap-1">From <input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} className="border border-slate-300 rounded px-1.5 py-1" /></label>
+            <label className="flex items-center gap-1">To <input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} className="border border-slate-300 rounded px-1.5 py-1" /></label>
+          </>
+        )}
+        <select value={paymentFilter} onChange={(e) => setPaymentFilter(e.target.value)} className="border border-slate-300 rounded px-1.5 py-1" aria-label="Payment method">
+          <option value="">All payments</option>
+          <option value="Cash">Cash</option>
+          <option value="M-Pesa">M-Pesa</option>
+          <option value="Mixed">Mixed</option>
+          <option value="Card">Card</option>
+          <option value="Bank">Bank</option>
+        </select>
+        <select value={priceModeFilter} onChange={(e) => setPriceModeFilter(e.target.value)} className="border border-slate-300 rounded px-1.5 py-1" aria-label="Price mode">
+          <option value="">Retail &amp; Wholesale</option>
+          <option value="RETAIL">Retail</option>
+          <option value="WHOLESALE">Wholesale</option>
+        </select>
+        <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} className="border border-slate-300 rounded px-1.5 py-1" aria-label="Status">
+          <option value="">All statuses</option>
+          <option value="not_voided">Not voided</option>
+          <option value="completed">Completed</option>
+          <option value="partially_returned">Partially returned</option>
+          <option value="returned">Returned</option>
+          <option value="voided">Voided</option>
+        </select>
+        {!isCashierUser && (
+          <select value={cashierFilter} onChange={(e) => setCashierFilter(e.target.value)} className="border border-slate-300 rounded px-1.5 py-1" aria-label="Cashier">
+            <option value="">All cashiers</option>
+            {cashierOptions.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+          </select>
+        )}
+        <div className="ml-auto flex items-center gap-1">
+          <button type="button" disabled={page <= 1} onClick={() => setPage(page - 1)} className="px-2 py-1 border border-slate-300 rounded disabled:opacity-40 cursor-pointer">‹ Prev</button>
+          <span className="text-slate-600">Page {page} of {pageInfo.totalPages}</span>
+          <button type="button" disabled={page >= pageInfo.totalPages} onClick={() => setPage(page + 1)} className="px-2 py-1 border border-slate-300 rounded disabled:opacity-40 cursor-pointer">Next ›</button>
+        </div>
+      </div>
+      {listNotice && <div className="mx-4 mt-2 p-2 rounded border border-amber-300 bg-amber-50 text-amber-800 text-xs">{listNotice}</div>}
 
       {/* Sales Table */}
       <div className="flex-1 overflow-auto p-4">

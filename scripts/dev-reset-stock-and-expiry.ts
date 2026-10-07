@@ -37,8 +37,21 @@ async function main() {
   if (process.env.ALLOW_DEV_STOCK_RESET !== 'true') refuse('ALLOW_DEV_STOCK_RESET=true is not set.');
   if (!process.argv.includes(CONFIRM_FLAG)) refuse(`Missing explicit confirmation flag ${CONFIRM_FLAG}.`);
   if (process.env.DB_NAME && process.env.DB_NAME !== REQUIRED_DB) refuse(`DB_NAME is "${process.env.DB_NAME}", not ${REQUIRED_DB}.`);
+  // The connection is taken from LOCAL_DATABASE_URL / DATABASE_URL before DB_NAME, so the database
+  // that WOULD be used is checked here, before any connection is opened.
+  const config: any = getDatabaseConnectionConfig();
+  let targetDb = config.database as string | undefined;
+  if (config.connectionString) {
+    try {
+      targetDb = decodeURIComponent(new URL(config.connectionString).pathname.replace(/^\//, ''));
+    } catch {
+      refuse('The database connection string cannot be parsed.');
+    }
+  }
+  if (targetDb === 'giga_chemist') refuse('Target is the PRODUCTION pharmacy database "giga_chemist". This script never runs there.');
+  if (targetDb !== REQUIRED_DB) refuse(`Configured database is "${targetDb}", not ${REQUIRED_DB}.`);
 
-  const pool = new pg.Pool(getDatabaseConnectionConfig());
+  const pool = new pg.Pool(config);
   const client = await pool.connect();
   try {
     const db = (await client.query('SELECT current_database() AS db')).rows[0].db;

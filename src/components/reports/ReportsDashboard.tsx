@@ -15,9 +15,41 @@ import {
   ArrowDownRight,
   TrendingDown,
 } from 'lucide-react';
-import { db } from '../../db/dexie';
+import { apiFetch } from '../../services/http';
 import { downloadCSV } from '../../services/exportUtils';
-import type { Sale, CustomerReturn, Expense, PharmacySettings, User } from '../../types';
+import type { Sale, PharmacySettings, User } from '../../types';
+
+interface ServerReport {
+  range: string;
+  start: string;
+  end: string;
+  today: string;
+  grossSales: number;
+  discounts: number;
+  refunds: number;
+  refundCount: number;
+  netSales: number;
+  cash: number;
+  mpesa: number;
+  tenders: Record<string, number>;
+  voids: { count: number; total: number };
+  transactionCount: number;
+  unitsSold: number;
+  unitsReturned: number;
+  netCogs: number;
+  grossProfit: number;
+  grossMarginPercent: number;
+  operatingExpenses: number;
+  netProfit: number;
+  netMarginPercent: number;
+  purchases: { count: number; total: number };
+  expenses: any[];
+  expenseCategoryStats: Record<string, number>;
+  cashierStats: Record<string, { count: number; gross: number; refunds: number; net: number; profit: number }>;
+  medicines: { name: string; quantity: number; revenue: number; profit: number }[];
+  returns: any[];
+  stock: { totalMedicines: number; inStock: number; lowStock: number; outOfStock: number };
+}
 
 interface ReportsDashboardProps {
   currentUser: User | null;
@@ -27,141 +59,62 @@ interface ReportsDashboardProps {
 type ReportTab = 'summary' | 'sales' | 'returns' | 'expenses' | 'medicines' | 'cashiers' | 'tenders';
 
 export const ReportsDashboard: React.FC<ReportsDashboardProps> = ({ currentUser, settings }) => {
-  const [sales, setSales] = useState<Sale[]>([]);
-  const [returns, setReturns] = useState<CustomerReturn[]>([]);
-  const [expenses, setExpenses] = useState<Expense[]>([]);
-  const [dateRange, setDateRange] = useState<'today' | 'week' | 'month' | 'all'>('month');
+  // All totals come from PostgreSQL (GET /api/reports/summary) over the FULL history, on
+  // Africa/Nairobi business days — never from the browser's cached sales.
+  const [dateRange, setDateRange] = useState<'today' | 'week' | 'month' | 'custom'>('month');
+  const [customStart, setCustomStart] = useState('');
+  const [customEnd, setCustomEnd] = useState('');
   const [activeTab, setActiveTab] = useState<ReportTab>('summary');
+  const [report, setReport] = useState<ServerReport | null>(null);
+  const [filteredSales, setFilteredSales] = useState<Sale[]>([]);
+  const [salesTotal, setSalesTotal] = useState(0);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    async function loadData() {
-      const [allSales, allReturns, allExpenses] = await Promise.all([
-        db.sales.toArray(),
-        db.customer_returns.toArray(),
-        db.expenses.toArray(),
-      ]);
-      setSales(allSales);
-      setReturns(allReturns);
-      setExpenses(allExpenses);
-    }
-    loadData();
-  }, []);
-
-  const now = new Date();
-  const todayStr = now.toISOString().split('T')[0];
-
-  const isWithinDateRange = (dateStr: string) => {
-    if (dateRange === 'all') return true;
-    if (dateRange === 'today') return dateStr === todayStr;
-
-    const itemDate = new Date(dateStr);
-    const diffDays = Math.ceil((now.getTime() - itemDate.getTime()) / (1000 * 60 * 60 * 24));
-    if (dateRange === 'week') return diffDays <= 7;
-    if (dateRange === 'month') return diffDays <= 30;
-    return true;
-  };
-
-  // 1. Filtered Non-Voided Completed/Partially Returned Sales
-  const filteredSales = sales.filter((s) => {
-    if (s.status === 'voided') return false;
-    return isWithinDateRange(s.date);
-  });
-
-  // 2. Filtered Customer Returns
-  const filteredReturns = returns.filter((r) => isWithinDateRange(r.date));
-
-  // 3. Filtered Operating Expenses
-  const filteredExpenses = expenses.filter((e) => isWithinDateRange(e.date));
-
-  // 4. Financial Calculations (Phase 2 Standardized Formulas)
-  const grossSales = filteredSales.reduce((acc, s) => acc + s.total, 0);
-  const totalRefunds = filteredReturns.reduce((acc, r) => acc + (r.refund_amount || 0), 0);
-  const netSales = Math.max(0, grossSales - totalRefunds);
-
-  // COGS based on historical unit cost snapshots, adjusted for returns
-  const grossCogs = filteredSales.reduce((acc, s) => acc + (s.cost_total || 0), 0);
-  const returnedCogs = filteredReturns.reduce(
-    (acc, r) => acc + (r.quantity * (r.cost_price_snapshot || 0)),
-    0
-  );
-  const netCogs = Math.max(0, grossCogs - returnedCogs);
-
-  const grossProfit = netSales - netCogs;
-  const operatingExpenses = filteredExpenses.reduce((acc, e) => acc + (e.amount || 0), 0);
-  const netProfit = grossProfit - operatingExpenses;
-
-  const grossMarginPercent = netSales > 0 ? (grossProfit / netSales) * 100 : 0;
-  const netMarginPercent = netSales > 0 ? (netProfit / netSales) * 100 : 0;
-
-  // Breakdown by Cashier (Net of returns where recorded)
-  const cashierStats: Record<string, { count: number; gross: number; refunds: number; net: number; profit: number }> = {};
-  for (const s of filteredSales) {
-    if (!cashierStats[s.cashier_name]) {
-      cashierStats[s.cashier_name] = { count: 0, gross: 0, refunds: 0, net: 0, profit: 0 };
-    }
-    cashierStats[s.cashier_name].count++;
-    cashierStats[s.cashier_name].gross += s.total;
-    cashierStats[s.cashier_name].net += s.total;
-    cashierStats[s.cashier_name].profit += (s.gross_profit || (s.total - (s.cost_total || 0)));
-  }
-  for (const r of filteredReturns) {
-    if (cashierStats[r.user_name]) {
-      cashierStats[r.user_name].refunds += r.refund_amount;
-      cashierStats[r.user_name].net -= r.refund_amount;
-      cashierStats[r.user_name].profit -= (r.refund_amount - (r.quantity * (r.cost_price_snapshot || 0)));
-    }
-  }
-
-  // Breakdown by Medicine (Net Velocity)
-  const medStats: Record<string, { name: string; quantity: number; revenue: number; profit: number }> = {};
-  for (const s of filteredSales) {
-    for (const it of s.items) {
-      if (!medStats[it.medicine_id]) {
-        medStats[it.medicine_id] = { name: it.medicine_name, quantity: 0, revenue: 0, profit: 0 };
+    if (dateRange === 'custom' && (!customStart || !customEnd)) return;
+    let alive = true;
+    (async () => {
+      setLoading(true);
+      try {
+        const qs = dateRange === 'custom' ? `range=custom&start=${customStart}&end=${customEnd}` : `range=${dateRange}`;
+        const r = await apiFetch<ServerReport>(`/api/reports/summary?${qs}`);
+        const page = await apiFetch<{ sales: Sale[]; total: number }>(
+          `/api/sales?page=1&limit=200&status=not_voided&startDate=${r.start}&endDate=${r.end}`
+        );
+        if (!alive) return;
+        setReport(r);
+        setFilteredSales(page.sales);
+        setSalesTotal(page.total);
+        setError(null);
+      } catch (err: any) {
+        if (alive) setError(err?.message || 'Report unavailable: the POS server could not be reached.');
+      } finally {
+        if (alive) setLoading(false);
       }
-      medStats[it.medicine_id].quantity += it.quantity;
-      medStats[it.medicine_id].revenue += it.total;
-      medStats[it.medicine_id].profit += (it.total - it.quantity * it.cost_price_snapshot);
-    }
-  }
-  for (const r of filteredReturns) {
-    if (medStats[r.medicine_id]) {
-      medStats[r.medicine_id].quantity -= r.quantity;
-      medStats[r.medicine_id].revenue -= r.refund_amount;
-      medStats[r.medicine_id].profit -= (r.refund_amount - r.quantity * (r.cost_price_snapshot || 0));
-    }
-  }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [dateRange, customStart, customEnd]);
 
-  const sortedMeds = Object.values(medStats).sort((a, b) => b.quantity - a.quantity);
-
-  // Breakdown by Payment Tender
-  const tenderStats: Record<string, number> = {
-    Cash: 0,
-    'M-Pesa': 0,
-    Card: 0,
-    Bank: 0,
-  };
-  for (const s of filteredSales) {
-    if (s.payment_method === 'Mixed' && s.split_payments) {
-      for (const sp of s.split_payments) {
-        tenderStats[sp.method] = (tenderStats[sp.method] || 0) + sp.amount;
-      }
-    } else {
-      tenderStats[s.payment_method] = (tenderStats[s.payment_method] || 0) + s.total;
-    }
-  }
-  for (const r of filteredReturns) {
-    const method = (r.payment_method as string) || 'Cash';
-    if (tenderStats[method] !== undefined) {
-      tenderStats[method] = Math.max(0, tenderStats[method] - r.refund_amount);
-    }
-  }
-
-  // Breakdown by Expense Category
-  const expenseCategoryStats: Record<string, number> = {};
-  for (const e of filteredExpenses) {
-    expenseCategoryStats[e.category] = (expenseCategoryStats[e.category] || 0) + e.amount;
-  }
+  const todayStr = report?.today || new Date().toISOString().split('T')[0];
+  const grossSales = report?.grossSales || 0;
+  const totalRefunds = report?.refunds || 0;
+  const netSales = report?.netSales || 0;
+  const netCogs = report?.netCogs || 0;
+  const grossProfit = report?.grossProfit || 0;
+  const operatingExpenses = report?.operatingExpenses || 0;
+  const netProfit = report?.netProfit || 0;
+  const grossMarginPercent = report?.grossMarginPercent || 0;
+  const netMarginPercent = report?.netMarginPercent || 0;
+  const cashierStats = report?.cashierStats || {};
+  const sortedMeds = report?.medicines || [];
+  const tenderStats: Record<string, number> = report?.tenders || { Cash: 0, 'M-Pesa': 0, Card: 0, Bank: 0 };
+  const expenseCategoryStats = report?.expenseCategoryStats || {};
+  const filteredReturns = (report?.returns || []) as any[];
+  const filteredExpenses = (report?.expenses || []) as any[];
+  void currentUser;
 
   const handleExportCSV = () => {
     if (activeTab === 'medicines') {
@@ -250,7 +203,7 @@ export const ReportsDashboard: React.FC<ReportsDashboardProps> = ({ currentUser,
                 dateRange === 'week' ? 'bg-slate-900 text-white' : 'bg-white text-slate-700 hover:bg-slate-100'
               }`}
             >
-              7 Days
+              This Week
             </button>
             <button
               onClick={() => setDateRange('month')}
@@ -258,17 +211,25 @@ export const ReportsDashboard: React.FC<ReportsDashboardProps> = ({ currentUser,
                 dateRange === 'month' ? 'bg-slate-900 text-white' : 'bg-white text-slate-700 hover:bg-slate-100'
               }`}
             >
-              30 Days
+              This Month
             </button>
             <button
-              onClick={() => setDateRange('all')}
+              onClick={() => setDateRange('custom')}
               className={`px-3 py-1 font-semibold ${
-                dateRange === 'all' ? 'bg-slate-900 text-white' : 'bg-white text-slate-700 hover:bg-slate-100'
+                dateRange === 'custom' ? 'bg-slate-900 text-white' : 'bg-white text-slate-700 hover:bg-slate-100'
               }`}
             >
-              All Time
+              Custom
             </button>
           </div>
+
+          {dateRange === 'custom' && (
+            <div className="flex items-center gap-1 text-xs">
+              <input type="date" value={customStart} onChange={(e) => setCustomStart(e.target.value)} className="border border-slate-300 rounded px-1.5 py-1" />
+              <span>to</span>
+              <input type="date" value={customEnd} onChange={(e) => setCustomEnd(e.target.value)} className="border border-slate-300 rounded px-1.5 py-1" />
+            </div>
+          )}
 
           <button
             onClick={handleExportCSV}
@@ -280,6 +241,23 @@ export const ReportsDashboard: React.FC<ReportsDashboardProps> = ({ currentUser,
         </div>
       </div>
 
+      <div className="px-4 py-2 bg-slate-50 border-b border-slate-200 text-[11px] text-slate-600 flex flex-wrap gap-x-4 gap-y-1 shrink-0">
+        <span>Period: <b>{report ? `${report.start} → ${report.end}` : '—'}</b> (Africa/Nairobi business days, all history from PostgreSQL)</span>
+        {loading && <span className="text-teal-700 font-semibold">Loading…</span>}
+        {error && <span className="text-rose-700 font-semibold">{error}</span>}
+        {report && (
+          <>
+            <span>Cash <b>{settings.currency} {report.cash.toFixed(2)}</b></span>
+            <span>M-Pesa <b>{settings.currency} {report.mpesa.toFixed(2)}</b></span>
+            <span>Discounts <b>{settings.currency} {report.discounts.toFixed(2)}</b></span>
+            <span>Voids <b>{report.voids.count}</b> ({settings.currency} {report.voids.total.toFixed(2)})</span>
+            <span>Purchases <b>{report.purchases.count}</b> ({settings.currency} {report.purchases.total.toFixed(2)})</span>
+            <span>Units sold <b>{report.unitsSold}</b> / returned <b>{report.unitsReturned}</b></span>
+            <span>Low stock <b>{report.stock.lowStock}</b> · Out of stock <b>{report.stock.outOfStock}</b></span>
+          </>
+        )}
+      </div>
+
       {/* KPI Cards Row (Standardized Phase 2 Accounting) */}
       <div className="p-4 grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3 bg-white border-b border-slate-200 shrink-0">
         <div className="p-2.5 rounded bg-slate-50 border border-slate-200">
@@ -287,7 +265,7 @@ export const ReportsDashboard: React.FC<ReportsDashboardProps> = ({ currentUser,
           <div className="text-lg font-bold font-mono text-slate-900 mt-0.5">
             {settings.currency} {grossSales.toFixed(2)}
           </div>
-          <div className="text-[10px] text-slate-400 mt-0.5">{filteredSales.length} sales</div>
+          <div className="text-[10px] text-slate-400 mt-0.5">{report?.transactionCount ?? 0} sales · {report?.unitsSold ?? 0} units</div>
         </div>
 
         <div className="p-2.5 rounded bg-rose-50 border border-rose-200">
@@ -449,6 +427,9 @@ export const ReportsDashboard: React.FC<ReportsDashboardProps> = ({ currentUser,
         {/* TAB 1: ALL SALES TRANSACTIONS */}
         {activeTab === 'sales' && (
           <div className="bg-white rounded border border-slate-200 overflow-hidden">
+            <div className="px-3 py-2 text-[11px] text-slate-500 border-b border-slate-100">
+              Showing the latest {filteredSales.length} of {salesTotal} non-voided sales in this period (totals above include all of them). Use Sales History to page through every sale.
+            </div>
             <table className="w-full text-left text-xs text-slate-700">
               <thead className="bg-slate-50 uppercase text-[10px] font-semibold text-slate-600 border-b border-slate-200">
                 <tr>

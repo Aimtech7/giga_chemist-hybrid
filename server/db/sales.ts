@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import { pgPool, HttpError, requireUuid, withTransaction, businessNow, type Queryable } from './client';
 import { ensureDevice } from './devices';
 import { recordAuditLog } from './audit';
+import { enqueueSyncEvent, rowJson, rowsJson } from '../sync/outbox';
 import {
   deriveBatchStatus,
   insertMovement,
@@ -175,7 +176,15 @@ export interface SalesQueryParams {
   startDate?: string;
   endDate?: string;
   cashierId?: string;
+  /** Cash | M-Pesa | Card | Bank | Mixed: matches the sale tender or any split payment line. */
+  paymentMethod?: string;
+  customerId?: string;
+  priceMode?: string;
+  /** completed | partially_returned | returned | voided | not_voided */
+  status?: string;
 }
+
+const SALE_STATUSES = ['completed', 'partially_returned', 'returned', 'voided'];
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -203,6 +212,29 @@ export async function getAllSales(params?: SalesQueryParams): Promise<Sale[] | P
   if (params?.cashierId) {
     values.push(requireUuid(params.cashierId, 'cashierId'));
     conditions.push(`s.cashier_id = $${values.length}`);
+  }
+  if (params?.paymentMethod) {
+    if (!PAYMENT_METHODS.includes(params.paymentMethod as PaymentMethod)) throw new HttpError(400, `paymentMethod must be one of ${PAYMENT_METHODS.join(', ')}.`);
+    values.push(params.paymentMethod);
+    conditions.push(`(s.payment_method = $${values.length} OR EXISTS (SELECT 1 FROM payments px WHERE px.sale_id = s.id AND px.method = $${values.length}))`);
+  }
+  if (params?.customerId) {
+    values.push(requireUuid(params.customerId, 'customerId'));
+    conditions.push(`s.customer_id = $${values.length}`);
+  }
+  if (params?.priceMode) {
+    const mode = requirePriceMode(params.priceMode, 'priceMode');
+    values.push(mode);
+    // Legacy rows without price_mode are retail sales.
+    conditions.push(`COALESCE(s.price_mode, 'RETAIL') = $${values.length}`);
+  }
+  if (params?.status) {
+    if (params.status === 'not_voided') conditions.push(`s.status <> 'voided'`);
+    else {
+      if (!SALE_STATUSES.includes(params.status)) throw new HttpError(400, `status must be one of ${SALE_STATUSES.join(', ')}, not_voided.`);
+      values.push(params.status);
+      conditions.push(`s.status = $${values.length}`);
+    }
   }
   const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
   const from = `FROM sales s LEFT JOIN users u ON s.cashier_id = u.id LEFT JOIN customers c ON s.customer_id = c.id`;
@@ -589,6 +621,23 @@ export async function checkoutSale(
       client
     );
 
+    await enqueueSyncEvent(client, {
+      event_type: 'SALE_COMPLETED',
+      entity_type: 'sale',
+      entity_id: saleId,
+      operation: 'CREATE',
+      data: async () => ({
+        sale: await rowJson(client, 'sales', saleId),
+        items: await rowsJson(client, 'sale_items', 'sale_id', saleId),
+        payments: await rowsJson(client, 'payments', 'sale_id', saleId),
+        customer: customerId ? await rowJson(client, 'customers', customerId) : null,
+        cashier_name: actor.user_name,
+      }),
+      actor,
+      device_id: deviceId,
+      business_ref: receiptNumber,
+    });
+
     const sale = (await getSaleById(saleId, client))!;
     return {
       success: true as const,
@@ -688,6 +737,19 @@ export async function voidSale(saleIdRaw: string, reasonRaw: unknown, actor: Sal
       },
       client
     );
+    await enqueueSyncEvent(client, {
+      event_type: 'SALE_VOIDED',
+      entity_type: 'sale',
+      entity_id: saleId,
+      operation: 'VOID',
+      data: async () => ({
+        sale: await rowJson(client, 'sales', saleId),
+        customer: sale.customer_id ? await rowJson(client, 'customers', sale.customer_id) : null,
+      }),
+      actor,
+      device_id: deviceId,
+      business_ref: sale.receipt_number,
+    });
 
     return {
       success: true,

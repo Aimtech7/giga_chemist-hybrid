@@ -1,7 +1,7 @@
 {
   "name": "react-example",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.2.0",
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
@@ -24,7 +24,14 @@
     "migrate:validate": "tsx scripts/migrate-chemist-pos/validate-migration.ts",
     "supabase:inspect": "tsx scripts/inspect-supabase.ts",
     "supabase:load": "tsx scripts/load-supabase-data.ts",
-    "test:integration": "tsx scripts/integration/run.ts"
+    "test:integration": "tsx scripts/integration/run.ts",
+    "test:hybrid": "tsx scripts/integration/run-hybrid.ts",
+    "cloud:emulator": "tsx scripts/cloud-emulator.ts",
+    "sync:bootstrap": "tsx scripts/sync-bootstrap.ts",
+    "env:check:online": "tsx scripts/validate-online-env.ts",
+    "backup": "tsx scripts/backup/backup-db.ts",
+    "target:rehearse": "tsx scripts/target/rehearse-migration.ts",
+    "test:ops": "tsx scripts/integration/run-ops.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
@@ -37,6 +44,7 @@
     "express": "^4.21.2",
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",
+    "nodemailer": "^6.10.1",
     "pg": "^8.23.1",
     "react": "^19.0.1",
     "react-dom": "^19.0.1",
@@ -49,6 +57,7 @@
   "devDependencies": {
     "@types/express": "^4.17.21",
     "@types/node": "^22.14.0",
+    "@types/nodemailer": "^6.4.24",
     "@types/pngjs": "^6.0.5",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",

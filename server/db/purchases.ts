@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import { pgPool, HttpError, requireUuid, withTransaction, businessNow } from './client';
 import { ensureDevice } from './devices';
 import { recordAuditLog } from './audit';
+import { enqueueSyncEvent, rowJson, rowsJson } from '../sync/outbox';
 import {
   deriveBatchStatus,
   deriveExpiryStatus,
@@ -249,6 +250,20 @@ export async function receivePurchaseOrder(input: PurchaseInput, actor: SaleActo
       },
       client
     );
+    await enqueueSyncEvent(client, {
+      event_type: 'PURCHASE_RECEIVED',
+      entity_type: 'purchase',
+      entity_id: purchaseId,
+      operation: 'RECEIVE',
+      data: async () => ({
+        purchase: await rowJson(client, 'purchases', purchaseId),
+        items: await rowsJson(client, 'purchase_items', 'purchase_id', purchaseId),
+        supplier: await rowJson(client, 'suppliers', supplierId),
+      }),
+      actor,
+      device_id: deviceId,
+      business_ref: invoice,
+    });
 
     const res = await client.query(`${PURCHASE_SELECT} WHERE p.id = $1`, [purchaseId]);
     const [purchase] = await hydratePurchases(client, res.rows);

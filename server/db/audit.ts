@@ -1,5 +1,6 @@
 import { pgPool, cleanUuid, ensureUuid, type Queryable } from './client';
 import type { AuditLog } from '../../src/types';
+import { collectAudit } from '../sync/collector';
 
 export async function getAllAuditLogs(): Promise<AuditLog[]> {
   const res = await pgPool.query(`
@@ -93,5 +94,14 @@ export async function recordAuditLog(log: AuditEntry, q: Queryable = pgPool): Pr
       fullLog.timestamp,
     ]
   );
+  // Inside a transaction the audit row also travels with that transaction's outbox event.
+  if (q !== pgPool) {
+    collectAudit(q, {
+      id: fullLog.id, user_id: cleanUuid(fullLog.user_id), user_name: fullLog.user_name, role: fullLog.role,
+      action: fullLog.action, entity: fullLog.entity, entity_id: fullLog.entity_id,
+      previous_value: fullLog.previous_value ?? null, new_value: fullLog.new_value ?? null,
+      device_id: fullLog.device_id, occurred_at: new Date(fullLog.timestamp).toISOString(),
+    });
+  }
   return fullLog;
 }

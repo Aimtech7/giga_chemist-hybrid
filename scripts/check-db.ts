@@ -65,6 +65,10 @@ async function checkDatabase() {
       'returns',
       'audit_logs',
       'settings',
+      'sync_events',
+      'shop_identity',
+      'sync_inbound_commands',
+      'sync_state',
     ];
 
     const missing = requiredTables.filter((t) => !tableNames.includes(t));
@@ -84,6 +88,14 @@ async function checkDatabase() {
       ['medicine_batches', 'expiry_status'],
       ['medicine_batches', 'updated_at'],
       ['medicines', 'version'],
+      // Hybrid outbox (migration 013)
+      ['sync_events', 'seq'],
+      ['sync_events', 'shop_id'],
+      ['sync_events', 'event_type'],
+      ['sync_events', 'attempt_count'],
+      ['sync_events', 'next_attempt_at'],
+      ['sync_events', 'synced_at'],
+      ['sync_events', 'last_error'],
     ];
     const colRes = await client.query(
       `SELECT table_name || '.' || column_name AS col FROM information_schema.columns WHERE table_schema = 'public'`
@@ -92,7 +104,7 @@ async function checkDatabase() {
     const missingCols = requiredColumns.map(([t, c]) => `${t}.${c}`).filter((c) => !presentCols.has(c));
     if (missingCols.length > 0) {
       console.error(`\n[ERROR] Missing required columns: ${missingCols.join(', ')}`);
-      console.log('Run "npm run db:migrate" to apply migration 007_local_stock_stabilization.sql.');
+      console.log('Run "npm run db:migrate" (migrations 007 stock columns, 013 hybrid outbox).');
       await client.end();
       process.exit(1);
     }
@@ -105,6 +117,18 @@ async function checkDatabase() {
       process.exit(1);
     }
     console.log('✓ Backend device "SERVER" is registered.');
+
+    const shop = await client.query('SELECT shop_id, shop_code FROM shop_identity WHERE id = 1');
+    if (!shop.rows[0]) {
+      console.error('\n[ERROR] Shop identity row is missing. Run "npm run db:migrate".');
+      await client.end();
+      process.exit(1);
+    }
+    console.log(`✓ Shop identity: ${shop.rows[0].shop_code} ${shop.rows[0].shop_id}`);
+    const outbox = await client.query(
+      `SELECT status, COUNT(*)::int AS n FROM sync_events GROUP BY status ORDER BY status`
+    );
+    console.log(`  Sync outbox: ${outbox.rows.length ? outbox.rows.map((r) => `${r.status}=${r.n}`).join(', ') : 'empty'}`);
 
     if (tableNames.includes('users')) {
       const userCount = await client.query('SELECT COUNT(*) FROM users;');

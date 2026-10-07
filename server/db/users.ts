@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import { pgPool, HttpError, isValidUuid, withTransaction, type Queryable } from './client';
 import { hashCredential, verifyCredential } from '../auth';
 import type { User, UserRole } from '../../src/types';
+import { enqueueSyncEvent, userJson } from '../sync/outbox';
 
 /**
  * Staff accounts live ONLY in the PostgreSQL users table. Credentials are PBKDF2-SHA512 hashes in
@@ -201,13 +202,21 @@ export async function createUser(data: {
   const phone = typeof data.phone === 'string' && data.phone.trim() ? data.phone.trim().slice(0, 50) : null;
 
   try {
-    const res = await pgPool.query(
-      `INSERT INTO users (id, name, email, username, role, phone, active, password_hash, pin_hash, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-       RETURNING ${PUBLIC_COLUMNS}`,
-      [crypto.randomUUID(), name, email, username, role, phone, data.active !== false, hashCredential(password).combined, pinHash]
-    );
-    return toUser(res.rows[0]);
+    return await withTransaction(async (client) => {
+      const res = await client.query(
+        `INSERT INTO users (id, name, email, username, role, phone, active, password_hash, pin_hash, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+         RETURNING ${PUBLIC_COLUMNS}`,
+        [crypto.randomUUID(), name, email, username, role, phone, data.active !== false, hashCredential(password).combined, pinHash]
+      );
+      const user = toUser(res.rows[0]);
+      await enqueueSyncEvent(client, {
+        event_type: 'USER_UPSERTED', entity_type: 'user', entity_id: user.id, operation: 'CREATE',
+        data: async () => ({ user: await userJson(client, user.id) }),
+        actor: { user_id: data.created_by || null },
+      });
+      return user;
+    });
   } catch (err: any) {
     if (uniqueViolation(err)) throw new HttpError(409, duplicateMessage(err, email, username));
     throw err;
@@ -256,7 +265,13 @@ export async function updateUser(
          RETURNING ${PUBLIC_COLUMNS}`,
         [name ?? null, email ?? null, role ?? null, phone !== undefined, phone ?? null, active ?? null, id, username !== undefined, username ?? null]
       );
-      return toUser(res.rows[0]);
+      const user = toUser(res.rows[0]);
+      await enqueueSyncEvent(client, {
+        event_type: 'USER_UPSERTED', entity_type: 'user', entity_id: id, operation: 'UPDATE',
+        data: async () => ({ user: await userJson(client, id) }),
+        actor: { user_id: actorId || null },
+      });
+      return user;
     } catch (err: any) {
       if (uniqueViolation(err)) throw new HttpError(409, duplicateMessage(err, email, username));
       throw err;

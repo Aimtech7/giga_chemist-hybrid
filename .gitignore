@@ -3,8 +3,13 @@ node_modules/
 
 # Environment / secrets (keep the sanitized template)
 .env
+.env.local
+.env.production
+.env.online
+.env.*.local
 .env.*
 !.env.example
+!.env.online.example
 
 # Build output & caches
 dist/

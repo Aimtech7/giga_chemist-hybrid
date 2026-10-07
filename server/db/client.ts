@@ -1,5 +1,6 @@
 import pg from 'pg';
 import dotenv from 'dotenv';
+import { resetCollector } from '../sync/collector';
 
 dotenv.config();
 
@@ -155,6 +156,7 @@ export type Queryable = Pick<pg.PoolClient, 'query'>;
 /** Runs fn inside BEGIN/COMMIT on one pooled client; any error triggers ROLLBACK and is rethrown. */
 export async function withTransaction<T>(fn: (client: pg.PoolClient) => Promise<T>): Promise<T> {
   const client = await pgPool.connect();
+  resetCollector(client);
   try {
     await client.query('BEGIN');
     const result = await fn(client);
@@ -168,6 +170,7 @@ export async function withTransaction<T>(fn: (client: pg.PoolClient) => Promise<
     }
     throw err;
   } finally {
+    resetCollector(client);
     client.release();
   }
 }

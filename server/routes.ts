@@ -56,6 +56,15 @@ import {
   ROLE_PERMISSIONS,
   type JwtPayload,
 } from './auth';
+import { getSyncStatus, syncWorker } from './sync/worker';
+import { resolveRange, getSalesReport } from './db/reports';
+import {
+  getEmailSettings, updateEmailSettings, enqueueTestEmail, enqueueReport, getEmailStatus, listEmailJobs,
+  requeueFailedEmails, businessDate,
+} from './email/service';
+import { runBackup, getBackupStatus } from './ops/backup';
+import { getSystemHealth } from './ops/health';
+import { pgPool } from './db/client';
 import type {
   User,
   UserRole,
@@ -652,6 +661,10 @@ apiRouter.get('/sales', requirePermission('sales.view_own'), async (req: Authent
       startDate: req.query.startDate as string | undefined,
       endDate: req.query.endDate as string | undefined,
       cashierId: req.userRole === 'CASHIER' ? req.userId : (req.query.cashierId as string | undefined),
+      paymentMethod: (req.query.paymentMethod as string | undefined) || undefined,
+      customerId: (req.query.customerId as string | undefined) || undefined,
+      priceMode: (req.query.priceMode as string | undefined) || undefined,
+      status: (req.query.status as string | undefined) || undefined,
     });
     if (req.userRole !== 'CASHIER') return res.json(result);
     // Cost and profit are hidden from Cashiers.
@@ -716,6 +729,163 @@ apiRouter.post('/sync', requireAuth, async (req: AuthenticatedRequest, res: Resp
     res.json(syncResponse);
   } catch (err: any) {
     sendError(res, err, 'Sync processing error.', 'POST /sync');
+  }
+});
+
+// --- 8b. HYBRID CLOUD SYNC STATUS (server outbox -> cloud) ---
+// Internet/cloud connectivity is reported separately from local PostgreSQL availability.
+// Admins get full details; Cashiers only a summary. No keys, tokens or URLs with credentials.
+apiRouter.get('/sync/status', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const [status, pg] = await Promise.all([getSyncStatus(), checkPgConnection()]);
+    const local_database = { connected: pg.connected };
+    if (req.userRole === 'ADMIN') return res.json({ ...status, local_database });
+    res.json({
+      mode: status.mode,
+      enabled: status.enabled,
+      local_database,
+      cloud_reachable: (status as any).cloud_reachable ?? null,
+      counts: status.counts ? { pending: status.counts.pending + status.counts.processing, failed: status.counts.failed } : null,
+      last_sync: (status as any).last_sync ?? null,
+    });
+  } catch (err: any) {
+    sendError(res, err, 'Failed to read sync status.', 'GET /sync/status');
+  }
+});
+
+// ADMIN: wake the worker now. It still claims only due events and the cloud still dedupes.
+apiRouter.post('/sync/now', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  const result = syncWorker.wake(true);
+  if (result === 'disabled') {
+    return res.status(409).json({ error: 'Cloud sync is not enabled on this server (APP_MODE=hybrid and SYNC_ENABLED=true are required).' });
+  }
+  res.json({ success: true, result });
+});
+
+// ADMIN: re-queue events the cloud rejected (after the cause was fixed). Idempotency keys are kept.
+apiRouter.post('/sync/retry-failed', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const r = await pgPool.query(
+      `UPDATE sync_events SET status = 'PENDING', next_attempt_at = CURRENT_TIMESTAMP WHERE status = 'FAILED' RETURNING id`
+    );
+    await recordAuditLog({
+      ...actorAudit(req),
+      action: 'SYNC_FAILED_EVENTS_REQUEUED',
+      entity: 'sync',
+      entity_id: 'sync_events',
+      new_value: { requeued: r.rowCount || 0 },
+    });
+    syncWorker.wake(false);
+    res.json({ success: true, requeued: r.rowCount || 0 });
+  } catch (err: any) {
+    sendError(res, err, 'Failed to re-queue failed events.', 'POST /sync/retry-failed');
+  }
+});
+
+// --- 8c. SERVER-SIDE REPORTS (PostgreSQL aggregates; never the browser cache) ---
+// ?range=today|week|month|custom&start=YYYY-MM-DD&end=YYYY-MM-DD[&cashierId=<uuid> (Admin)]
+// Cashier: own sales only, no cost/profit/expenses/purchases.
+apiRouter.get('/reports/summary', requirePermission('sales.view_own'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const isAdmin = req.userRole === 'ADMIN';
+    const range = await resolveRange(req.query.range, req.query.start, req.query.end);
+    const report = await getSalesReport(range, {
+      cashierId: isAdmin ? ((req.query.cashierId as string) || null) : req.userId!,
+      includeCost: isAdmin,
+    });
+    res.json(report);
+  } catch (err: any) {
+    sendError(res, err, 'Failed to build report.', 'GET /reports/summary');
+  }
+});
+
+// --- 8d. EMAIL REPORTS (ADMIN). SMTP credentials are never returned. ---
+apiRouter.get('/email/settings', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const [settings, status] = await Promise.all([getEmailSettings(), getEmailStatus()]);
+    res.json({ settings, status });
+  } catch (err: any) {
+    sendError(res, err, 'Failed to read email settings.', 'GET /email/settings');
+  }
+});
+
+apiRouter.put('/email/settings', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    res.json({ success: true, settings: await updateEmailSettings(req.body || {}, actorAudit(req)) });
+  } catch (err: any) {
+    sendError(res, err, 'Failed to save email settings.', 'PUT /email/settings');
+  }
+});
+
+apiRouter.post('/email/test', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const recipients = req.body?.recipients ? String(req.body.recipients).split(/[,;\s]+/).filter(Boolean) : undefined;
+    const job = await enqueueTestEmail(recipients, req.userName || 'Admin');
+    await recordAuditLog({ ...actorAudit(req), action: 'EMAIL_TEST_QUEUED', entity: 'email_job', entity_id: job.id, new_value: { recipients: recipients || 'default' } });
+    res.status(202).json({ success: true, job });
+  } catch (err: any) {
+    sendError(res, err, 'Failed to queue test email.', 'POST /email/test');
+  }
+});
+
+// Generates today's report of that type now (same idempotency key as the schedule: never a duplicate).
+apiRouter.post('/email/reports/:type/run', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const types = ['DAILY_STOCK', 'DAILY_BUSINESS', 'WEEKLY_EXPIRY', 'LOW_STOCK_DIGEST'] as const;
+    const type = String(req.params.type || '').toUpperCase() as (typeof types)[number];
+    if (!types.includes(type)) return res.status(400).json({ error: `type must be one of ${types.join(', ')}.` });
+    const { date } = await businessDate();
+    const job = await enqueueReport(type, date, { createdBy: req.userName || 'Admin' });
+    res.status(job.created ? 202 : 200).json({ success: true, job });
+  } catch (err: any) {
+    sendError(res, err, 'Failed to queue report.', 'POST /email/reports/:type/run');
+  }
+});
+
+apiRouter.get('/email/jobs', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    res.json(await listEmailJobs(Number(req.query.limit) || 50));
+  } catch (err: any) {
+    sendError(res, err, 'Failed to list email jobs.', 'GET /email/jobs');
+  }
+});
+
+apiRouter.post('/email/retry-failed', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const n = await requeueFailedEmails();
+    await recordAuditLog({ ...actorAudit(req), action: 'EMAIL_FAILED_REQUEUED', entity: 'email_job', entity_id: 'email_jobs', new_value: { requeued: n } });
+    res.json({ success: true, requeued: n });
+  } catch (err: any) {
+    sendError(res, err, 'Failed to re-queue emails.', 'POST /email/retry-failed');
+  }
+});
+
+// --- 8e. BACKUPS (ADMIN). There is deliberately NO restore endpoint. ---
+apiRouter.get('/backups/status', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    res.json(await getBackupStatus());
+  } catch (err: any) {
+    sendError(res, err, 'Failed to read backup status.', 'GET /backups/status');
+  }
+});
+
+apiRouter.post('/backups/run', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const r = await runBackup('MANUAL');
+    await recordAuditLog({ ...actorAudit(req), action: r.success ? 'BACKUP_CREATED' : 'BACKUP_FAILED', entity: 'backup', entity_id: r.id || 'none', new_value: r.success ? { size_bytes: r.size_bytes, duration_ms: r.duration_ms } : { error: r.error } });
+    if (!r.success) return res.status(500).json({ success: false, error: r.error });
+    res.json({ success: true, file: r.file.split(/[\\/]/).pop(), size_bytes: r.size_bytes, duration_ms: r.duration_ms, pruned: r.pruned.length });
+  } catch (err: any) {
+    sendError(res, err, 'Backup failed.', 'POST /backups/run');
+  }
+});
+
+// --- 8f. SYSTEM HEALTH (ADMIN) ---
+apiRouter.get('/admin/health', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    res.json(await getSystemHealth());
+  } catch (err: any) {
+    sendError(res, err, 'Failed to read system health.', 'GET /admin/health');
   }
 });
 
