@@ -18,7 +18,8 @@ export interface SyncCounts {
 }
 
 export interface ServerSyncStatus {
-  mode: 'local' | 'hybrid' | 'cloud';
+  mode: 'local' | 'hybrid' | 'cloud' | 'online';
+  read_only?: boolean;
   enabled: boolean;
   local_database?: { connected: boolean };
   cloud_reachable: boolean | null;
@@ -42,6 +43,7 @@ export type SyncIndicatorState =
   | 'SERVER_UNREACHABLE'
   | 'DATABASE_UNAVAILABLE'
   | 'LOCAL'
+  | 'ONLINE_READONLY'
   | 'LOCAL_SYNC_OFF'
   | 'ONLINE_SYNCED'
   | 'ONLINE_SYNCING'
@@ -67,6 +69,7 @@ export function deriveState(serverReachable: boolean, s: ServerSyncStatus | null
   if (!serverReachable) return 'SERVER_UNREACHABLE';
   if (!s) return 'UNKNOWN';
   if (s.local_database && !s.local_database.connected) return 'DATABASE_UNAVAILABLE';
+  if (s.mode === 'online') return 'ONLINE_READONLY';
   if (s.mode !== 'hybrid') return 'LOCAL';
   if (!s.enabled) return 'LOCAL_SYNC_OFF';
   const pending = (s.counts?.pending || 0) + (s.counts?.processing || 0);

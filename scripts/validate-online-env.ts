@@ -51,14 +51,15 @@ function httpsUrl(k: string, label = k) {
 console.log(`Validating ${path.relative(process.cwd(), file)} (values are never printed)\n`);
 
 console.log('[mode]');
-env.APP_MODE === 'hybrid' ? pass('APP_MODE=hybrid') : fail('APP_MODE must be hybrid');
+env.APP_MODE === 'online' ? pass('APP_MODE=online (Vercel: cloud data, read-only, no local workers)') : fail('APP_MODE must be online for the Vercel deployment');
 ['true', 'false'].includes(env.SYNC_ENABLED) ? pass('SYNC_ENABLED is true/false') : fail('SYNC_ENABLED must be true or false');
 env.NODE_ENV === 'production' ? pass('NODE_ENV=production') : fail('NODE_ENV must be production');
 
 console.log('\n[public frontend]');
-httpsUrl('VITE_API_URL');
-httpsUrl('VITE_SUPABASE_URL');
-has('VITE_SUPABASE_ANON_KEY') ? pass('VITE_SUPABASE_ANON_KEY is set') : fail('VITE_SUPABASE_ANON_KEY is set');
+if (env.VITE_API_URL === undefined || env.VITE_API_URL.trim() === '') pass('VITE_API_URL blank -> same-origin /api');
+else httpsUrl('VITE_API_URL', 'VITE_API_URL (override)');
+// Not needed by the online design (the browser never talks to Supabase); public if set.
+if (env.VITE_SUPABASE_URL || env.VITE_SUPABASE_ANON_KEY) warn('VITE_SUPABASE_* are set: they are compiled into the public bundle and are not needed (leave them unset on Vercel)');
 for (const k of Object.keys(env).filter((x) => x.startsWith('VITE_'))) {
   if (SECRET_NAME.test(k)) fail(`${k}: secret-looking name must not be a VITE_ (public) variable`);
 }
@@ -96,7 +97,10 @@ else {
     const u = new URL(env.DATABASE_URL);
     /^postgres(ql)?:$/.test(u.protocol) ? pass('DATABASE_URL is a postgres URL') : fail('DATABASE_URL must be postgres://');
     isLocalHost(u.hostname) ? fail('DATABASE_URL must not point to localhost/127.0.0.1') : pass('DATABASE_URL is not localhost');
-    /giga_chemist_dev/i.test(u.pathname) ? fail('DATABASE_URL must not be the dev database') : pass('DATABASE_URL is not giga_chemist_dev');
+    /\/(giga_chemist|giga_chemist_dev)$/i.test(u.pathname) ? fail('DATABASE_URL must not be a shop database') : pass('DATABASE_URL is not a shop database');
+    if (/^db\.[a-z0-9]+\.supabase\.co$/i.test(u.hostname)) {
+      fail('DATABASE_URL uses the DIRECT Supabase host (IPv6-only): Vercel functions need the connection POOLER URL (Supabase -> Connect -> Transaction pooler, host *.pooler.supabase.com, port 6543)');
+    } else if (/pooler\.supabase\.com$/i.test(u.hostname)) pass('DATABASE_URL uses the Supabase connection pooler (IPv4, serverless-safe)');
     /sslmode=(require|verify)/.test(u.search) || /supabase\.(co|com)/.test(u.hostname) ? pass('DATABASE_URL uses TLS') : warn('DATABASE_URL has no sslmode=require');
   } catch {
     fail('DATABASE_URL is a valid URL');
@@ -105,6 +109,7 @@ else {
 
 console.log('\n[shop identity]');
 has('SHOP_ID') && UUID.test(env.SHOP_ID) ? pass('SHOP_ID is a UUID') : fail('SHOP_ID must be a UUID');
+if (env.SHOP_ID === 'c2a176c8-a50f-456f-a370-225c11d2e32f') warn('SHOP_ID is the DEVELOPMENT database id; use the pharmacy PC id after its upgrade (npm run db:check there)');
 has('BRANCH_ID') && UUID.test(env.BRANCH_ID) ? pass('BRANCH_ID is a UUID') : fail('BRANCH_ID must be a UUID');
 
 console.log('\n[sync]');

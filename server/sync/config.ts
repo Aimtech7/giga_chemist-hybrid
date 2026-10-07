@@ -1,4 +1,4 @@
-import { getAppMode } from '../db/client';
+import { getAppMode, type AppMode } from '../db/client';
 
 /**
  * Hybrid sync configuration, read from the server environment only. Nothing here is ever sent to
@@ -8,7 +8,7 @@ import { getAppMode } from '../db/client';
  *   SYNC_ENABLED=true     the background worker actually talks to the cloud
  */
 export interface SyncConfig {
-  mode: 'local' | 'hybrid' | 'cloud';
+  mode: AppMode;
   /** Outbox rows are written by business transactions (APP_MODE=hybrid). */
   outboxEnabled: boolean;
   /** Worker runs (hybrid + SYNC_ENABLED=true). */

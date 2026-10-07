@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { pgPool, HttpError, requireUuid, withTransaction, roundMoney } from './client';
+import { pgPool, HttpError, requireUuid, withTransaction, roundMoney, type Queryable } from './client';
 import { recordAuditLog } from './audit';
 import { enqueueSyncEvent, rowJson } from '../sync/outbox';
 import type { SaleActor } from './sales';
@@ -20,8 +20,8 @@ function toSupplier(r: any): Supplier {
   };
 }
 
-export async function getAllSuppliers(): Promise<Supplier[]> {
-  const res = await pgPool.query('SELECT *, balance::float AS balance FROM suppliers ORDER BY name ASC');
+export async function getAllSuppliers(q: Queryable = pgPool): Promise<Supplier[]> {
+  const res = await q.query('SELECT *, balance::float AS balance FROM suppliers ORDER BY name ASC');
   return res.rows.map(toSupplier);
 }
 

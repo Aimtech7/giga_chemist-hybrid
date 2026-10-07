@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { pgPool, HttpError, requireUuid, withTransaction, businessNow } from './client';
+import { pgPool, HttpError, requireUuid, withTransaction, businessNow, type Queryable } from './client';
 import { ensureDevice } from './devices';
 import { recordAuditLog } from './audit';
 import { enqueueSyncEvent, rowJson, rowsJson } from '../sync/outbox';
@@ -72,9 +72,9 @@ async function hydratePurchases(q: { query: Function }, rows: any[]): Promise<Pu
   })) as Purchase[];
 }
 
-export async function getAllPurchases(): Promise<Purchase[]> {
-  const res = await pgPool.query(`${PURCHASE_SELECT} ORDER BY p.order_date DESC, p.created_at DESC LIMIT 1000`);
-  return hydratePurchases(pgPool, res.rows);
+export async function getAllPurchases(q: Queryable = pgPool): Promise<Purchase[]> {
+  const res = await q.query(`${PURCHASE_SELECT} ORDER BY p.order_date DESC, p.created_at DESC LIMIT 1000`);
+  return hydratePurchases(q, res.rows);
 }
 
 export interface PurchaseItemInput {

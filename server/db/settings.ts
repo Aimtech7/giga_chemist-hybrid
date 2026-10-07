@@ -47,7 +47,7 @@ function wholeNumber(v: unknown, field: string): number {
   return n;
 }
 
-function toSettings(r: any): PharmacySettings {
+export function toSettings(r: any): PharmacySettings {
   return {
     pharmacy_name: r.pharmacy_name,
     tagline: r.tagline || '',
@@ -83,8 +83,8 @@ async function ensureSettingsRow(q: Queryable): Promise<any> {
   return created.rows[0] || (await q.query('SELECT * FROM settings WHERE branch_id = $1', [MAIN_BRANCH_ID])).rows[0];
 }
 
-export async function getPharmacySettings(): Promise<PharmacySettings> {
-  return toSettings(await ensureSettingsRow(pgPool));
+export async function getPharmacySettings(q: Queryable = pgPool): Promise<PharmacySettings> {
+  return toSettings(await ensureSettingsRow(q));
 }
 
 /** ADMIN: updates the editable settings columns in one transaction with an audit row. */

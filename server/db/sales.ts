@@ -188,7 +188,7 @@ const SALE_STATUSES = ['completed', 'partially_returned', 'returned', 'voided'];
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
-export async function getAllSales(params?: SalesQueryParams): Promise<Sale[] | PaginatedSalesResponse> {
+export async function getAllSales(params?: SalesQueryParams, q: Queryable = pgPool): Promise<Sale[] | PaginatedSalesResponse> {
   const page = Math.max(1, Number(params?.page) || 1);
   const limit = Math.min(500, Math.max(1, Number(params?.limit) || 50));
   const offset = (page - 1) * limit;
@@ -239,12 +239,12 @@ export async function getAllSales(params?: SalesQueryParams): Promise<Sale[] | P
   const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
   const from = `FROM sales s LEFT JOIN users u ON s.cashier_id = u.id LEFT JOIN customers c ON s.customer_id = c.id`;
 
-  const count = await pgPool.query(`SELECT COUNT(*)::int AS n ${from} ${where}`, values);
-  const rows = await pgPool.query(
+  const count = await q.query(`SELECT COUNT(*)::int AS n ${from} ${where}`, values);
+  const rows = await q.query(
     `SELECT ${SALE_COLUMNS} ${from} ${where} ORDER BY s.created_at DESC, s.id DESC LIMIT $${values.length + 1} OFFSET $${values.length + 2}`,
     [...values, limit, offset]
   );
-  const sales = await hydrateSales(pgPool, rows.rows);
+  const sales = await hydrateSales(q, rows.rows);
   if (params?.page || params?.limit) {
     const total = count.rows[0].n;
     return { sales, total, page, limit, totalPages: Math.ceil(total / limit) || 1 };
@@ -784,13 +784,13 @@ export interface TodaySalesSummary {
  * payments table (split payments counted per part). Refunds are reported separately and netSales
  * = totalSales - refundsTotal. Day boundaries are Africa/Nairobi via PostgreSQL.
  */
-export async function getTodaySalesSummary(options: { cashierId?: string }): Promise<TodaySalesSummary> {
+export async function getTodaySalesSummary(options: { cashierId?: string }, q: Queryable = pgPool): Promise<TodaySalesSummary> {
   const cashierId = options.cashierId ? requireUuid(options.cashierId, 'cashierId') : null;
-  const { date: today } = await businessNow();
+  const { date: today } = await businessNow(q);
   const params: any[] = [today];
   const cashierFilter = cashierId ? (params.push(cashierId), `AND s.cashier_id = $2`) : '';
 
-  const totals = await pgPool.query(
+  const totals = await q.query(
     `SELECT COALESCE(SUM(s.total) FILTER (WHERE s.status <> 'voided'), 0)::numeric AS total_sales,
             COALESCE(SUM(s.discount_total) FILTER (WHERE s.status <> 'voided'), 0)::numeric AS discount_total,
             COALESCE(SUM(s.gross_profit) FILTER (WHERE s.status <> 'voided'), 0)::numeric AS gross_profit,
@@ -799,7 +799,7 @@ export async function getTodaySalesSummary(options: { cashierId?: string }): Pro
      FROM sales s WHERE s.date = $1::date ${cashierFilter}`,
     params
   );
-  const pays = await pgPool.query(
+  const pays = await q.query(
     `SELECT p.method, COALESCE(SUM(p.amount), 0)::numeric AS amount
      FROM payments p JOIN sales s ON p.sale_id = s.id
      WHERE s.date = $1::date AND s.status <> 'voided' ${cashierFilter}
@@ -807,7 +807,7 @@ export async function getTodaySalesSummary(options: { cashierId?: string }): Pro
     params
   );
   const refundFilter = cashierId ? `AND r.user_id = $2` : '';
-  const refunds = await pgPool.query(
+  const refunds = await q.query(
     // Only APPROVED returns are refunds; counted on the day the Administrator approved them.
     `SELECT COALESCE(SUM(r.refund_amount), 0)::numeric AS refunds
      FROM returns r WHERE r.status = 'APPROVED' AND (r.reviewed_at AT TIME ZONE 'Africa/Nairobi')::date = $1::date ${refundFilter}`,

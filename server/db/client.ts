@@ -10,10 +10,11 @@ const { Pool } = pg;
 // local-midnight JS Date, which shifts the calendar day when serialized to UTC (EAT is UTC+3).
 pg.types.setTypeParser(1082, (value: string) => value);
 
-export type AppMode = 'local' | 'cloud' | 'hybrid';
+export type AppMode = 'local' | 'cloud' | 'hybrid' | 'online';
 
 export function getAppMode(): AppMode {
   const envMode = (process.env.APP_MODE || '').toLowerCase().trim();
+  if (envMode === 'online') return 'online';
   if (envMode === 'cloud') return 'cloud';
   if (envMode === 'hybrid') return 'hybrid';
   if (envMode === 'local') return 'local';

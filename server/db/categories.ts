@@ -1,12 +1,12 @@
-import { pgPool } from './client';
+import { pgPool, type Queryable } from './client';
 import type { Category } from '../../src/types';
 
 /**
  * Lists categories from PostgreSQL. PostgreSQL is authoritative in local AND hybrid mode, so errors
  * propagate (there is no cloud fallback: the cloud is never read to serve the POS).
  */
-export async function getAllCategories(): Promise<Category[]> {
-  const res = await pgPool.query(`SELECT id, name, description, created_at, updated_at FROM categories ORDER BY name ASC`);
+export async function getAllCategories(q: Queryable = pgPool): Promise<Category[]> {
+  const res = await q.query(`SELECT id, name, description, created_at, updated_at FROM categories ORDER BY name ASC`);
   return res.rows.map((r) => ({
     id: r.id,
     name: r.name,

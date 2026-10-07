@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { pgPool, HttpError, withTransaction, businessNow, roundMoney } from './client';
+import { pgPool, HttpError, withTransaction, businessNow, roundMoney, type Queryable } from './client';
 import { recordAuditLog } from './audit';
 import { enqueueSyncEvent, rowJson } from '../sync/outbox';
 import type { SaleActor } from './sales';
@@ -26,8 +26,8 @@ function toExpense(r: any): Expense {
   } as Expense;
 }
 
-export async function getAllExpenses(): Promise<Expense[]> {
-  const res = await pgPool.query(
+export async function getAllExpenses(q: Queryable = pgPool): Promise<Expense[]> {
+  const res = await q.query(
     `SELECT e.*, e.amount::float AS amount, u.name AS user_name
      FROM expenses e LEFT JOIN users u ON e.user_id = u.id
      ORDER BY e.date DESC, e.created_at DESC LIMIT 2000`

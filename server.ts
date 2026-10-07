@@ -5,7 +5,8 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import { createServer as createViteServer } from 'vite';
-import { apiRouter } from './server/routes';
+import { applyCommonMiddleware, apiErrorHandler } from './server/http/common';
+import { getAppMode } from './server/db/client';
 import { assertAuthConfiguration } from './server/auth';
 import { startSyncWorker, syncWorker } from './server/sync/worker';
 import { getSyncConfig } from './server/sync/config';
@@ -24,46 +25,19 @@ async function startServer() {
   // Server port defaults to 3000
   const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
-  app.use(express.json({ limit: '10mb' }));
-  app.use(express.urlencoded({ extended: true }));
-
-  // CORS. POS terminals load the UI from this same server (same origin: no CORS needed).
-  // ALLOWED_ORIGINS (comma-separated) restricts cross-origin callers, e.g. an online frontend;
-  // when it is not set the previous permissive behaviour ("*") is kept for compatibility.
-  // Auth uses Bearer tokens (not cookies), so a foreign page cannot ride a logged-in session.
-  const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map((o) => o.trim().replace(/\/$/, '')).filter(Boolean);
-  app.disable('x-powered-by');
-  app.use((req, res, next) => {
-    const origin = req.headers.origin;
-    if (allowedOrigins.length === 0) {
-      res.setHeader('Access-Control-Allow-Origin', '*');
-    } else if (origin && allowedOrigins.includes(origin)) {
-      res.setHeader('Access-Control-Allow-Origin', origin);
-      res.setHeader('Vary', 'Origin');
-    }
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Device-Id');
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('Referrer-Policy', 'same-origin');
-    if (req.method === 'OPTIONS') {
-      return res.sendStatus(204);
-    }
-    next();
-  });
-
-  // Mount API router
-  app.use('/api', apiRouter);
-
-  // Errors raised before/inside the API router (e.g. malformed JSON body, oversized payload) are
-  // answered as JSON, never as Express's default HTML error page.
-  app.use('/api', (err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
-    if (res.headersSent) return next(err);
-    const status = typeof err?.status === 'number' && err.status >= 400 && err.status < 600 ? err.status : 500;
-    if (status >= 500) console.error('[API] Unhandled error:', err?.message || err);
-    res.status(status).json({
-      error: err?.type === 'entity.parse.failed' ? 'Request body is not valid JSON.' : status >= 500 ? 'Internal server error.' : err?.message || 'Bad request.',
-    });
-  });
+  const mode = getAppMode();
+  if (mode === 'online') {
+    // ONLINE (Vercel-style): cloud data, read-only API, no local PostgreSQL, no background workers.
+    const { mountOnlineApi } = await import('./server/online/app');
+    mountOnlineApi(app);
+  } else {
+    // LOCAL / HYBRID pharmacy server: local PostgreSQL is authoritative.
+    applyCommonMiddleware(app);
+    const { apiRouter } = await import('./server/routes');
+    app.use('/api', apiRouter);
+    // Errors raised before/inside the API router are answered as JSON, never as an HTML page.
+    app.use('/api', apiErrorHandler);
+  }
 
   // Serve or mount Vite middlewares
   const distPath = path.resolve(__dirname, 'dist');
@@ -107,6 +81,10 @@ async function startServer() {
   const HOST = (process.env.API_HOST || '0.0.0.0').trim();
   httpServer.listen(PORT, HOST, () => {
     console.log(`[GIGA CHEMIST] Server listening on http://${HOST}:${PORT}`);
+    if (mode === 'online') {
+      console.log('[GIGA CHEMIST] Mode: ONLINE | cloud data source, read-only API, no local workers');
+      return;
+    }
     const sync = getSyncConfig();
     console.log(`[GIGA CHEMIST] Mode: ${sync.mode.toUpperCase()} | outbox ${sync.outboxEnabled ? 'on' : 'off'} | cloud sync worker ${sync.workerEnabled ? 'on' : 'off'}`);
     // The cloud is never required for startup: the worker logs and retries on its own.

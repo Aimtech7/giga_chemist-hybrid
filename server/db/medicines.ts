@@ -57,8 +57,8 @@ export function toMedicine(r: any): Medicine {
   } as Medicine;
 }
 
-export async function getAllMedicines(): Promise<Medicine[]> {
-  const res = await pgPool.query(`${MEDICINE_SELECT} ORDER BY m.name ASC`);
+export async function getAllMedicines(q: Pick<pg.PoolClient, 'query'> = pgPool): Promise<Medicine[]> {
+  const res = await q.query(`${MEDICINE_SELECT} ORDER BY m.name ASC`);
   return res.rows.map(toMedicine);
 }
 

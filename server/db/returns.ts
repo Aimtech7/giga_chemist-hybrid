@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import type pg from 'pg';
-import { pgPool, HttpError, requireUuid, withTransaction, businessNow } from './client';
+import { pgPool, HttpError, requireUuid, withTransaction, businessNow, type Queryable } from './client';
 import { ensureDevice } from './devices';
 import { recordAuditLog } from './audit';
 import { enqueueSyncEvent, rowJson } from '../sync/outbox';
@@ -105,7 +105,7 @@ function toReturn(r: any): CustomerReturn & Record<string, any> {
   } as any;
 }
 
-export async function getAllReturns(options: { userId?: string; status?: string } = {}): Promise<any[]> {
+export async function getAllReturns(options: { userId?: string; status?: string } = {}, q: Queryable = pgPool): Promise<any[]> {
   const where: string[] = [];
   const params: any[] = [];
   if (options.userId) {
@@ -117,7 +117,7 @@ export async function getAllReturns(options: { userId?: string; status?: string 
     params.push(options.status);
     where.push(`r.status = $${params.length}`);
   }
-  const res = await pgPool.query(
+  const res = await q.query(
     `${RETURN_SELECT} ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY r.created_at DESC LIMIT 1000`,
     params
   );

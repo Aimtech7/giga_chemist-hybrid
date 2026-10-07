@@ -47,6 +47,8 @@ export default defineConfig(() => {
         workbox: {
           globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
           navigateFallback: '/index.html',
+          // /api/* must always reach the server (JSON), never the cached SPA shell.
+          navigateFallbackDenylist: [/^\/api(\/|$)/],
           runtimeCaching: [
             {
               urlPattern: /^\/api\/.*/i,

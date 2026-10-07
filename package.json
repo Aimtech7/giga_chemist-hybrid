@@ -9,7 +9,7 @@
     "start": "tsx server.ts",
     "start:local": "tsx server.ts",
     "server": "tsx server.ts",
-    "build": "vite build",
+    "build": "node scripts/build-online-api.mjs && vite build",
     "preview": "vite preview",
     "db:migrate": "tsx scripts/run-migrations.ts",
     "db:check": "tsx scripts/check-db.ts",
@@ -31,7 +31,10 @@
     "env:check:online": "tsx scripts/validate-online-env.ts",
     "backup": "tsx scripts/backup/backup-db.ts",
     "target:rehearse": "tsx scripts/target/rehearse-migration.ts",
-    "test:ops": "tsx scripts/integration/run-ops.ts"
+    "test:ops": "tsx scripts/integration/run-ops.ts",
+    "build:api": "node scripts/build-online-api.mjs",
+    "test:online": "tsx scripts/integration/run-online.ts",
+    "online:create-user": "tsx scripts/online/create-online-user.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
@@ -62,6 +65,7 @@
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "autoprefixer": "^10.4.21",
+    "esbuild": "^0.28.2",
     "pngjs": "^7.0.0"
   },
   "engines": {

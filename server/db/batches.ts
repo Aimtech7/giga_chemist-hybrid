@@ -1,4 +1,4 @@
-import { pgPool, requireUuid } from './client';
+import { pgPool, requireUuid, type Queryable } from './client';
 import type { MedicineBatch } from '../../src/types';
 
 /**
@@ -43,8 +43,8 @@ function toBatch(r: any): MedicineBatch {
   } as MedicineBatch;
 }
 
-export async function getAllBatches(): Promise<MedicineBatch[]> {
-  const res = await pgPool.query(`${BATCH_SELECT} ORDER BY b.expiry_date ASC NULLS LAST, b.created_at ASC`);
+export async function getAllBatches(q: Queryable = pgPool): Promise<MedicineBatch[]> {
+  const res = await q.query(`${BATCH_SELECT} ORDER BY b.expiry_date ASC NULLS LAST, b.created_at ASC`);
   return res.rows.map(toBatch);
 }
 
