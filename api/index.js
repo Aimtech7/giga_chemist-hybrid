@@ -1212,7 +1212,12 @@ var requireAdmin = (req, res, next) => {
   if (req.onlineUser.role !== "ADMIN") return res.status(403).json({ error: "Forbidden: Administrator only." });
   next();
 };
+var CONNECTION_ERRORS = ["ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "ENETUNREACH", "EHOSTUNREACH"];
 function send(res, err, label) {
+  if (CONNECTION_ERRORS.includes(err?.code) || /timeout|terminated|Connection/i.test(String(err?.message || ""))) {
+    console.error(`[Online] ${label}: cloud database unreachable (${err?.code || err?.message})`);
+    return res.status(503).json({ error: "Cloud database unreachable. Try again shortly.", code: "CLOUD_DB_UNREACHABLE" });
+  }
   const status = typeof err?.status === "number" ? err.status : 500;
   if (status >= 500) console.error(`[Online] ${label} failed:`, err?.message || err);
   res.status(status).json({ error: status >= 500 && !(err instanceof HttpError) ? "Cloud database error." : err.message });

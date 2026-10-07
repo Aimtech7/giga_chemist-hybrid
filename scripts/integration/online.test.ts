@@ -206,3 +206,17 @@ export async function onlineTests(ctx: Ctx, env: HybridEnv) {
   const fresh = spawnSync(process.execPath, ['scripts/build-online-api.mjs', '--check'], { encoding: 'utf-8' });
   check(fresh.status === 0, 'committed api/index.js bundle is up to date with the source', fresh.stderr);
 }
+
+/** Unreachable cloud database: data and login answer 503 (never a fake/local fallback). */
+export async function onlineUnreachableTests(shopId: string) {
+  section('ONLINE API — cloud database unreachable');
+  await spawnOnline(['scripts/online/serve-vercel-bundle.mjs'], BUNDLE_PORT, {
+    APP_MODE: 'online', DATABASE_URL: 'postgresql://u:p@giga-chemist-nonexistent-host.invalid:6543/postgres', SHOP_ID: shopId, JWT_SECRET: 'y'.repeat(40),
+  });
+  const h = await call(BUNDLE_PORT, 'GET', '/api/health');
+  const l = await call(BUNDLE_PORT, 'POST', '/api/auth/login', null, { email: 'a@b.cd', password: 'whatever-123' });
+  const s = await call(BUNDLE_PORT, 'GET', '/api/settings');
+  check(h.status === 503 && h.data.database.connected === false, 'health 503 degraded when the cloud DB is unreachable', h.data);
+  check(l.status === 503 && l.data.code === 'CLOUD_DB_UNREACHABLE' && s.status === 503, 'login / data answer 503 CLOUD_DB_UNREACHABLE', [l.status, s.status]);
+  await stopOnline();
+}

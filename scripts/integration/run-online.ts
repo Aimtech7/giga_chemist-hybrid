@@ -1,6 +1,6 @@
 import { assertDevDatabase, cleanupFixtures, login, pool, startServer, stopServer, summary, upsertFixtureUser, getServerLog } from './harness';
 import { setupHybridCloud, type HybridEnv } from './hybrid.test';
-import { onlineTests, stopOnline } from './online.test';
+import { onlineTests, onlineUnreachableTests, stopOnline } from './online.test';
 import type { Ctx } from './auth-users.test';
 
 /**
@@ -47,6 +47,7 @@ async function main() {
       cashier2Token: await login(cashier2.email, cashier2.password),
     };
     await onlineTests(ctx, env);
+    await onlineUnreachableTests(env.shopId);
   } finally {
     await stopOnline();
     await stopServer();
