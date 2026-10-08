@@ -9,6 +9,10 @@ import { pgPool, getDatabaseConnectionConfig } from '../db/client';
  *  - file: <BACKUP_DIR>/<database>_<YYYY-MM-DD_HHmmss>.dump (Africa/Nairobi time), written as
  *    .partial first and renamed only after verification (pg_restore --list must succeed)
  *  - keeps the newest BACKUP_KEEP files of this database (only files matching that pattern)
+ *  - WEEKLY tier: when the newest copy in <BACKUP_DIR>/weekly is 7+ days old (or missing), the
+ *    verified archive is also copied there; the newest BACKUP_KEEP_WEEKLY (default 4) are kept
+ *  - an archive counts as a success only when pg_dump exits 0, the file is non-empty and
+ *    pg_restore --list reads a non-empty table of contents (verified = true is recorded)
  *  - every attempt is recorded in backup_runs and appended to logs/backup.log
  *  - the database password is passed to pg_dump through PGPASSWORD, never on the command line
  *  - one backup at a time per database (advisory lock)
@@ -19,17 +23,20 @@ export interface BackupConfig {
   enabled: boolean;
   dir: string;
   keep: number;
+  keepWeekly: number;
   time: string;
   pgBinDir: string | null;
 }
 
 export function getBackupConfig(): BackupConfig {
   const keep = Number(process.env.BACKUP_KEEP);
+  const keepWeekly = Number(process.env.BACKUP_KEEP_WEEKLY);
   const time = (process.env.BACKUP_TIME || '21:00').trim();
   return {
     enabled: String(process.env.BACKUP_ENABLED || '').toLowerCase() === 'true',
     dir: path.resolve(process.env.BACKUP_DIR || 'backups'),
     keep: Number.isInteger(keep) && keep > 0 ? Math.min(keep, 365) : 14,
+    keepWeekly: Number.isInteger(keepWeekly) && keepWeekly >= 0 ? Math.min(keepWeekly, 104) : 4,
     time: /^([01]\d|2[0-3]):[0-5]\d$/.test(time) ? time : '21:00',
     pgBinDir: process.env.PG_BIN_DIR?.trim() || null,
   };
@@ -89,7 +96,29 @@ function log(line: string) {
 
 export type BackupTrigger = 'SCHEDULED' | 'MANUAL' | 'CLI' | 'PRE_UPGRADE';
 
-export async function runBackup(trigger: BackupTrigger, overrides: { dir?: string; keep?: number } = {}) {
+/** Copies a verified archive into <dir>/weekly when the newest weekly copy is 7+ days old; prunes that tier. */
+function keepWeeklyCopy(dir: string, file: string, pattern: RegExp, keepWeekly: number): { copied: string | null; pruned: string[] } {
+  if (keepWeekly <= 0) return { copied: null, pruned: [] };
+  const weeklyDir = path.join(dir, 'weekly');
+  fs.mkdirSync(weeklyDir, { recursive: true });
+  const existing = fs.readdirSync(weeklyDir).filter((f) => pattern.test(f)).sort().reverse();
+  const newest = existing[0] ? fs.statSync(path.join(weeklyDir, existing[0])).mtimeMs : 0;
+  let copied: string | null = null;
+  if (Date.now() - newest >= 7 * 86_400_000 - 3_600_000) {
+    copied = path.join(weeklyDir, path.basename(file));
+    fs.copyFileSync(file, copied);
+    if (fs.statSync(copied).size !== fs.statSync(file).size) throw new Error('Weekly copy size mismatch.');
+    existing.unshift(path.basename(file));
+  }
+  const pruned: string[] = [];
+  for (const f of existing.slice(keepWeekly)) {
+    fs.unlinkSync(path.join(weeklyDir, f));
+    pruned.push(f);
+  }
+  return { copied, pruned };
+}
+
+export async function runBackup(trigger: BackupTrigger, overrides: { dir?: string; keep?: number; keepWeekly?: number } = {}) {
   const cfg = getBackupConfig();
   const dir = path.resolve(overrides.dir || cfg.dir);
   const keep = overrides.keep || cfg.keep;
@@ -126,13 +155,23 @@ export async function runBackup(trigger: BackupTrigger, overrides: { dir?: strin
       fs.unlinkSync(path.join(dir, f));
       removed.push(f);
     }
+    const weekly = keepWeeklyCopy(dir, finalPath, pattern, overrides.keepWeekly ?? cfg.keepWeekly);
     const duration = Date.now() - started;
-    await pgPool.query(
-      `UPDATE backup_runs SET status = 'SUCCESS', file_path = $2, size_bytes = $3, duration_ms = $4, finished_at = CURRENT_TIMESTAMP WHERE id = $1`,
-      [runId, finalPath, size, duration]
-    );
-    log(`SUCCESS ${trigger} ${finalPath} ${size} bytes ${duration} ms toc=${tocEntries} pruned=${removed.length}`);
-    return { success: true as const, id: runId, file: finalPath, size_bytes: size, duration_ms: duration, toc_entries: tocEntries, pruned: removed };
+    try {
+      await pgPool.query(
+        `UPDATE backup_runs SET status = 'SUCCESS', file_path = $2, size_bytes = $3, duration_ms = $4, finished_at = CURRENT_TIMESTAMP,
+                verified = TRUE, toc_entries = $5, tier = $6, weekly_file_path = $7 WHERE id = $1`,
+        [runId, finalPath, size, duration, tocEntries, weekly.copied ? 'WEEKLY' : 'DAILY', weekly.copied]
+      );
+    } catch (err: any) {
+      if (err?.code !== '42703') throw err; // migration 015 not applied yet: record the essentials
+      await pgPool.query(
+        `UPDATE backup_runs SET status = 'SUCCESS', file_path = $2, size_bytes = $3, duration_ms = $4, finished_at = CURRENT_TIMESTAMP WHERE id = $1`,
+        [runId, finalPath, size, duration]
+      );
+    }
+    log(`SUCCESS ${trigger} ${finalPath} ${size} bytes ${duration} ms toc=${tocEntries} pruned=${removed.length}${weekly.copied ? ' weekly=' + path.basename(weekly.copied) : ''}`);
+    return { success: true as const, id: runId, file: finalPath, size_bytes: size, duration_ms: duration, toc_entries: tocEntries, verified: true, pruned: removed, weekly_file: weekly.copied, weekly_pruned: weekly.pruned };
   } catch (err: any) {
     const msg = String(err?.message || err).slice(0, 1000);
     if (runId) {
@@ -157,11 +196,31 @@ export async function getBackupStatus() {
   const cfg = getBackupConfig();
   const last = (await pgPool.query(`SELECT * FROM backup_runs WHERE status = 'SUCCESS' ORDER BY finished_at DESC LIMIT 1`)).rows[0];
   const lastAttempt = (await pgPool.query(`SELECT * FROM backup_runs ORDER BY started_at DESC LIMIT 1`)).rows[0];
+  // Next scheduled run: today at BACKUP_TIME (Nairobi) unless today's scheduled backup is done; a due
+  // but not yet taken backup (the scheduler checks every 20 minutes) is reported as due now.
+  const next = cfg.enabled ? (await pgPool.query(
+    `WITH t AS (SELECT (now() AT TIME ZONE 'Africa/Nairobi') AS local_now,
+                       EXISTS (SELECT 1 FROM backup_runs WHERE trigger = 'SCHEDULED' AND status = 'SUCCESS'
+                                 AND (started_at AT TIME ZONE 'Africa/Nairobi')::date = (now() AT TIME ZONE 'Africa/Nairobi')::date) AS done)
+     SELECT CASE WHEN done THEN ((local_now::date + 1) + $1::time) AT TIME ZONE 'Africa/Nairobi'
+                 WHEN local_now::time >= $1::time THEN now()
+                 ELSE (local_now::date + $1::time) AT TIME ZONE 'Africa/Nairobi' END AS at FROM t`, [cfg.time])).rows[0]?.at : null;
+  let weeklyCount = 0;
+  try {
+    weeklyCount = fs.readdirSync(path.join(cfg.dir, 'weekly')).filter((f) => f.endsWith('.dump')).length;
+  } catch {
+    /* no weekly tier yet */
+  }
   const ageHours = last?.finished_at ? Math.round(((Date.now() - new Date(last.finished_at).getTime()) / 3_600_000) * 10) / 10 : null;
   return {
     enabled: cfg.enabled,
     schedule_time: cfg.time,
     keep: cfg.keep,
+    keep_weekly: cfg.keepWeekly,
+    weekly_count: weeklyCount,
+    next_backup_at: next ? new Date(next).toISOString() : null,
+    last_success_verified: last ? last.verified !== false : null,
+    last_success_toc_entries: last?.toc_entries ?? null,
     location: cfg.dir,
     last_success_at: last?.finished_at ? new Date(last.finished_at).toISOString() : null,
     last_success_file: last?.file_path ? path.basename(last.file_path) : null,

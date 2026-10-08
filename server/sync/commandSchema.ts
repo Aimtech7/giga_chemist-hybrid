@@ -18,6 +18,9 @@ export const COMMAND_TYPES = [
   'STOCK_REMOVE',
   'STOCK_SET',
   'BATCH_EXPIRY_UPDATE',
+  'USER_SET_ACTIVE',
+  'USER_ROLE_UPDATE',
+  'APP_UPDATE_APPROVE',
 ] as const;
 export type CommandType = (typeof COMMAND_TYPES)[number];
 
@@ -28,16 +31,19 @@ export const STOCK_REMOVE_REASONS = ['Damaged', 'Expired', 'Lost', 'Physical sto
 
 export const MAX_STOCK_QUANTITY = 1_000_000;
 
+/** Roles a remote Administrator may assign to shop staff (same as the shop's user screen). */
+export const ASSIGNABLE_ROLES = ['ADMIN', 'CASHIER'] as const;
+
 export const PRICE_FIELDS = ['selling_price', 'wholesale_price', 'min_selling_price', 'purchase_price'] as const;
 export const METADATA_FIELDS = [
   'name', 'generic_name', 'brand_name', 'manufacturer', 'description', 'dosage_form',
-  'dosage_strength', 'unit', 'prescription_required', 'category',
+  'dosage_strength', 'unit', 'prescription_required', 'category', 'sku', 'barcode', 'reorder_level', 'status',
 ] as const;
 export const SETTINGS_FIELDS = ['pharmacy_name', 'tagline', 'address', 'phone', 'email', 'receipt_header', 'receipt_footer'] as const;
 
 const TEXT_LIMITS: Record<string, number> = {
   name: 255, generic_name: 255, brand_name: 255, manufacturer: 255, description: 2000, dosage_form: 100,
-  dosage_strength: 100, unit: 50, category: 100,
+  dosage_strength: 100, unit: 50, category: 100, sku: 100, barcode: 100,
   pharmacy_name: 255, tagline: 255, address: 500, phone: 50, email: 255, receipt_header: 1000, receipt_footer: 1000,
 };
 
@@ -155,10 +161,17 @@ export function validateCommandPayload(type: string, payload: unknown): Record<s
         if (f === 'prescription_required') {
           if (typeof p[f] !== 'boolean') throw new HttpError(400, 'prescription_required must be true or false.');
           out[f] = p[f];
+        } else if (f === 'reorder_level') {
+          out[f] = wholeNumber(p[f], 'reorder_level', 0);
+        } else if (f === 'status') {
+          if (p[f] !== 'active' && p[f] !== 'inactive') throw new HttpError(400, 'status must be "active" or "inactive".');
+          out[f] = p[f];
         } else {
           if (typeof p[f] !== 'string') throw new HttpError(400, `${f} must be text.`);
           const t = p[f].trim();
           if (f === 'name' && !t) throw new HttpError(400, 'name cannot be empty.');
+          if ((f === 'sku' || f === 'barcode') && t && !/^[A-Za-z0-9._\-/]+$/.test(t)) throw new HttpError(400, `${f} may contain letters, digits and . _ - / only.`);
+          if ((f === 'sku' || f === 'barcode') && !t) throw new HttpError(400, `${f} cannot be cleared remotely.`);
           out[f] = t.slice(0, TEXT_LIMITS[f] || 255);
         }
       }
@@ -185,6 +198,22 @@ export function validateCommandPayload(type: string, payload: unknown): Record<s
       if (out.pharmacy_name === '') throw new HttpError(400, 'pharmacy_name cannot be empty.');
       if (Object.keys(out).length === 0) throw new HttpError(400, `SETTINGS_UPDATE needs at least one of: ${SETTINGS_FIELDS.join(', ')}.`);
       return out;
+    }
+    case 'USER_SET_ACTIVE': {
+      onlyKeys(p, ['user_id', 'active', 'reason'], 'USER_SET_ACTIVE');
+      if (typeof p.active !== 'boolean') throw new HttpError(400, 'active must be true or false.');
+      return { user_id: uuid(p.user_id, 'user_id'), active: p.active, reason: reasonText(p.reason, true) };
+    }
+    case 'USER_ROLE_UPDATE': {
+      onlyKeys(p, ['user_id', 'role', 'reason'], 'USER_ROLE_UPDATE');
+      if (!ASSIGNABLE_ROLES.includes(p.role)) throw new HttpError(400, `role must be one of: ${ASSIGNABLE_ROLES.join(', ')}.`);
+      return { user_id: uuid(p.user_id, 'user_id'), role: p.role, reason: reasonText(p.reason, true) };
+    }
+    case 'APP_UPDATE_APPROVE': {
+      onlyKeys(p, ['target_commit', 'reason'], 'APP_UPDATE_APPROVE');
+      const c = typeof p.target_commit === 'string' ? p.target_commit.trim().toLowerCase() : '';
+      if (!/^[0-9a-f]{40}$/.test(c)) throw new HttpError(400, 'target_commit must be a full 40-character commit id.');
+      return { target_commit: c, reason: reasonText(p.reason, false) };
     }
     default:
       throw new HttpError(400, `Unsupported command type "${type}".`);

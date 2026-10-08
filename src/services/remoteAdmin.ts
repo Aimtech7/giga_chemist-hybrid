@@ -17,13 +17,18 @@ export type RemoteAction =
   | 'medicine-update'
   | 'batch-expiry'
   | 'category'
-  | 'settings';
+  | 'settings'
+  | 'user-active'
+  | 'user-role'
+  | 'app-update';
 
 export interface RemoteCommand {
   command_id: string;
   command_type: string;
   status: CommandStatus;
   payload: Record<string, any>;
+  display?: Record<string, any> | null;
+  audit_reference?: string | null;
   created_at: string;
   created_by: string | null;
   delivered_at: string | null;
@@ -119,4 +124,36 @@ export const COMMAND_LABELS: Record<string, string> = {
   BATCH_EXPIRY_UPDATE: 'Batch expiry',
   CATEGORY_UPSERT: 'Category',
   SETTINGS_UPDATE: 'Pharmacy settings',
+  USER_SET_ACTIVE: 'Staff account on/off',
+  USER_ROLE_UPDATE: 'Staff role',
+  APP_UPDATE_APPROVE: 'Software update approval',
 };
+
+// ---------------------------------------------------------------- health, alerts, insights, security
+export const getShopHealth = () => apiFetch<any>('/api/admin/shop-health');
+export const getAlerts = (all = false) => apiFetch<{ supported: boolean; alerts: any[]; message?: string }>(`/api/admin/alerts?status=${all ? 'all' : 'open'}`);
+export const ackAlert = (id: number) => apiFetch<any>(`/api/admin/alerts/${id}/ack`, { method: 'POST', body: {} });
+export const getInsights = (days = 30) => apiFetch<any>(`/api/admin/insights?days=${days}`);
+export const getReport = (range: 'today' | 'week' | 'month') => apiFetch<any>(`/api/reports/summary?range=${range}`);
+export const getStaff = () => apiFetch<any[]>('/api/users');
+export const getSecurity = () => apiFetch<any>('/api/admin/security');
+export const setRemoteWrites = (enabled: boolean) => apiFetch<any>('/api/admin/security/remote-writes', { method: 'POST', body: { enabled } });
+export const setMaintenance = (enabled: boolean, message?: string) => apiFetch<any>('/api/admin/security/maintenance', { method: 'POST', body: { enabled, message } });
+export const revokeSessions = (body: { all: true } | { user_id: string }) => apiFetch<any>('/api/admin/security/revoke-sessions', { method: 'POST', body });
+export const setOnlineUserActive = (id: string, active: boolean) => apiFetch<any>(`/api/admin/security/online-users/${id}/active`, { method: 'POST', body: { active } });
+
+/** CSV download of rows (client side; no server state). */
+export function downloadCsv(filename: string, rows: Record<string, unknown>[]) {
+  if (!rows.length) return;
+  const cols = Object.keys(rows[0]);
+  const esc = (v: unknown) => {
+    const t = v === null || v === undefined ? '' : typeof v === 'object' ? JSON.stringify(v) : String(v);
+    return /[",\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t;
+  };
+  const csv = [cols.join(','), ...rows.map((r) => cols.map((c) => esc(r[c])).join(','))].join('\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}

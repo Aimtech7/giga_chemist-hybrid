@@ -112,7 +112,21 @@ try {
     # 2-3. Start and supervise.
     $env:NODE_ENV = "production"
     $failures = 0
+    $RuntimeDir = Join-Path $LogDir "runtime"
+    if (-not (Test-Path $RuntimeDir)) { New-Item -ItemType Directory -Path $RuntimeDir -Force | Out-Null }
+    $MaintLock = Join-Path $RuntimeDir "maintenance.lock"
+    $RestartLog = Join-Path $RuntimeDir "restarts.log"
     while ($true) {
+        # The updater holds the server down while it replaces the code (maintenance.lock).
+        if (Test-Path $MaintLock) {
+            if (((Get-Date) - (Get-Item $MaintLock).LastWriteTime).TotalHours -gt 3) {
+                Write-Log "Removing a stale maintenance lock (older than 3 h)." "WARN"
+                Remove-Item $MaintLock -Force -ErrorAction SilentlyContinue
+            } else {
+                Start-Sleep -Seconds 3
+                continue
+            }
+        }
         if (Test-GigaHealth) {
             # Someone else (a manual start) already serves the POS: watch it, do not duplicate it.
             Start-Sleep -Seconds 30
@@ -133,6 +147,16 @@ try {
             Write-Log "Could not start the server: $($_.Exception.Message)" "ERROR"
         }
         $upMinutes = ((Get-Date) - $started).TotalMinutes
+        if (Test-Path $MaintLock) {
+            Write-Log "Server stopped for maintenance (update in progress)." "INFO"
+            continue
+        }
+        # One line per unexpected exit: the heartbeat raises SERVICE_CRASHING at 3+ per hour.
+        try {
+            Add-Content -Path $RestartLog -Value ("{0} exit={1}" -f (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ"), $code)
+            $lines = Get-Content $RestartLog
+            if ($lines.Count -gt 500) { $lines | Select-Object -Last 200 | Set-Content $RestartLog }
+        } catch {}
         if ($upMinutes -ge 10) { $failures = 0 } else { $failures++ }
         $delay = [Math]::Min(60, 5 * [Math]::Pow(2, [Math]::Min($failures, 4)))
         Write-Log ("Server exited (code {0}) after {1:N1} min; restarting in {2} s. See logs\server-err.log." -f $code, $upMinutes, $delay) "WARN"

@@ -147,14 +147,66 @@ async function authenticate(req: OnlineRequest, res: Response, next: NextFunctio
   }
   if (!check.valid || !check.payload || !isValidUuid(check.payload.userId)) return next();
   try {
-    const row = (await withCloud((c) => c.query(
-      `SELECT id, name, email, role, local_user_id, shop_id FROM giga_cloud.online_users WHERE id = $1 AND active`,
-      [check.payload!.userId]
-    ))).rows[0];
-    if (row) req.onlineUser = row;
+    const row = await findOnlineUser(check.payload.userId);
+    // Revoked session: the account's token_version moved on after this token was issued.
+    if (row && Number(row.token_version || 0) === Number(check.payload.tv || 0)) {
+      delete row.token_version;
+      req.onlineUser = row;
+    }
+    if (req.onlineUser && req.onlineUser.role !== 'ADMIN') {
+      const ctl = await getRemoteControl();
+      if (ctl.maintenance_mode && !req.path.startsWith('/health')) {
+        return res.status(503).json({ error: ctl.maintenance_message || 'The online app is in maintenance. Try again later.', code: 'MAINTENANCE' });
+      }
+    }
     next();
   } catch (err: any) {
     res.status(503).json({ error: 'Cloud database unavailable: cannot verify the session.' });
+  }
+}
+
+/** Active online account (+ token_version when cloud migration 004 is applied; 0 before). */
+async function findOnlineUser(by: string, column: 'id' | 'email' = 'id', withHash = false): Promise<any> {
+  const cols = `id, name, email, role, local_user_id, shop_id${withHash ? ', password_hash' : ''}`;
+  try {
+    return (await withCloud((c) => c.query(`SELECT ${cols}, token_version FROM giga_cloud.online_users WHERE ${column} = $1 AND active`, [by]))).rows[0];
+  } catch (err: any) {
+    if (err?.code !== '42703') throw err;
+    const row = (await withCloud((c) => c.query(`SELECT ${cols} FROM giga_cloud.online_users WHERE ${column} = $1 AND active`, [by]))).rows[0];
+    return row ? { ...row, token_version: 0 } : row;
+  }
+}
+
+// Emergency switches (giga_cloud.remote_control, migration 004), cached briefly per instance.
+let controlCache: { at: number; value: { remote_writes_enabled: boolean; maintenance_mode: boolean; maintenance_message: string | null } } | null = null;
+export async function getRemoteControl(fresh = false) {
+  if (!fresh && controlCache && Date.now() - controlCache.at < 10_000) return controlCache.value;
+  let value = { remote_writes_enabled: true, maintenance_mode: false, maintenance_message: null as string | null };
+  try {
+    const row = (await withCloud((c) => c.query(
+      `SELECT remote_writes_enabled, maintenance_mode, maintenance_message FROM giga_cloud.remote_control WHERE shop_id = $1`, [getOnlineConfig().shopId]
+    ))).rows[0];
+    if (row) value = row;
+  } catch (err: any) {
+    if (err?.code !== '42P01') throw err; // table missing = migration 004 not applied = defaults
+  }
+  controlCache = { at: Date.now(), value };
+  return value;
+}
+export function clearRemoteControlCache() {
+  controlCache = null;
+}
+
+/** Security event in giga_cloud.online_audit (never passwords/tokens). Best effort. */
+export async function securityEvent(req: Request, action: string, email: string | null, userId: string | null, details: Record<string, unknown> = {}) {
+  try {
+    await withCloud((c) => c.query(
+      `INSERT INTO giga_cloud.online_audit (shop_id, online_user_id, user_email, action, details, client_ip, user_agent) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [getOnlineConfig().shopId, userId, email ? email.slice(0, 200) : null, action, JSON.stringify(details),
+       String(req.headers['x-forwarded-for'] || req.ip || '').split(',')[0].trim().slice(0, 100), String(req.headers['user-agent'] || '').slice(0, 300)]
+    ));
+  } catch {
+    /* auditing must never break login; table may be missing before migration 003 */
   }
 }
 
@@ -234,16 +286,20 @@ export function buildOnlineRouter() {
       const identifier = String(req.body?.email || req.body?.username || '').trim().toLowerCase();
       const secret = String(req.body?.password || '').trim();
       if (!identifier || !secret) return res.status(400).json({ error: 'Email and password are required.' });
-      const user = (await withCloud((c) => c.query(
-        `SELECT id, name, email, role, password_hash, shop_id FROM giga_cloud.online_users WHERE email = $1 AND active`, [identifier]
-      ))).rows[0];
+      const user = await findOnlineUser(identifier, 'email', true);
       const shopId = getOnlineConfig().shopId;
       // Same answer for unknown user / wrong password / other shop.
       if (!user || !verifyCredential(secret, user.password_hash) || (user.shop_id && user.shop_id !== shopId)) {
+        await securityEvent(req, 'ONLINE_LOGIN_FAILED', identifier, user?.id ?? null);
         return res.status(401).json({ error: 'Invalid email or password.' });
       }
+      if (user.role !== 'ADMIN') {
+        const ctl = await getRemoteControl();
+        if (ctl.maintenance_mode) return res.status(503).json({ error: ctl.maintenance_message || 'The online app is in maintenance. Try again later.', code: 'MAINTENANCE' });
+      }
+      await securityEvent(req, 'ONLINE_LOGIN', user.email, user.id, { role: user.role });
       await withCloud((c) => c.query('UPDATE giga_cloud.online_users SET last_login_at = now() WHERE id = $1', [user.id]));
-      const token = createJwtToken({ userId: user.id, role: user.role, email: user.email, name: user.name });
+      const token = createJwtToken({ userId: user.id, role: user.role, email: user.email, name: user.name, tv: Number(user.token_version || 0) });
       res.json({ success: true, token, user: { id: user.id, name: user.name, email: user.email, role: user.role, active: true }, permissions: ROLE_PERMISSIONS[user.role as UserRole] });
     } catch (err) {
       send(res, err, 'POST /auth/login');
@@ -317,7 +373,9 @@ export function buildOnlineRouter() {
   r.get('/expenses', requireAdmin, route('GET /expenses', () => withShop((c) => getAllExpenses(c))));
 
   // Remote administration (ADMIN only): queue commands for the shop; never a direct cloud write.
-  r.use(buildRemoteAdminRouter({ shopId: () => getOnlineConfig().shopId, withShop, withCloud, requireAdmin, route }));
+  r.use(buildRemoteAdminRouter({
+    shopId: () => getOnlineConfig().shopId, withShop, withCloud, requireAdmin, route, getRemoteControl, clearRemoteControlCache, securityEvent,
+  }));
 
   // Shop-only features: not available from the cloud copy (yet).
   for (const p of ['/inventory/movements', '/audit', '/admin/health', '/email/settings', '/email/jobs', '/backups/status']) {

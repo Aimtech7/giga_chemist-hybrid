@@ -22,6 +22,13 @@ export function applyCommonMiddleware(app: express.Express) {
     if (origin) res.setHeader('Vary', 'Origin');
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Referrer-Policy', 'same-origin');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
+    // HSTS only when the request really arrived over HTTPS (Vercel); the LAN POS stays plain http.
+    if (req.secure || String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https') {
+      res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    }
+    if (req.path.startsWith('/api')) res.setHeader('Cache-Control', 'no-store');
     if (req.method === 'OPTIONS') return res.sendStatus(204);
     next();
   });

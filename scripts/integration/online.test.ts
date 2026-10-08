@@ -311,6 +311,91 @@ async function remoteAdminTests(ctx: Ctx, env: HybridEnv, o: { med: string; onli
   }
   check((await c('POST', '/api/inventory/add-stock', A, {})).status === 409, 'direct stock endpoints stay closed online (only commands)');
 
+  // 5b. Remote operations: health, alerts, insights, staff, emergency controls
+  section('REMOTE OPERATIONS — health, alerts, insights, staff, emergency controls');
+  const health = await waitFor(async () => (await c('GET', '/api/admin/shop-health', A)).data, (d) => d?.online === true && d?.database === 'HEALTHY', 40_000);
+  check(health?.online === true && health.database === 'HEALTHY' && health.sync === 'HEALTHY' && health.heartbeat_age_seconds < 60,
+    'shop health from the heartbeat: ONLINE, PostgreSQL HEALTHY, sync HEALTHY', health && { o: health.online, db: health.database, s: health.sync, age: health.heartbeat_age_seconds });
+  check(typeof health?.pending_uploads === 'number' && 'failed_events' in health && health.backup && 'uptime_seconds' in health && health.app_version,
+    'diagnostics: queues, uptime, version, backup status');
+  const healthText = JSON.stringify(health);
+  check(!healthText.includes(env.token) && !healthText.includes(env.apiKey) && !healthText.includes(o.onlineEnv.JWT_SECRET) && !/postgres(ql)?:\/\//i.test(healthText) &&
+        !healthText.includes(process.env.DB_PASSWORD || '@@none@@'), 'health response contains no secrets');
+  await env.emu.pool.query(`UPDATE giga_cloud.shop_runtime_status SET reported_at = now() - interval '10 minutes' WHERE shop_id = $1`, [env.shopId]);
+  const stale = (await c('GET', '/api/admin/shop-health', A)).data;
+  const staleRs = (await c('GET', '/api/admin/remote-status', A)).data;
+  check(stale?.online === false && staleRs?.shop_in_contact === false && staleRs.online_basis === 'heartbeat', 'heartbeat older than the threshold -> shop OFFLINE (not "web app online")', { o: stale?.online, rs: staleRs?.shop_in_contact });
+  const alerts = (await c('GET', '/api/admin/alerts', A)).data;
+  const offline = alerts?.alerts?.find((a: any) => a.alert_key === 'SHOP_OFFLINE' && a.status === 'ACTIVE');
+  check(alerts?.supported === true && Boolean(offline) && offline.severity === 'CRITICAL', 'SHOP_OFFLINE alert raised from heartbeat age', alerts?.alerts?.map((a: any) => a.alert_key));
+  const ack = await c('POST', `/api/admin/alerts/${offline?.id}/ack`, A, {});
+  check(ack.status === 200 && ack.data.status === 'ACKNOWLEDGED', 'Admin acknowledges an alert');
+  const back = await waitFor(async () => (await c('GET', '/api/admin/shop-health', A)).data, (d) => d?.online === true, 40_000);
+  const hist = (await c('GET', '/api/admin/alerts?status=all', A)).data;
+  check(back?.online === true && hist.alerts.some((a: any) => a.alert_key === 'SHOP_OFFLINE' && a.status === 'RESOLVED'), 'fresh heartbeat -> ONLINE again; offline alert RESOLVED in history');
+  const ins = await c('GET', '/api/admin/insights?days=30', A);
+  check(ins.status === 200 && Array.isArray(ins.data.low_stock) && Array.isArray(ins.data.reorder_suggestions) && Array.isArray(ins.data.dead_stock) &&
+        /Deterministic/.test(ins.data.method) && ins.data.fast_moving.some((x: any) => x.id === med), 'inventory intelligence (deterministic, from the cloud copy)', ins.data?.method);
+  for (const p of ['/api/admin/shop-health', '/api/admin/alerts', '/api/admin/insights', '/api/admin/security']) check((await c('GET', p, C)).status === 403, `Cashier GET ${p} -> 403`);
+  check((await c('POST', '/api/admin/security/remote-writes', C, { enabled: false })).status === 403, 'Cashier cannot use emergency controls (403)');
+
+  // Staff management through the phone (command -> shop). Staff profiles reach the cloud through
+  // the baseline (npm run sync:bootstrap); here only the test cashier's profile is queued.
+  const ub = spawnSync(process.execPath, ['--import', 'tsx', 'scripts/sync-bootstrap.ts', '--confirm', '--users-only', '--user', ctx.cashier2.id],
+    { env: { ...process.env, APP_MODE: 'hybrid' }, encoding: 'utf-8' });
+  const synced = await waitFor(async () => (await env.emu.pool.query('SELECT to_jsonb(u) AS j FROM giga_cloud.users u WHERE shop_id = $1 AND user_id = $2', [env.shopId, ctx.cashier2.id])).rows[0]?.j,
+    (j) => Boolean(j), 30_000);
+  check(ub.status === 0 && Boolean(synced) && !JSON.stringify(synced).includes('password_hash') && !JSON.stringify(synced).includes('pin_hash'),
+    'staff profile baseline reaches the cloud without password / PIN hashes', ub.stderr.slice(0, 300));
+  const cred = await c('POST', '/api/admin/commands/user-active', A, { user_id: ctx.cashier2.id, active: false, reason: 'ITEST x', password: 'Secret-123' });
+  check(cred.status === 400 && /password/.test(cred.data?.error || ''), 'credentials are refused by the online API (never stored in command history)');
+  const off = await follow((await c('POST', '/api/admin/commands/user-active', A, { user_id: ctx.cashier2.id, active: false, reason: 'ITEST phone disable' })).data?.command_id);
+  check(off.status === 'APPLIED' && (await pool.query('SELECT active FROM users WHERE id = $1', [ctx.cashier2.id])).rows[0].active === false && off.display?.user_name,
+    'Admin deactivates a shop cashier from the phone (APPLIED at the shop)', off);
+  const on = await follow((await c('POST', '/api/admin/commands/user-active', A, { user_id: ctx.cashier2.id, active: true, reason: 'ITEST phone enable' })).data?.command_id);
+  check(on.status === 'APPLIED' && (await pool.query('SELECT active FROM users WHERE id = $1', [ctx.cashier2.id])).rows[0].active === true, 'and reactivates it');
+  const upd = await c('POST', '/api/admin/commands/app-update', A, { target_commit: crypto.randomBytes(20).toString('hex') });
+  check(upd.status === 409, 'update approval refused unless it is the version the shop reported available', upd.data);
+  const detail = (await c('GET', `/api/admin/commands/${q.data?.command_id}`, A)).data;
+  check(detail?.display?.medicine_name === 'ZZ ITEST Online Medicine' && detail.display.batch_number === 'ONL-B1' && detail.audit_reference && detail.created_by && detail.delivered_at && detail.acked_at,
+    'activity detail: who, when requested/delivered/applied, target medicine/batch, audit reference', detail && { d: detail.display, a: detail.audit_reference });
+
+  // Emergency switch: block NEW remote changes immediately
+  const offW = await c('POST', '/api/admin/security/remote-writes', A, { enabled: false });
+  const blocked = await c('POST', '/api/admin/commands/stock-add', A, { ...stockAdd, quantity: 1 });
+  check(offW.status === 200 && offW.data.remote_writes_enabled === false && blocked.status === 423, 'remote writes disabled -> new commands refused (423)', [offW.status, blocked.status]);
+  const dbBlocked = await env.emu.pool.query(`SELECT * FROM giga_cloud.queue_online_command($1,'STOCK_ADD','{}'::jsonb,$2,(SELECT id FROM giga_cloud.online_users WHERE email = 'itest-online-admin@itest.local'))`,
+    [env.shopId, `online:x:${crypto.randomUUID()}`]).then(() => 'queued', (e) => e.code);
+  check(dbBlocked === 'PT423', 'the database itself refuses commands while disabled (not only the API)', dbBlocked);
+  const onW = await c('POST', '/api/admin/security/remote-writes', A, { enabled: true });
+  check(onW.data?.remote_writes_enabled === true, 'remote writes re-enabled');
+
+  // Maintenance mode: only Administrators
+  await c('POST', '/api/admin/security/maintenance', A, { enabled: true, message: 'ITEST maintenance' });
+  const cm = await c('GET', '/api/medicines', C);
+  const cl = await c('POST', '/api/auth/login', null, { email: 'itest-online-cashier@itest.local', password: o.cashPw });
+  check(cm.status === 503 && cm.data?.code === 'MAINTENANCE' && cl.status === 503 && (await c('GET', '/api/medicines', A)).status === 200,
+    'maintenance mode: Cashier blocked (session + login), Administrator still works', [cm.status, cl.status]);
+  await c('POST', '/api/admin/security/maintenance', A, { enabled: false });
+  check((await c('GET', '/api/medicines', C)).status === 200, 'maintenance off: Cashier back');
+
+  // Session revocation and account deactivation (stolen phone)
+  const sec = (await c('GET', '/api/admin/security', A)).data;
+  const cashierAcct = sec?.online_users?.find((u: any) => u.email === 'itest-online-cashier@itest.local');
+  const rv = await c('POST', '/api/admin/security/revoke-sessions', A, { user_id: cashierAcct?.id });
+  check(rv.status === 200 && (await c('GET', '/api/auth/me', C)).status === 401, 'revoked session rejected (401)');
+  const C2 = (await c('POST', '/api/auth/login', null, { email: 'itest-online-cashier@itest.local', password: o.cashPw })).data?.token;
+  check(Boolean(C2) && (await c('GET', '/api/auth/me', C2)).status === 200, 'a new login works after revocation');
+  await c('POST', `/api/admin/security/online-users/${cashierAcct?.id}/active`, A, { active: false });
+  check((await c('POST', '/api/auth/login', null, { email: 'itest-online-cashier@itest.local', password: o.cashPw })).status === 401 && (await c('GET', '/api/auth/me', C2)).status === 401,
+    'deactivated online account: login refused and its sessions die');
+  await c('POST', `/api/admin/security/online-users/${cashierAcct?.id}/active`, A, { active: true });
+  const me = (await c('GET', '/api/auth/me', A)).data;
+  const lastAdmin = await c('POST', `/api/admin/security/online-users/${me?.user?.id}/active`, A, { active: false });
+  check(lastAdmin.status === 409, 'the last active online Administrator cannot be deactivated', lastAdmin.data);
+  const events = (await c('GET', '/api/admin/security', A)).data?.recent_events?.map((e: any) => e.action) || [];
+  check(['REMOTE_WRITES_DISABLED', 'MAINTENANCE_ON', 'ONLINE_SESSIONS_REVOKED', 'ONLINE_ACCOUNT_DEACTIVATED', 'ONLINE_LOGIN'].every((a) => events.includes(a)), 'security events audited', events.slice(0, 12));
+
   // 6. No shop secrets reach the browser
   const bodies = JSON.stringify([q.data, f1, list.data, rs.data, (await c('GET', '/api/health')).data]);
   check(!bodies.includes(env.token) && !bodies.includes(env.apiKey), 'API responses never contain the shop sync token or cloud key');

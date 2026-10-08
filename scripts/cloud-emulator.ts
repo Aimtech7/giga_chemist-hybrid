@@ -22,6 +22,7 @@ const FUNCTIONS: Record<string, [string, string][]> = {
   gc_ingest_events: [['p_shop_id', 'uuid'], ['p_token', 'text'], ['p_events', 'jsonb']],
   gc_pull_commands: [['p_shop_id', 'uuid'], ['p_token', 'text'], ['p_limit', 'integer']],
   gc_ack_command: [['p_shop_id', 'uuid'], ['p_token', 'text'], ['p_command_id', 'uuid'], ['p_status', 'text'], ['p_result', 'jsonb'], ['p_error', 'text']],
+  gc_heartbeat: [['p_shop_id', 'uuid'], ['p_token', 'text'], ['p_status', 'jsonb']],
 };
 
 export type FaultMode = 'none' | 'timeout' | 'error500' | 'drop_response';

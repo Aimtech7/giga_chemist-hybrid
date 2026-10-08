@@ -64,6 +64,7 @@ import {
 } from './email/service';
 import { runBackup, getBackupStatus } from './ops/backup';
 import { getSystemHealth } from './ops/health';
+import { appVersion, currentCommit } from './ops/runtime';
 import { pgPool } from './db/client';
 import type {
   User,
@@ -234,6 +235,10 @@ apiRouter.get('/health', async (req, res) => {
     app_mode: getAppMode(),
     timestamp: Date.now(),
     version: '1.0.0-pwa',
+    // Public, non-secret identity of the running code + worker state (used by the updater's health gate).
+    app_version: appVersion(),
+    commit: currentCommit(),
+    sync_worker: { enabled: syncWorker.status().running, leader: syncWorker.status().leader },
     database: {
       provider: 'PostgreSQL',
       connected: pgStatus.connected,

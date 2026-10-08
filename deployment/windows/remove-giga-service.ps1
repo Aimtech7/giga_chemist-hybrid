@@ -28,6 +28,11 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
     Write-Host "[INFO] Task '$TaskName' was not installed."
 }
 
+if (Get-ScheduledTask -TaskName "GIGA CHEMIST Watchdog" -ErrorAction SilentlyContinue) {
+    Unregister-ScheduledTask -TaskName "GIGA CHEMIST Watchdog" -Confirm:$false
+    Write-Host "[ OK ] Removed task 'GIGA CHEMIST Watchdog'." -ForegroundColor Green
+}
+
 if (-not $KeepRunning) {
     # The supervisor (powershell running giga-service-runner.ps1) first, then its node server.
     $root = [Regex]::Escape($ProjectRoot)

@@ -32,6 +32,8 @@ import {
   type RemoteCommand,
   type RemoteStatus,
 } from '../../services/remoteAdmin';
+import { Sheet, StatusBadge, STATUS_TEXT, ago, when, inputCls, labelCls, btnPrimary, btnSecondary, describeResult, describeRequest, type Draft } from './remoteUi';
+import { AlertsTab, CommandDetail, HealthTab, InsightsTab, SecurityTab, StaffTab } from './RemoteOps';
 import type { Medicine, MedicineBatch, PharmacySettings, User } from '../../types';
 
 /**
@@ -44,66 +46,9 @@ interface Props {
   settings: PharmacySettings;
 }
 
-type Tab = 'medicines' | 'changes' | 'shop';
+type Tab = 'medicines' | 'changes' | 'health' | 'alerts' | 'insights' | 'staff' | 'security' | 'shop';
 
 type ActionKind = 'add' | 'remove' | 'count' | 'price' | 'details' | 'expiry';
-
-interface Draft {
-  action: RemoteAction;
-  title: string;
-  payload: Record<string, unknown>;
-  lines: [string, string][];
-  requestId: string;
-}
-
-const ago = (iso: string | null | undefined, now = Date.now()) => {
-  if (!iso) return 'never';
-  const s = Math.max(0, Math.round((now - new Date(iso).getTime()) / 1000));
-  if (s < 60) return `${s}s ago`;
-  if (s < 3600) return `${Math.round(s / 60)} min ago`;
-  if (s < 86400) return `${Math.round(s / 3600)} h ago`;
-  return `${Math.round(s / 86400)} d ago`;
-};
-const when = (iso: string | null | undefined) => (iso ? new Date(iso).toLocaleString() : '—');
-
-const STATUS_STYLE: Record<string, string> = {
-  PENDING: 'bg-amber-50 text-amber-800 border-amber-200',
-  DELIVERED: 'bg-sky-50 text-sky-800 border-sky-200',
-  APPLIED: 'bg-emerald-50 text-emerald-800 border-emerald-200',
-  REJECTED: 'bg-rose-50 text-rose-800 border-rose-200',
-};
-const STATUS_TEXT: Record<string, string> = {
-  PENDING: 'Waiting for the shop computer',
-  DELIVERED: 'Shop computer received it',
-  APPLIED: 'Applied by the shop',
-  REJECTED: 'Rejected by the shop',
-};
-
-const StatusBadge: React.FC<{ status: string }> = ({ status }) => (
-  <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded border text-[11px] font-bold ${STATUS_STYLE[status] || 'bg-slate-50 text-slate-700 border-slate-200'}`}>
-    {status === 'APPLIED' ? <CheckCircle2 className="w-3 h-3" /> : status === 'REJECTED' ? <XCircle className="w-3 h-3" /> : <Clock className="w-3 h-3" />}
-    {status}
-  </span>
-);
-
-const inputCls = 'w-full px-3 py-2.5 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-teal-600 focus:border-teal-600 outline-none bg-white';
-const labelCls = 'block text-xs font-semibold text-slate-600 mb-1';
-const btnPrimary = 'w-full flex items-center justify-center gap-2 px-4 py-3 rounded-lg bg-teal-700 hover:bg-teal-800 text-white text-sm font-bold disabled:opacity-50';
-const btnSecondary = 'w-full flex items-center justify-center gap-2 px-4 py-3 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-slate-800 text-sm font-semibold';
-
-function describeResult(c: RemoteCommand): string | null {
-  const r = c.result;
-  if (!r) return null;
-  if ('previous_quantity' in r && 'new_quantity' in r) {
-    const d = Number(r.delta);
-    return `Batch ${r.batch_number ?? ''}: ${r.previous_quantity} → ${r.new_quantity} (${d > 0 ? '+' : ''}${d}). Medicine stock now ${r.current_stock}.`;
-  }
-  if ('expiry_date' in r) return `Batch ${r.batch_number ?? ''} expiry now ${r.expiry_date || 'unknown'}.`;
-  if ('selling_price' in r) return `Selling price now ${r.selling_price}${r.wholesale_price != null ? `, wholesale ${r.wholesale_price}` : ''}.`;
-  if ('updated' in r) return `Updated: ${(r.updated as string[]).join(', ')}.`;
-  if ('name' in r) return `Saved: ${r.name}.`;
-  return null;
-}
 
 export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings }) => {
   const [tab, setTab] = useState<Tab>('medicines');
@@ -123,6 +68,7 @@ export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings }) => 
   const [tracked, setTracked] = useState<RemoteCommand[]>([]);
   const [history, setHistory] = useState<RemoteCommand[]>([]);
   const [now, setNow] = useState(Date.now());
+  const [detail, setDetail] = useState<RemoteCommand | null>(null);
   const cur = settings.currency || 'KES';
 
   const loadCatalog = useCallback(async () => {
@@ -286,7 +232,7 @@ export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings }) => 
   );
 
   const commandRow = (c: RemoteCommand) => (
-    <div key={c.command_id} className="bg-white border border-slate-200 rounded-xl p-3">
+    <button key={c.command_id} onClick={() => setDetail(c)} className="w-full text-left bg-white border border-slate-200 rounded-xl p-3 hover:border-teal-600">
       <div className="flex items-center justify-between gap-2">
         <div className="text-sm font-semibold text-slate-900 truncate">
           {COMMAND_LABELS[c.command_type] || c.command_type}
@@ -295,13 +241,13 @@ export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings }) => 
         <StatusBadge status={c.status} />
       </div>
       <div className="text-[11px] text-slate-500 mt-0.5">
-        {medicines.find((m) => m.id === c.payload?.medicine_id)?.name || c.payload?.name || c.payload?.pharmacy_name || ''} · sent {ago(c.created_at, now)}
+        {describeRequest(c) || medicines.find((m) => m.id === c.payload?.medicine_id)?.name || ''} · sent {ago(c.created_at, now)}
         {c.created_by ? ` by ${c.created_by.replace(/\s*<.*>$/, '')}` : ''}
       </div>
       <div className="text-[11px] mt-1 text-slate-600">{STATUS_TEXT[c.status]}{c.acked_at ? ` · ${when(c.acked_at)}` : ''}</div>
       {c.status === 'APPLIED' && describeResult(c) && <div className="text-[12px] mt-1 text-emerald-800 font-medium">{describeResult(c)}</div>}
       {c.status === 'REJECTED' && c.error && <div className="text-[12px] mt-1 text-rose-800 bg-rose-50 rounded p-1.5">{c.error}</div>}
-    </div>
+    </button>
   );
 
   return (
@@ -309,9 +255,10 @@ export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings }) => 
       <div className="px-3 pt-3 pb-2 bg-white border-b border-slate-200 shrink-0">
         <h1 className="text-base font-bold text-slate-900">Remote Admin</h1>
         <p className="text-[11px] text-slate-500">Changes are sent to the shop computer, which applies them to the shop database and syncs the result back.</p>
-        <div className="grid grid-cols-3 gap-1 mt-2 bg-slate-100 p-1 rounded-lg">
-          {([['medicines', 'Medicines'], ['changes', 'Changes'], ['shop', 'Shop & Settings']] as [Tab, string][]).map(([id, label]) => (
-            <button key={id} onClick={() => setTab(id)} className={`py-2 rounded-md text-xs font-semibold ${tab === id ? 'bg-white text-teal-800 shadow-xs' : 'text-slate-600'}`}>
+        <div className="flex gap-1 mt-2 bg-slate-100 p-1 rounded-lg overflow-x-auto">
+          {([['medicines', 'Medicines'], ['changes', 'Activity'], ['health', 'Health'], ['alerts', 'Alerts'], ['insights', 'Reports'],
+            ['staff', 'Staff'], ['security', 'Security'], ['shop', 'Settings']] as [Tab, string][]).map(([id, label]) => (
+            <button key={id} onClick={() => setTab(id)} className={`shrink-0 px-3 py-2 rounded-md text-xs font-semibold whitespace-nowrap ${tab === id ? 'bg-white text-teal-800 shadow-xs' : 'text-slate-600'}`}>
               {label}
               {id === 'changes' && status && status.commands.pending + status.commands.delivered > 0 ? ` (${status.commands.pending + status.commands.delivered})` : ''}
             </button>
@@ -420,7 +367,7 @@ export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings }) => 
         {tab === 'changes' && (
           <div className="space-y-2">
             <div className="flex items-center justify-between">
-              <div className="text-xs font-bold text-slate-600 uppercase tracking-wide">Recent remote changes</div>
+              <div className="text-xs font-bold text-slate-600 uppercase tracking-wide">Remote activity (tap for details)</div>
               <button onClick={() => void loadHistory()} className="text-xs font-semibold text-teal-800 flex items-center gap-1"><RefreshCw className="w-3.5 h-3.5" /> Refresh</button>
             </div>
             {history.length === 0 && <div className="text-xs text-slate-500 p-4 text-center">No remote changes yet.</div>}
@@ -428,10 +375,18 @@ export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings }) => 
           </div>
         )}
 
+        {tab === 'health' && <HealthTab onDraft={(d) => { setSendError(null); setDraft(d); }} />}
+        {tab === 'alerts' && <AlertsTab />}
+        {tab === 'insights' && <InsightsTab currency={cur} />}
+        {tab === 'staff' && <StaffTab onDraft={(d) => { setSendError(null); setDraft(d); }} />}
+        {tab === 'security' && <SecurityTab currentUser={currentUser} />}
+
         {tab === 'shop' && (
           <ShopSettingsForms settings={settings} onDraft={(d) => { setSendError(null); setDraft(d); }} />
         )}
       </div>
+
+      {detail && <CommandDetail cmd={[...tracked, ...history].find((x) => x.command_id === detail.command_id) || detail} onClose={() => setDetail(null)} />}
 
       {form && selected && !draft && (
         <ActionSheet
@@ -471,18 +426,6 @@ export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings }) => 
 };
 
 // ---------------------------------------------------------------------------- sheets & forms
-const Sheet: React.FC<{ title: string; onClose: () => void; children: React.ReactNode }> = ({ title, onClose, children }) => (
-  <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-end sm:items-center justify-center">
-    <div className="bg-white w-full sm:max-w-md rounded-t-2xl sm:rounded-2xl max-h-[92vh] overflow-y-auto p-4">
-      <div className="flex items-center justify-between mb-3">
-        <h2 className="text-base font-bold text-slate-900">{title}</h2>
-        <button onClick={onClose} className="p-2 -mr-2 rounded-lg hover:bg-slate-100" aria-label="Close"><X className="w-5 h-5 text-slate-500" /></button>
-      </div>
-      {children}
-    </div>
-  </div>
-);
-
 const ActionSheet: React.FC<{
   kind: ActionKind;
   medicine: Medicine;
@@ -511,6 +454,8 @@ const ActionSheet: React.FC<{
     manufacturer: medicine.manufacturer || '', dosage_form: String(medicine.dosage_form || ''), dosage_strength: medicine.dosage_strength || '',
     unit: medicine.unit || '', category: medicine.category || '', description: medicine.description || '',
     prescription_required: Boolean(medicine.prescription_required),
+    sku: medicine.sku || '', barcode: medicine.barcode || '', reorder_level: String(medicine.reorder_level ?? 0),
+    status: (medicine.status || 'active') as string,
   });
   const [error, setError] = useState<string | null>(null);
   const batch = batches.find((b) => b.id === batchId) || null;
@@ -589,9 +534,11 @@ const ActionSheet: React.FC<{
         const payload: Record<string, unknown> = { medicine_id: medicine.id };
         const lines: [string, string][] = [...base];
         for (const [k, v] of Object.entries(details)) {
-          const old = k === 'prescription_required' ? Boolean(medicine.prescription_required) : String((medicine as any)[k] ?? '');
+          const old = k === 'prescription_required' ? Boolean(medicine.prescription_required) : String((medicine as any)[k] ?? (k === 'reorder_level' ? 0 : ''));
           const val = typeof v === 'string' ? v.trim() : v;
-          if (val !== old) { payload[k] = val; lines.push([k.replace(/_/g, ' '), `${String(old) || '—'} → ${String(val) || '—'}`]); }
+          if (k === 'reorder_level' && !/^d+$/.test(String(val))) throw new Error('Reorder level must be a whole number.');
+          if ((k === 'sku' || k === 'barcode') && val === '' && old !== '') throw new Error(`${k} cannot be cleared remotely.`);
+          if (val !== old) { payload[k] = k === 'reorder_level' ? Number(val) : val; lines.push([k.replace(/_/g, ' '), `${String(old) || '—'} → ${String(val) || '—'}`]); }
         }
         if (details.name.trim() === '') throw new Error('Name cannot be empty.');
         if (lines.length === 1) throw new Error('Nothing changed.');
@@ -679,7 +626,8 @@ const ActionSheet: React.FC<{
         {kind === 'details' && (
           <div className="space-y-2">
             {([['name', 'Name'], ['generic_name', 'Generic name'], ['brand_name', 'Brand'], ['manufacturer', 'Manufacturer'], ['dosage_form', 'Dosage form'],
-              ['dosage_strength', 'Strength'], ['unit', 'Unit'], ['description', 'Description']] as const).map(([k, label]) => (
+              ['dosage_strength', 'Strength'], ['unit', 'Unit'], ['description', 'Description'], ['sku', 'SKU'], ['barcode', 'Barcode'],
+              ['reorder_level', 'Reorder level']] as const).map(([k, label]) => (
               <div key={k}>
                 <label className={labelCls}>{label}</label>
                 <input value={details[k]} onChange={(e) => setDetails({ ...details, [k]: e.target.value })} className={inputCls} />
@@ -694,6 +642,13 @@ const ActionSheet: React.FC<{
               <input type="checkbox" checked={details.prescription_required} onChange={(e) => setDetails({ ...details, prescription_required: e.target.checked })} className="w-4 h-4" />
               Prescription required
             </label>
+            <div>
+              <label className={labelCls}>Status</label>
+              <select value={details.status} onChange={(e) => setDetails({ ...details, status: e.target.value })} className={inputCls}>
+                <option value="active">Active (sellable)</option>
+                <option value="inactive">Inactive (hidden from POS)</option>
+              </select>
+            </div>
           </div>
         )}
         {error && <div className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded p-2">{error}</div>}

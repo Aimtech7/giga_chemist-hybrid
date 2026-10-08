@@ -87,6 +87,28 @@ Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger @($atBoot, $
     -Description "GIGA CHEMIST pharmacy POS server (local PostgreSQL authoritative; hybrid cloud sync). Configuration in $ProjectRoot\.env." | Out-Null
 Ok "Scheduled task '$TaskName' registered (SYSTEM, at startup + 5-minute watchdog)."
 
+# 3b. PostgreSQL must start with Windows (never reinstalled or reconfigured beyond the start type).
+$pgServices = Get-Service -Name "postgresql*" -ErrorAction SilentlyContinue
+if (-not $pgServices) { Write-Host "[WARN] No postgresql* Windows service found (expected e.g. postgresql-x64-18)." -ForegroundColor Yellow }
+foreach ($svc in $pgServices) {
+    if ($svc.StartType -ne "Automatic") {
+        Set-Service -Name $svc.Name -StartupType Automatic
+        Ok "PostgreSQL service $($svc.Name): startup type set to Automatic (was $($svc.StartType))."
+    } else { Ok "PostgreSQL service $($svc.Name): Automatic" }
+    if ($svc.Status -ne "Running") { Start-Service -Name $svc.Name; Ok "Started $($svc.Name)." }
+}
+
+# 3c. Watchdog: hung-server detection + PostgreSQL / supervisor restart, every 5 minutes.
+$WatchdogTask = "GIGA CHEMIST Watchdog"
+$Watchdog = Join-Path $ProjectRoot "deployment\windows\watchdog.ps1"
+if (Get-ScheduledTask -TaskName $WatchdogTask -ErrorAction SilentlyContinue) { Unregister-ScheduledTask -TaskName $WatchdogTask -Confirm:$false }
+$wdAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Watchdog`" -ProjectRoot `"$ProjectRoot`" -Port $Port" -WorkingDirectory $ProjectRoot
+$wdTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(3) -RepetitionInterval (New-TimeSpan -Minutes 5)
+$wdSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 4)
+Register-ScheduledTask -TaskName $WatchdogTask -Action $wdAction -Trigger $wdTrigger -Principal $taskPrincipal -Settings $wdSettings `
+    -Description "GIGA CHEMIST watchdog: restarts a hung server, starts PostgreSQL / the supervisor if stopped." | Out-Null
+Ok "Scheduled task '$WatchdogTask' registered (SYSTEM, every 5 minutes)."
+
 # 4. LAN firewall rule (Private profile only). PostgreSQL is never opened.
 if (-not $NoLanFirewallRule) {
     Get-NetFirewallRule -DisplayName $FirewallRuleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule

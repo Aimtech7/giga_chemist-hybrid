@@ -36,6 +36,19 @@ if (Get-ScheduledTask -TaskName "GigaChemistPOS_Service" -ErrorAction SilentlyCo
     Bad "The older task 'GigaChemistPOS_Service' still exists (it forces APP_MODE=local). Re-run install-giga-service.ps1."
 }
 
+foreach ($t in @("GIGA CHEMIST Watchdog", "GIGA CHEMIST Updater")) {
+    $x = Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue
+    if (-not $x) { if ($t -like "*Watchdog") { Bad "Task '$t' missing (re-run install-giga-service.ps1)." } else { Warn "Task '$t' not installed (remote updates disabled; deployment\windows\updater\install-updater-task.ps1)." } }
+    elseif ($x.State -eq "Disabled") { Bad "Task '$t' is DISABLED." }
+    else { Ok "Task '$t': $($x.State)" }
+}
+$pgSvc = Get-Service -Name "postgresql*" -ErrorAction SilentlyContinue
+if (-not $pgSvc) { Bad "No postgresql* Windows service found." }
+foreach ($svc in $pgSvc) {
+    if ($svc.StartType -eq "Automatic") { Ok "PostgreSQL service $($svc.Name): Automatic, $($svc.Status)" } else { Bad "PostgreSQL service $($svc.Name) startup type is $($svc.StartType) (must be Automatic)." }
+    if ($svc.Status -ne "Running") { Bad "PostgreSQL service $($svc.Name) is $($svc.Status)." }
+}
+
 # 2. Server
 try {
     $h = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/health" -TimeoutSec 5 -ErrorAction Stop
@@ -60,6 +73,8 @@ if (Test-Path $envFile) {
     $sync = (& $get "SYNC_ENABLED").Trim().ToLower()
     if ($mode -eq "hybrid") { Ok ".env APP_MODE=hybrid" } else { Bad ".env APP_MODE=$mode (remote admin needs hybrid)" }
     if ($sync -eq "true") { Ok ".env SYNC_ENABLED=true" } else { Bad ".env SYNC_ENABLED is not true (commands from the phone would never be pulled)" }
+    $bk = (& $get "BACKUP_ENABLED").Trim().ToLower()
+    if ($bk -eq "true") { Ok ".env BACKUP_ENABLED=true (daily at $((& $get 'BACKUP_TIME').Trim()), dir $((& $get 'BACKUP_DIR').Trim()))" } else { Bad ".env BACKUP_ENABLED is not true (no automatic backups)" }
     foreach ($k in @("SUPABASE_URL", "SYNC_SHOP_TOKEN", "SHOP_ID")) {
         if ((& $get $k).Trim()) { Ok ".env $k is set (value not shown)" } else { Bad ".env $k is empty" }
     }

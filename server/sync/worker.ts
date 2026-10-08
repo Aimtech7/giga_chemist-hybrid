@@ -4,6 +4,7 @@ import { getSyncConfig, cloudHost } from './config';
 import { callCloud, CloudError } from './cloudClient';
 import { applyCloudCommand, type CloudCommand } from './commands';
 import { getShopIdentity, reconcileShopIdentity } from './identity';
+import { collectRuntimeStatus } from './heartbeat';
 
 /**
  * Background sync worker on the LOCAL server.
@@ -40,6 +41,8 @@ class SyncWorker {
   private nextRunAt: number | null = null;
   /** Commands whose apply failure was already logged (avoid one log line per cycle). */
   private loggedCommandErrors = new Set<string>();
+  private lastHeartbeatAt = 0;
+  private heartbeatNotice = false;
   readonly workerId = `server-${process.pid}`;
 
   cloudReachable: boolean | null = null;
@@ -146,13 +149,38 @@ class SyncWorker {
     const inbound = await this.pullAndApplyCommands();
     if (inbound === 'unreachable') return;
 
-    // 3. Cloud just became reachable again: make backed-off events due and push them now.
+    // 3. Heartbeat (runtime health + alert conditions) for the Administrator's phone.
+    await this.maybeHeartbeat();
+
+    // 4. Cloud just became reachable again: make backed-off events due and push them now.
     if (inbound === 'reconnected' || outbound === 'reconnected') {
       const res = await pgPool.query(
         `UPDATE sync_events SET next_attempt_at = CURRENT_TIMESTAMP WHERE status = 'PENDING' AND next_attempt_at > CURRENT_TIMESTAMP`
       );
       if (res.rowCount) console.log(`[Sync] Cloud reachable again; retrying ${res.rowCount} backed-off event(s) now.`);
       await this.pushDueEvents();
+    }
+  }
+
+  // -------------------------------------------------------------------------- heartbeat
+  private async maybeHeartbeat(force = false) {
+    const every = Math.max(15, Number(process.env.HEARTBEAT_INTERVAL_SECONDS) || 60) * 1000;
+    if (!force && Date.now() - this.lastHeartbeatAt < every) return;
+    this.lastHeartbeatAt = Date.now();
+    const cfg = getSyncConfig();
+    try {
+      const identity = await getShopIdentity();
+      const status = await collectRuntimeStatus({
+        running: this.started && !this.stopped, leader: this.isLeader, consecutive_failures: this.consecutiveFailures, halted_reason: this.haltedReason,
+      });
+      await callCloud('gc_heartbeat', { p_shop_id: identity.shop_id, p_token: cfg.shopToken, p_status: status });
+      this.heartbeatNotice = false;
+    } catch (err: any) {
+      // Never affects sync or the POS. A cloud without migration 004 answers 404: logged once.
+      if (!this.heartbeatNotice) {
+        console.warn('[Sync] Heartbeat not delivered:', err?.message || err);
+        this.heartbeatNotice = true;
+      }
     }
   }
 

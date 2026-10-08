@@ -1,5 +1,8 @@
 # GIGA CHEMIST — Remote Admin from a phone
 
+> Full operations guide (health, alerts, backups, updates, emergency controls, deployment and the
+> phone acceptance test): [GIGA_CHEMIST_REMOTE_OPERATIONS.md](GIGA_CHEMIST_REMOTE_OPERATIONS.md).
+
 The Administrator manages the pharmacy from https://gigachem.vercel.app on a phone. The pharmacy PC's
 local PostgreSQL stays **authoritative**: the phone never writes stock in the cloud.
 

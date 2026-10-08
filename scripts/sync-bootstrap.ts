@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { pgPool } from '../server/db/client';
-import { enqueueMedicineBaselines } from '../server/sync/bootstrap';
+import { enqueueMedicineBaselines, enqueueUserProfiles } from '../server/sync/bootstrap';
 import { getSyncConfig } from '../server/sync/config';
 
 /**
@@ -11,13 +11,25 @@ import { getSyncConfig } from '../server/sync/config';
  *
  *   npm run sync:bootstrap -- --confirm
  *   npm run sync:bootstrap -- --confirm --medicine <uuid> [--medicine <uuid> ...]
+ *   npm run sync:bootstrap -- --confirm --users-only [--user <uuid> ...]   staff profiles only (no hashes)
+ * A full run (no --medicine) also queues every staff profile (USER_UPSERTED, credentials stripped).
  */
 async function main() {
   const cfg = getSyncConfig();
   if (!cfg.outboxEnabled) throw new Error('APP_MODE must be hybrid in .env.');
   const args = process.argv.slice(2);
   const ids: string[] = [];
-  for (let i = 0; i < args.length; i++) if (args[i] === '--medicine' && args[i + 1]) ids.push(args[++i]);
+  const userIds: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--medicine' && args[i + 1]) ids.push(args[++i]);
+    else if (args[i] === '--user' && args[i + 1]) userIds.push(args[++i]);
+  }
+  if (args.includes('--users-only')) {
+    if (!args.includes('--confirm')) return console.log('Would queue staff profiles. Re-run with --confirm.');
+    const u = await enqueueUserProfiles({ userIds });
+    console.log(`Queued ${u.queued} staff profile event(s).`);
+    return;
+  }
   const total = ids.length || Number((await pgPool.query('SELECT COUNT(*) n FROM medicines')).rows[0].n);
   if (!args.includes('--confirm')) {
     console.log(`Would queue ${total} MEDICINE_BASELINE event(s). Re-run with --confirm to queue them.`);
@@ -30,6 +42,7 @@ async function main() {
     },
   });
   console.log(`Queued ${res.queued} baseline event(s). The running server's sync worker delivers them.`);
+  if (!ids.length) console.log(`Queued ${(await enqueueUserProfiles()).queued} staff profile event(s) (no credentials).`);
 }
 
 main()

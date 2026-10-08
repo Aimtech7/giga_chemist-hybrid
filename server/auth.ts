@@ -36,6 +36,8 @@ export interface JwtPayload {
   role: UserRole;
   email: string;
   name: string;
+  /** Online accounts only: session version; bumping it in the cloud revokes older tokens. */
+  tv?: number;
   iat: number;
   exp: number;
 }
@@ -89,7 +91,7 @@ function base64UrlDecode(str: string): string {
   return Buffer.from(base64, 'base64').toString('utf-8');
 }
 
-export function createJwtToken(payload: { userId: string; role: UserRole; email: string; name: string }): string {
+export function createJwtToken(payload: { userId: string; role: UserRole; email: string; name: string; tv?: number }): string {
   const now = Math.floor(Date.now() / 1000);
   const fullPayload: JwtPayload = {
     ...payload,

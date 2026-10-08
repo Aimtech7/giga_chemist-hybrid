@@ -240,6 +240,13 @@ export async function opsTests(ctx: Ctx, env: OpsEnv) {
   check(b2.status === 200 && b3.status === 200 && files3.length === 2 && !files3.includes(files1[0]), 'retention keeps the newest BACKUP_KEEP=2 generations', files3);
   const st = (await api('GET', '/api/backups/status', ctx.adminToken)).data;
   check(st.last_success_at && st.last_success_file === b3.data.file && st.age_hours !== null && st.location === backupDir, 'backup status: last success, age, location', st);
+  const runs = (await pool.query(`SELECT verified, toc_entries, tier, weekly_file_path FROM backup_runs WHERE status = 'SUCCESS' ORDER BY started_at DESC LIMIT 3`)).rows;
+  check(runs.length === 3 && runs.every((x) => x.verified === true && x.toc_entries > 0), 'every successful backup recorded as VERIFIED (pg_restore --list TOC entries)', runs);
+  const weekly = fs.existsSync(path.join(backupDir, 'weekly')) ? fs.readdirSync(path.join(backupDir, 'weekly')).filter((f) => f.endsWith('.dump')) : [];
+  check(weekly.length === 1 && runs.filter((x) => x.tier === 'WEEKLY').length === 1 && runs[2].tier === 'WEEKLY',
+    'weekly tier: first backup copied to weekly/, later ones within 7 days are daily only', { weekly, tiers: runs.map((x) => x.tier) });
+  check(fs.statSync(path.join(backupDir, 'weekly', weekly[0])).size === b1.data.size_bytes, 'weekly copy is byte-identical in size to its verified daily archive');
+  check(st.keep_weekly === 4 && st.weekly_count === 1 && st.last_success_verified === true && 'next_backup_at' in st, 'status reports weekly retention, verification and next backup', st);
   const cliDir = path.join(backupDir, 'cli');
   const cli = spawnSync(process.execPath, ['--import', 'tsx', 'scripts/backup/backup-db.ts', '--dir', cliDir, '--keep', '1'], { encoding: 'utf-8', env: { ...process.env, APP_MODE: 'local' } });
   check(cli.status === 0 && /BACKUP OK/.test(cli.stdout) && fs.readdirSync(cliDir).filter((f) => f.endsWith('.dump')).length === 1, 'CLI backup (npm run backup) succeeds', cli.stderr.slice(0, 300));

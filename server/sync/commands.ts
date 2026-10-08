@@ -7,6 +7,8 @@ import { adminAddStockTx, adminEditBatchExpiryTx, adminPhysicalStockCountTx, adm
 import { enqueueSyncEvent, medicineJson } from './outbox';
 import { getShopIdentity } from './identity';
 import { COMMAND_TYPES, validateCommandPayload } from './commandSchema';
+import { updateUserTx } from '../db/users';
+import { readUpdateState } from '../ops/runtime';
 
 /**
  * Inbound cloud -> shop commands. Conservative by design:
@@ -215,7 +217,67 @@ const HANDLERS: Record<string, Handler> = {
       expiry_date: out.batch.expiry_date || null, batch_status: out.batch.status, current_stock: out.medicine.current_stock,
     };
   },
+
+  // ---------------------------------------------------------------- shop staff (no credentials)
+  // Same rules as the shop's user screen: the last active Administrator can never be deactivated or
+  // demoted. Passwords / PINs are NOT handled by commands (they would persist in cloud history).
+  async USER_SET_ACTIVE(client, cmd) {
+    const p = validateCommandPayload('USER_SET_ACTIVE', cmd.payload);
+    const before = await lockUser(client, p.user_id);
+    const saved = await updateUserTx(client, p.user_id, { active: p.active });
+    await recordAuditLog({
+      ...cloudActor(cmd), action: p.active ? 'REMOTE_USER_ACTIVATED' : 'REMOTE_USER_DEACTIVATED', entity: 'user', entity_id: p.user_id,
+      previous_value: { active: before.active }, new_value: { active: saved.active, reason: p.reason, command_id: cmd.command_id },
+    } as any, client);
+    return { user_id: p.user_id, name: saved.name, active: saved.active, role: saved.role };
+  },
+
+  async USER_ROLE_UPDATE(client, cmd) {
+    const p = validateCommandPayload('USER_ROLE_UPDATE', cmd.payload);
+    const before = await lockUser(client, p.user_id);
+    const saved = await updateUserTx(client, p.user_id, { role: p.role });
+    await recordAuditLog({
+      ...cloudActor(cmd), action: 'REMOTE_USER_ROLE_CHANGED', entity: 'user', entity_id: p.user_id,
+      previous_value: { role: before.role }, new_value: { role: saved.role, reason: p.reason, command_id: cmd.command_id },
+    } as any, client);
+    return { user_id: p.user_id, name: saved.name, previous_role: before.role, role: saved.role };
+  },
+
+  // ---------------------------------------------------------------- software update approval
+  // Records the approval only. The updater (scripts/updater/updater.mjs) installs it after checking
+  // independently that the commit is the tip of the approved production branch, with a verified
+  // backup first and automatic rollback if the new version is unhealthy.
+  async APP_UPDATE_APPROVE(client, cmd) {
+    const p = validateCommandPayload('APP_UPDATE_APPROVE', cmd.payload);
+    const state = readUpdateState();
+    if (!state) throw new HttpError(409, 'The updater is not installed on the shop computer (no update status yet).');
+    if (state.available_commit !== p.target_commit) {
+      throw new HttpError(409, `This version is not the update the shop detected on the approved production channel` +
+        `${state.available_commit ? ` (${state.available_commit.slice(0, 12)})` : ' (none available)'}.`);
+    }
+    let row;
+    try {
+      row = (await client.query(
+        `INSERT INTO update_approvals (target_commit, approved_by, command_id) VALUES ($1, $2, $3) RETURNING id, approved_at`,
+        [p.target_commit, cloudActor(cmd).user_name, cmd.command_id]
+      )).rows[0];
+    } catch (err: any) {
+      if (err?.code === '42P01') throw new HttpError(409, 'Local database migration 015 is missing; run npm run db:migrate on the shop computer.');
+      throw err;
+    }
+    await recordAuditLog({
+      ...cloudActor(cmd), action: 'REMOTE_UPDATE_APPROVED', entity: 'software_update', entity_id: p.target_commit,
+      new_value: { target_commit: p.target_commit, reason: p.reason, command_id: cmd.command_id, current_commit: state.current_commit ?? null },
+    } as any, client);
+    return { approval_id: row.id, target_commit: p.target_commit, note: 'Approval recorded. The shop updater verifies, backs up and installs it; watch Updates.' };
+  },
 };
+
+async function lockUser(client: pg.PoolClient, userId: string) {
+  const r = await client.query('SELECT id, name, role, active FROM users WHERE id = $1 FOR UPDATE', [userId]);
+  if (!r.rows[0]) throw new HttpError(404, 'This user does not exist in the shop.');
+  return r.rows[0] as { id: string; name: string; role: string; active: boolean };
+}
 
 export const SUPPORTED_COMMANDS = Object.keys(HANDLERS);
 // The shop handles exactly the types the cloud accepts.

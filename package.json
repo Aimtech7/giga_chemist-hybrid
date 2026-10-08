@@ -34,7 +34,10 @@
     "test:ops": "tsx scripts/integration/run-ops.ts",
     "build:api": "node scripts/build-online-api.mjs",
     "test:online": "tsx scripts/integration/run-online.ts",
-    "online:create-user": "tsx scripts/online/create-online-user.ts"
+    "online:create-user": "tsx scripts/online/create-online-user.ts",
+    "test:updater": "tsx scripts/integration/updater.test.ts",
+    "scan:dist": "node scripts/scan-dist.mjs",
+    "updater:check": "node scripts/updater/updater.mjs check"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

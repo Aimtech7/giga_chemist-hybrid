@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import type pg from 'pg';
 import { pgPool, HttpError, isValidUuid, withTransaction, type Queryable } from './client';
 import { hashCredential, verifyCredential } from '../auth';
 import type { User, UserRole } from '../../src/types';
@@ -228,6 +229,16 @@ export async function updateUser(
   updates: Partial<{ name: string; email: string; username: string | null; role: UserRole; phone: string; active: boolean }>,
   actorId?: string
 ): Promise<User> {
+  return withTransaction((client) => updateUserTx(client, id, updates, actorId));
+}
+
+/** updateUser on the caller's transaction (used by inbound cloud commands). */
+export async function updateUserTx(
+  client: pg.PoolClient,
+  id: string,
+  updates: Partial<{ name: string; email: string; username: string | null; role: UserRole; phone: string; active: boolean }>,
+  actorId?: string
+): Promise<User> {
   if (!isValidUuid(id)) throw new HttpError(400, 'User id must be a valid UUID.');
   const name = updates.name !== undefined ? requireName(updates.name) : undefined;
   const email = updates.email !== undefined ? requireEmail(updates.email) : undefined;
@@ -237,46 +248,44 @@ export async function updateUser(
   const phone =
     updates.phone !== undefined ? (String(updates.phone).trim().slice(0, 50) || null) : undefined;
 
-  return withTransaction(async (client) => {
-    const found = await client.query(`SELECT * FROM users WHERE id = $1 FOR UPDATE`, [id]);
-    const target: UserRow | undefined = found.rows[0];
-    if (!target) throw new HttpError(404, 'User not found.');
+  const found = await client.query(`SELECT * FROM users WHERE id = $1 FOR UPDATE`, [id]);
+  const target: UserRow | undefined = found.rows[0];
+  if (!target) throw new HttpError(404, 'User not found.');
 
-    const losingAdmin =
-      target.role === 'ADMIN' && target.active && ((role !== undefined && role !== 'ADMIN') || active === false);
-    if (losingAdmin) {
-      if (actorId && actorId === id) {
-        throw new HttpError(409, 'You cannot remove your own Administrator role or deactivate your own account.');
-      }
-      await assertAnotherActiveAdmin(client, id);
+  const losingAdmin =
+    target.role === 'ADMIN' && target.active && ((role !== undefined && role !== 'ADMIN') || active === false);
+  if (losingAdmin) {
+    if (actorId && actorId === id) {
+      throw new HttpError(409, 'You cannot remove your own Administrator role or deactivate your own account.');
     }
+    await assertAnotherActiveAdmin(client, id);
+  }
 
-    try {
-      const res = await client.query(
-        `UPDATE users SET
-           name = COALESCE($1, name),
-           email = COALESCE($2, email),
-           role = COALESCE($3, role),
-           phone = CASE WHEN $4::boolean THEN $5 ELSE phone END,
-           active = COALESCE($6, active),
-           username = CASE WHEN $8::boolean THEN $9 ELSE username END,
-           updated_at = CURRENT_TIMESTAMP
-         WHERE id = $7
-         RETURNING ${PUBLIC_COLUMNS}`,
-        [name ?? null, email ?? null, role ?? null, phone !== undefined, phone ?? null, active ?? null, id, username !== undefined, username ?? null]
-      );
-      const user = toUser(res.rows[0]);
-      await enqueueSyncEvent(client, {
-        event_type: 'USER_UPSERTED', entity_type: 'user', entity_id: id, operation: 'UPDATE',
-        data: async () => ({ user: await userJson(client, id) }),
-        actor: { user_id: actorId || null },
-      });
-      return user;
-    } catch (err: any) {
-      if (uniqueViolation(err)) throw new HttpError(409, duplicateMessage(err, email, username));
-      throw err;
-    }
-  });
+  try {
+    const res = await client.query(
+      `UPDATE users SET
+         name = COALESCE($1, name),
+         email = COALESCE($2, email),
+         role = COALESCE($3, role),
+         phone = CASE WHEN $4::boolean THEN $5 ELSE phone END,
+         active = COALESCE($6, active),
+         username = CASE WHEN $8::boolean THEN $9 ELSE username END,
+         updated_at = CURRENT_TIMESTAMP
+       WHERE id = $7
+       RETURNING ${PUBLIC_COLUMNS}`,
+      [name ?? null, email ?? null, role ?? null, phone !== undefined, phone ?? null, active ?? null, id, username !== undefined, username ?? null]
+    );
+    const user = toUser(res.rows[0]);
+    await enqueueSyncEvent(client, {
+      event_type: 'USER_UPSERTED', entity_type: 'user', entity_id: id, operation: 'UPDATE',
+      data: async () => ({ user: await userJson(client, id) }),
+      actor: { user_id: actorId || null },
+    });
+    return user;
+  } catch (err: any) {
+    if (uniqueViolation(err)) throw new HttpError(409, duplicateMessage(err, email, username));
+    throw err;
+  }
 }
 
 export async function toggleUserStatus(id: string, active: boolean, actorId?: string): Promise<User> {

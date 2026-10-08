@@ -1,4 +1,7 @@
 import crypto from 'crypto';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { spawnSync } from 'child_process';
 import { api, check, pool, section, startServer, stopServer, getServerLog, setServerEnv, upsertFixtureMedicine } from './harness';
 import { startCloudEmulator, prepareCloudDatabase, registerShop, type CloudEmulator } from '../cloud-emulator';
@@ -11,6 +14,8 @@ import type { Ctx } from './auth-users.test';
  * (timeout), answers 503, or commits and drops the response.
  */
 export const CLOUD_TEST_DB = 'giga_chemist_cloud_test';
+/** Runtime state dir of the test server (update-state.json etc.), never the real logs/runtime. */
+export const TEST_RUNTIME_DIR = path.join(os.tmpdir(), 'gc-itest-runtime');
 const EMU_PORT = Number(process.env.ITEST_CLOUD_PORT || 54399);
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -68,7 +73,11 @@ export async function setupHybridCloud(): Promise<HybridEnv> {
     SYNC_HTTP_TIMEOUT_MS: '1500',
     SYNC_MAX_BACKOFF_SECONDS: '3',
     SYNC_BATCH_SIZE: '25',
+    HEARTBEAT_INTERVAL_SECONDS: '15',
+    GIGA_RUNTIME_DIR: TEST_RUNTIME_DIR,
   });
+  fs.rmSync(TEST_RUNTIME_DIR, { recursive: true, force: true });
+  fs.mkdirSync(TEST_RUNTIME_DIR, { recursive: true });
   return { emu, shopId, token, apiKey };
 }
 
@@ -443,6 +452,60 @@ export async function hybridTests(ctx: Ctx, env: HybridEnv) {
   check(snapR?.status === 'REJECTED' && /current_stock/.test(snapR.error || ''), 'stock snapshot field refused', snapR?.error);
   check((await batchQty()) === 50, 'rejected commands changed nothing');
   check((await sale1Items()) === itemsBefore, 'historical sale_items untouched by remote stock commands');
+
+  // ------------------------------------------------------------------ TEST 14
+  section('TEST 14 — Heartbeat, alerts, staff commands, update approval');
+  const rt = await waitFor(async () => (await emu.pool.query(
+    `SELECT *, EXTRACT(EPOCH FROM now() - reported_at)::int AS age FROM giga_cloud.shop_runtime_status WHERE shop_id = $1`, [shopId])).rows[0], (x) => Boolean(x), 30_000);
+  check(Boolean(rt) && rt.age < 60 && rt.db_healthy === true && rt.worker_healthy === true, 'heartbeat stored in the cloud (db healthy, sync worker healthy)', rt && { age: rt.age, db: rt.db_healthy, w: rt.worker_healthy });
+  check(rt?.app_version && rt.device_id && typeof rt.outbound_pending === 'number' && rt.backup && rt.inventory, 'heartbeat carries version, device, queue counts, backup and inventory state');
+  const hbText = JSON.stringify(rt?.status || {});
+  check(!hbText.includes(env.token) && !hbText.includes(env.apiKey) && !/postgres(ql)?:\/\//i.test(hbText) && !hbText.includes(process.env.DB_PASSWORD || '@@none@@') &&
+        !hbText.includes(process.env.JWT_SECRET || '@@none@@'), 'heartbeat contains no token, key, connection string, DB password or JWT secret');
+  const before14 = Number(rt?.heartbeats || 0);
+  const rt2 = await waitFor(async () => Number((await emu.pool.query('SELECT heartbeats FROM giga_cloud.shop_runtime_status WHERE shop_id = $1', [shopId])).rows[0]?.heartbeats || 0), (n) => n > before14, 30_000);
+  check(rt2 > before14, 'heartbeat repeats periodically', { before14, rt2 });
+  const shopAlerts = (await emu.pool.query(`SELECT alert_key FROM giga_cloud.alerts WHERE shop_id = $1 AND source = 'SHOP' AND status <> 'RESOLVED'`, [shopId])).rows.map((x) => x.alert_key);
+  check(shopAlerts.includes('BACKUP_DISABLED') || shopAlerts.includes('BACKUP_STALE'), 'shop-raised alert stored (backups not enabled on the test server)', shopAlerts);
+
+  // Staff commands (no credentials ever travel)
+  const c2 = ctx.cashier2;
+  const off = await issue('USER_SET_ACTIVE', { user_id: c2.id, active: false, reason: 'ITEST staff left' });
+  const offR = await waitFinal(off);
+  const c2row = async () => (await pool.query('SELECT active, role FROM users WHERE id = $1', [c2.id])).rows[0];
+  check(offR?.status === 'APPLIED' && (await c2row()).active === false, 'USER_SET_ACTIVE: cashier deactivated by command', offR);
+  const denied = await api('POST', '/api/auth/login', null, { email: c2.email, password: c2.password });
+  check(denied.status === 401 || denied.status === 403, 'deactivated cashier can no longer log in at the shop', denied.status);
+  check(await n(`SELECT COUNT(*) n FROM audit_logs WHERE action = 'REMOTE_USER_DEACTIVATED' AND entity_id = $1 AND new_value->>'command_id' = $2`, [c2.id, off]) === 1 &&
+        await n(`SELECT COUNT(*) n FROM sync_events WHERE event_type = 'USER_UPSERTED' AND entity_id = $1 AND created_at > now() - interval '2 minutes'`, [c2.id]) >= 1,
+    'audited and synced back (USER_UPSERTED)');
+  const role = await issue('USER_ROLE_UPDATE', { user_id: c2.id, role: 'ADMIN', reason: 'ITEST promotion' });
+  const roleR = await waitFinal(role);
+  check(roleR?.status === 'APPLIED' && (await c2row()).role === 'ADMIN', 'USER_ROLE_UPDATE applied', roleR);
+  const badRole = await issue('USER_ROLE_UPDATE', { user_id: c2.id, role: 'SUPERUSER', reason: 'ITEST bad' });
+  check((await waitFinal(badRole))?.status === 'REJECTED', 'unknown role REJECTED');
+  const pin = await issue('USER_SET_ACTIVE', { user_id: c2.id, active: true, reason: 'ITEST back', pin: '123456' });
+  const pinR = await waitFinal(pin);
+  check(pinR?.status === 'REJECTED' && /pin/.test(pinR.error || ''), 'credential fields are refused in staff commands', pinR?.error);
+  await waitFinal(await issue('USER_ROLE_UPDATE', { user_id: c2.id, role: 'CASHIER', reason: 'ITEST restore' }));
+  const onR = await waitFinal(await issue('USER_SET_ACTIVE', { user_id: c2.id, active: true, reason: 'ITEST restore' }));
+  check(onR?.status === 'APPLIED' && (await c2row()).active === true && (await c2row()).role === 'CASHIER', 'cashier restored (active CASHIER)');
+
+  // Update approval: only the exact version the shop's updater detected is accepted.
+  const fakeSha = crypto.randomBytes(20).toString('hex');
+  const noState = await waitFinal(await issue('APP_UPDATE_APPROVE', { target_commit: fakeSha }));
+  check(noState?.status === 'REJECTED' && /updater is not installed/.test(noState.error || ''), 'approval REJECTED when the updater has reported nothing', noState?.error);
+  fs.writeFileSync(path.join(TEST_RUNTIME_DIR, 'update-state.json'), JSON.stringify({ status: 'UPDATE_AVAILABLE', channel: 'production', current_commit: 'a'.repeat(40), available_commit: fakeSha }));
+  const other = await waitFinal(await issue('APP_UPDATE_APPROVE', { target_commit: crypto.randomBytes(20).toString('hex') }));
+  check(other?.status === 'REJECTED' && /not the update the shop detected/.test(other.error || ''), 'approval for a different commit REJECTED', other?.error);
+  const ok14 = await waitFinal(await issue('APP_UPDATE_APPROVE', { target_commit: fakeSha, reason: 'ITEST approve' }));
+  const appr = (await pool.query('SELECT target_commit, consumed_at FROM update_approvals WHERE target_commit = $1', [fakeSha])).rows;
+  check(ok14?.status === 'APPLIED' && appr.length === 1 && appr[0].consumed_at === null, 'approval of the detected version recorded locally (updater installs it)', ok14);
+  const helper = spawnSync(process.execPath, ['--import', 'tsx', 'scripts/updater/approval.ts', 'get', fakeSha], { encoding: 'utf-8', env: { ...process.env } });
+  check(/"approved":true/.test(helper.stdout), 'updater approval helper sees the approval', helper.stdout + helper.stderr);
+  spawnSync(process.execPath, ['--import', 'tsx', 'scripts/updater/approval.ts', 'consume', fakeSha, 'ITEST', 'test cleanup'], { encoding: 'utf-8' });
+  await pool.query('DELETE FROM update_approvals WHERE target_commit = $1', [fakeSha]);
+  fs.rmSync(path.join(TEST_RUNTIME_DIR, 'update-state.json'), { force: true });
 
   // ------------------------------------------------------------------ SECURITY / STATUS
   section('SYNC STATUS & SECURITY');

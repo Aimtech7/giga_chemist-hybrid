@@ -1,5 +1,5 @@
 import { pgPool, withTransaction } from '../db/client';
-import { enqueueSyncEvent, isOutboxEnabled, medicineJson } from './outbox';
+import { enqueueSyncEvent, isOutboxEnabled, medicineJson, userJson } from './outbox';
 
 /**
  * Queues one MEDICINE_BASELINE event per medicine: its metadata plus every batch with its
@@ -39,4 +39,23 @@ export async function enqueueMedicineBaselines(opts: { medicineIds?: string[]; o
     opts.onProgress?.(done, ids.length);
   }
   return { queued: done };
+}
+
+/**
+ * Queues one USER_UPSERTED event per shop staff account (name, role, active — userJson() strips the
+ * password / PIN hashes), so the Administrator's phone can see and manage staff from the start.
+ */
+export async function enqueueUserProfiles(opts: { userIds?: string[] } = {}) {
+  if (!isOutboxEnabled()) throw new Error('APP_MODE=hybrid is required to queue cloud baselines.');
+  const ids: string[] = opts.userIds?.length ? opts.userIds : (await pgPool.query('SELECT id FROM users ORDER BY name, id')).rows.map((r) => r.id);
+  for (const id of ids) {
+    await withTransaction(async (client) => {
+      await enqueueSyncEvent(client, {
+        event_type: 'USER_UPSERTED', entity_type: 'user', entity_id: id, operation: 'BASELINE',
+        data: async () => ({ user: await userJson(client, id) }),
+        actor: { user_name: 'SYSTEM (baseline)' },
+      });
+    });
+  }
+  return { queued: ids.length };
 }

@@ -98,6 +98,8 @@ export const SyncIndicator: React.FC<SyncIndicatorProps> = ({ currentUser, onRef
 
   const state = snap?.state || 'UNKNOWN';
   const pending = snap?.pending || 0;
+  // Online Administrators can queue remote changes (applied by the shop computer); the cloud copy itself stays read-only.
+  const label = state === 'ONLINE_READONLY' && admin ? 'ONLINE — CLOUD COPY · REMOTE ADMIN ENABLED' : LABELS[state](pending);
   const s = snap?.status;
   const title =
     state === 'SERVER_UNREACHABLE'
@@ -125,11 +127,11 @@ export const SyncIndicator: React.FC<SyncIndicatorProps> = ({ currentUser, onRef
         onClick={() => admin && setOpen((v) => !v)}
         className={`flex items-center gap-1.5 px-1.5 py-0.5 rounded ${admin ? 'hover:bg-slate-800 cursor-pointer' : 'cursor-default'}`}
         title={title}
-        aria-label={`Sync status: ${LABELS[state](pending)}`}
+        aria-label={`Sync status: ${label}`}
       >
         <span className={`w-2 h-2 rounded-full ${DOT[state]}`} />
         <StateIcon state={state} />
-        <span className={`font-medium ${TEXT[state]}`}>{LABELS[state](pending)}</span>
+        <span className={`font-medium ${TEXT[state]}`}>{label}</span>
       </button>
 
       <button
