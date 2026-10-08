@@ -139,6 +139,8 @@ export interface StockActor {
   user_name: string;
   role?: string;
   device_id?: string;
+  /** Set when the change was requested by a cloud (remote admin) command; recorded in the outbox event. */
+  command_id?: string;
 }
 
 export async function insertMovement(
@@ -355,6 +357,11 @@ export interface AdminAddStockParams extends StockActor {
 }
 
 export async function adminAddStock(params: AdminAddStockParams) {
+  return withTransaction((client) => adminAddStockTx(client, params));
+}
+
+/** Same operation on the caller's transaction (used by inbound cloud commands). */
+export async function adminAddStockTx(client: pg.PoolClient, params: AdminAddStockParams) {
   const medicineId = requireUuid(params.medicine_id, 'medicine_id');
   const quantity = requireWholeNumber(params.quantity, 'quantity', { allowZero: false });
   const batchNumber = (params.batch_number || '').trim().toUpperCase();
@@ -367,97 +374,95 @@ export async function adminAddStock(params: AdminAddStockParams) {
     }
   }
 
-  return withTransaction(async (client) => {
-    const deviceId = await resolveDeviceId(client, params.device_id);
-    const medicine = await lockMedicine(client, medicineId);
+  const deviceId = await resolveDeviceId(client, params.device_id);
+  const medicine = await lockMedicine(client, medicineId);
 
-    const existingRes = await client.query(
-      'SELECT * FROM medicine_batches WHERE medicine_id = $1 AND UPPER(batch_number) = $2 FOR UPDATE',
-      [medicineId, batchNumber]
-    );
+  const existingRes = await client.query(
+    'SELECT * FROM medicine_batches WHERE medicine_id = $1 AND UPPER(batch_number) = $2 FOR UPDATE',
+    [medicineId, batchNumber]
+  );
 
-    let previousQty = 0;
-    let saved: any;
-    if (existingRes.rows.length > 0) {
-      const existing = existingRes.rows[0];
-      previousQty = Number(existing.quantity_available) || 0;
-      const newQty = previousQty + quantity;
-      const effectiveExpiry = expiryDate ?? existing.expiry_date ?? null;
-      const upd = await client.query(`
-        UPDATE medicine_batches
-        SET quantity_available = $1,
-            quantity_received = quantity_received + $2,
-            expiry_date = $3,
-            expiry_status = $4,
-            supplier_id = COALESCE($5, supplier_id),
-            purchase_price = COALESCE($6, purchase_price),
-            selling_price_override = COALESCE($7, selling_price_override),
-            status = $8,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE id = $9
-        RETURNING *
-      `, [
-        newQty, quantity, effectiveExpiry, deriveExpiryStatus(effectiveExpiry), supplierId,
-        params.purchase_price ?? null, params.selling_price_override ?? null,
-        deriveBatchStatus(newQty, effectiveExpiry, existing.status), existing.id,
-      ]);
-      saved = upd.rows[0];
-    } else {
-      const ins = await client.query(`
-        INSERT INTO medicine_batches (
-          id, medicine_id, batch_number, supplier_id, quantity_received, quantity_available,
-          purchase_price, selling_price_override, expiry_date, expiry_status,
-          received_date, status, created_at
-        ) VALUES ($1, $2, $3, $4, $5, $5, $6, $7, $8, $9, $10, $11, CURRENT_TIMESTAMP)
-        RETURNING *
-      `, [
-        crypto.randomUUID(), medicineId, batchNumber, supplierId, quantity,
-        params.purchase_price ?? (Number(medicine.purchase_price) || 0),
-        params.selling_price_override ?? null, expiryDate, deriveExpiryStatus(expiryDate),
-        localDateStr(), deriveBatchStatus(quantity, expiryDate),
-      ]);
-      saved = ins.rows[0];
-    }
+  let previousQty = 0;
+  let saved: any;
+  if (existingRes.rows.length > 0) {
+    const existing = existingRes.rows[0];
+    previousQty = Number(existing.quantity_available) || 0;
+    const newQty = previousQty + quantity;
+    const effectiveExpiry = expiryDate ?? existing.expiry_date ?? null;
+    const upd = await client.query(`
+      UPDATE medicine_batches
+      SET quantity_available = $1,
+          quantity_received = quantity_received + $2,
+          expiry_date = $3,
+          expiry_status = $4,
+          supplier_id = COALESCE($5, supplier_id),
+          purchase_price = COALESCE($6, purchase_price),
+          selling_price_override = COALESCE($7, selling_price_override),
+          status = $8,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = $9
+      RETURNING *
+    `, [
+      newQty, quantity, effectiveExpiry, deriveExpiryStatus(effectiveExpiry), supplierId,
+      params.purchase_price ?? null, params.selling_price_override ?? null,
+      deriveBatchStatus(newQty, effectiveExpiry, existing.status), existing.id,
+    ]);
+    saved = upd.rows[0];
+  } else {
+    const ins = await client.query(`
+      INSERT INTO medicine_batches (
+        id, medicine_id, batch_number, supplier_id, quantity_received, quantity_available,
+        purchase_price, selling_price_override, expiry_date, expiry_status,
+        received_date, status, created_at
+      ) VALUES ($1, $2, $3, $4, $5, $5, $6, $7, $8, $9, $10, $11, CURRENT_TIMESTAMP)
+      RETURNING *
+    `, [
+      crypto.randomUUID(), medicineId, batchNumber, supplierId, quantity,
+      params.purchase_price ?? (Number(medicine.purchase_price) || 0),
+      params.selling_price_override ?? null, expiryDate, deriveExpiryStatus(expiryDate),
+      localDateStr(), deriveBatchStatus(quantity, expiryDate),
+    ]);
+    saved = ins.rows[0];
+  }
 
-    const updatedMedicine = await reconcileMedicineStock(client, medicineId);
-    const movement = await insertMovement(client, {
+  const updatedMedicine = await reconcileMedicineStock(client, medicineId);
+  const movement = await insertMovement(client, {
+    medicine_id: medicineId,
+    batch_id: saved.id,
+    previous_quantity: previousQty,
+    new_quantity: Number(saved.quantity_available),
+    movement_type: 'PURCHASE',
+    reason: 'ADD_STOCK',
+    notes: params.notes?.trim() || `Admin added ${quantity} units to batch ${batchNumber}`,
+  }, params, deviceId);
+
+  await insertAudit(client, {
+    action: 'ADMIN_ADD_STOCK',
+    entity: 'medicine_batch',
+    entity_id: saved.id,
+    previous_value: { batch_quantity: previousQty, current_stock: Number(medicine.current_stock) || 0 },
+    new_value: {
       medicine_id: medicineId,
-      batch_id: saved.id,
-      previous_quantity: previousQty,
-      new_quantity: Number(saved.quantity_available),
-      movement_type: 'PURCHASE',
-      reason: 'ADD_STOCK',
-      notes: params.notes?.trim() || `Admin added ${quantity} units to batch ${batchNumber}`,
-    }, params, deviceId);
-
-    await insertAudit(client, {
-      action: 'ADMIN_ADD_STOCK',
-      entity: 'medicine_batch',
-      entity_id: saved.id,
-      previous_value: { batch_quantity: previousQty, current_stock: Number(medicine.current_stock) || 0 },
-      new_value: {
-        medicine_id: medicineId,
-        batch_number: batchNumber,
-        quantity_added: quantity,
-        batch_quantity: Number(saved.quantity_available),
-        current_stock: Number(updatedMedicine.current_stock),
-        movement_id: movement.id,
-      },
-    }, params, deviceId);
-    await enqueueSyncEvent(client, {
-      event_type: 'STOCK_ADDED', entity_type: 'medicine', entity_id: medicineId, operation: 'ADJUST',
-      data: { medicine_id: medicineId, batch_id: saved.id, quantity_added: quantity, notes: params.notes || null },
-      actor: params, device_id: deviceId,
-    });
-
-    return {
-      success: true,
-      medicine: toMedicineStockDto(updatedMedicine),
-      batch: toBatchDto(saved, medicine.name),
-      movement,
-      added_quantity: quantity,
-    };
+      batch_number: batchNumber,
+      quantity_added: quantity,
+      batch_quantity: Number(saved.quantity_available),
+      current_stock: Number(updatedMedicine.current_stock),
+      movement_id: movement.id,
+    },
+  }, params, deviceId);
+  await enqueueSyncEvent(client, {
+    event_type: 'STOCK_ADDED', entity_type: 'medicine', entity_id: medicineId, operation: 'ADJUST',
+    data: { medicine_id: medicineId, batch_id: saved.id, quantity_added: quantity, notes: params.notes || null, command_id: params.command_id || null },
+    actor: params, device_id: deviceId,
   });
+
+  return {
+    success: true,
+    medicine: toMedicineStockDto(updatedMedicine),
+    batch: toBatchDto(saved, medicine.name),
+    movement,
+    added_quantity: quantity,
+  };
 }
 
 export interface AdminRemoveStockParams extends StockActor {
@@ -469,69 +474,72 @@ export interface AdminRemoveStockParams extends StockActor {
 }
 
 export async function adminRemoveStock(params: AdminRemoveStockParams) {
+  return withTransaction((client) => adminRemoveStockTx(client, params));
+}
+
+/** Same operation on the caller's transaction (used by inbound cloud commands). */
+export async function adminRemoveStockTx(client: pg.PoolClient, params: AdminRemoveStockParams) {
   const medicineId = requireUuid(params.medicine_id, 'medicine_id');
   const batchId = requireUuid(params.batch_id, 'batch_id');
   const quantity = requireWholeNumber(params.quantity, 'quantity', { allowZero: false });
   const reason = (params.reason || 'DAMAGE').trim();
 
-  return withTransaction(async (client) => {
-    const deviceId = await resolveDeviceId(client, params.device_id);
-    const medicine = await lockMedicine(client, medicineId);
-    const batch = await lockBatch(client, batchId, medicineId);
-    const previousQty = Number(batch.quantity_available) || 0;
+  const deviceId = await resolveDeviceId(client, params.device_id);
+  const medicine = await lockMedicine(client, medicineId);
+  const batch = await lockBatch(client, batchId, medicineId);
+  const previousQty = Number(batch.quantity_available) || 0;
 
-    if (quantity > previousQty) {
-      throw new HttpError(400, `Cannot remove ${quantity} units. Batch only has ${previousQty} units available.`);
-    }
+  if (quantity > previousQty) {
+    throw new HttpError(400, `Cannot remove ${quantity} units. Batch only has ${previousQty} units available.`);
+  }
 
-    const newQty = previousQty - quantity;
-    const upd = await client.query(`
-      UPDATE medicine_batches
-      SET quantity_available = $1, status = $2, updated_at = CURRENT_TIMESTAMP
-      WHERE id = $3
-      RETURNING *
-    `, [newQty, deriveBatchStatus(newQty, batch.expiry_date, batch.status), batchId]);
-    const saved = upd.rows[0];
+  const newQty = previousQty - quantity;
+  const upd = await client.query(`
+    UPDATE medicine_batches
+    SET quantity_available = $1, status = $2, updated_at = CURRENT_TIMESTAMP
+    WHERE id = $3
+    RETURNING *
+  `, [newQty, deriveBatchStatus(newQty, batch.expiry_date, batch.status), batchId]);
+  const saved = upd.rows[0];
 
-    const updatedMedicine = await reconcileMedicineStock(client, medicineId);
-    const movement = await insertMovement(client, {
-      medicine_id: medicineId,
-      batch_id: batchId,
-      previous_quantity: previousQty,
-      new_quantity: newQty,
-      movement_type: reason.toUpperCase().replace(/\s+/g, '_').slice(0, 50),
-      reason: reason.slice(0, 100),
-      notes: params.notes?.trim() || `Admin removed ${quantity} units (${reason})`,
-    }, params, deviceId);
+  const updatedMedicine = await reconcileMedicineStock(client, medicineId);
+  const movement = await insertMovement(client, {
+    medicine_id: medicineId,
+    batch_id: batchId,
+    previous_quantity: previousQty,
+    new_quantity: newQty,
+    movement_type: reason.toUpperCase().replace(/\s+/g, '_').slice(0, 50),
+    reason: reason.slice(0, 100),
+    notes: params.notes?.trim() || `Admin removed ${quantity} units (${reason})`,
+  }, params, deviceId);
 
-    await insertAudit(client, {
-      action: 'ADMIN_REMOVE_STOCK',
-      entity: 'medicine_batch',
-      entity_id: batchId,
-      previous_value: { batch_quantity: previousQty, current_stock: Number(medicine.current_stock) || 0 },
-      new_value: {
-        removed_quantity: quantity,
-        batch_quantity: newQty,
-        current_stock: Number(updatedMedicine.current_stock),
-        reason,
-        notes: params.notes,
-        movement_id: movement.id,
-      },
-    }, params, deviceId);
-    await enqueueSyncEvent(client, {
-      event_type: 'STOCK_REMOVED', entity_type: 'medicine', entity_id: medicineId, operation: 'ADJUST',
-      data: { medicine_id: medicineId, batch_id: batchId, quantity_removed: quantity, reason, notes: params.notes || null },
-      actor: params, device_id: deviceId,
-    });
-
-    return {
-      success: true,
-      medicine: toMedicineStockDto(updatedMedicine),
-      batch: toBatchDto(saved, medicine.name),
-      movement,
+  await insertAudit(client, {
+    action: 'ADMIN_REMOVE_STOCK',
+    entity: 'medicine_batch',
+    entity_id: batchId,
+    previous_value: { batch_quantity: previousQty, current_stock: Number(medicine.current_stock) || 0 },
+    new_value: {
       removed_quantity: quantity,
-    };
+      batch_quantity: newQty,
+      current_stock: Number(updatedMedicine.current_stock),
+      reason,
+      notes: params.notes,
+      movement_id: movement.id,
+    },
+  }, params, deviceId);
+  await enqueueSyncEvent(client, {
+    event_type: 'STOCK_REMOVED', entity_type: 'medicine', entity_id: medicineId, operation: 'ADJUST',
+    data: { medicine_id: medicineId, batch_id: batchId, quantity_removed: quantity, reason, notes: params.notes || null, command_id: params.command_id || null },
+    actor: params, device_id: deviceId,
   });
+
+  return {
+    success: true,
+    medicine: toMedicineStockDto(updatedMedicine),
+    batch: toBatchDto(saved, medicine.name),
+    movement,
+    removed_quantity: quantity,
+  };
 }
 
 export interface AdminEditExpiryParams extends StockActor {
@@ -540,50 +548,53 @@ export interface AdminEditExpiryParams extends StockActor {
 }
 
 export async function adminEditBatchExpiry(params: AdminEditExpiryParams) {
+  return withTransaction((client) => adminEditBatchExpiryTx(client, params));
+}
+
+/** Same operation on the caller's transaction (used by inbound cloud commands). */
+export async function adminEditBatchExpiryTx(client: pg.PoolClient, params: AdminEditExpiryParams) {
   const batchId = requireUuid(params.batch_id, 'batch_id');
   const expiryDate = normalizeExpiryDate(params.expiry_date);
   const expiryStatus = deriveExpiryStatus(expiryDate);
 
-  return withTransaction(async (client) => {
-    const deviceId = await resolveDeviceId(client, params.device_id);
-    const found = await client.query('SELECT medicine_id FROM medicine_batches WHERE id = $1', [batchId]);
-    if (found.rows.length === 0) throw new HttpError(404, `Batch ${batchId} not found.`);
-    const medicineId = found.rows[0].medicine_id;
+  const deviceId = await resolveDeviceId(client, params.device_id);
+  const found = await client.query('SELECT medicine_id FROM medicine_batches WHERE id = $1', [batchId]);
+  if (found.rows.length === 0) throw new HttpError(404, `Batch ${batchId} not found.`);
+  const medicineId = found.rows[0].medicine_id;
 
-    const medicine = await lockMedicine(client, medicineId);
-    const previous = await lockBatch(client, batchId, medicineId);
-    const qty = Number(previous.quantity_available) || 0;
-    const newStatus = deriveBatchStatus(qty, expiryDate, previous.status);
+  const medicine = await lockMedicine(client, medicineId);
+  const previous = await lockBatch(client, batchId, medicineId);
+  const qty = Number(previous.quantity_available) || 0;
+  const newStatus = deriveBatchStatus(qty, expiryDate, previous.status);
 
-    const upd = await client.query(`
-      UPDATE medicine_batches
-      SET expiry_date = $1, expiry_status = $2, status = $3, updated_at = CURRENT_TIMESTAMP
-      WHERE id = $4
-      RETURNING *
-    `, [expiryDate, expiryStatus, newStatus, batchId]);
-    const saved = upd.rows[0];
+  const upd = await client.query(`
+    UPDATE medicine_batches
+    SET expiry_date = $1, expiry_status = $2, status = $3, updated_at = CURRENT_TIMESTAMP
+    WHERE id = $4
+    RETURNING *
+  `, [expiryDate, expiryStatus, newStatus, batchId]);
+  const saved = upd.rows[0];
 
-    const updatedMedicine = await reconcileMedicineStock(client, medicineId);
+  const updatedMedicine = await reconcileMedicineStock(client, medicineId);
 
-    await insertAudit(client, {
-      action: 'ADMIN_EDIT_EXPIRY',
-      entity: 'medicine_batch',
-      entity_id: batchId,
-      previous_value: { expiry_date: previous.expiry_date, expiry_status: previous.expiry_status, status: previous.status },
-      new_value: { expiry_date: expiryDate, expiry_status: expiryStatus, status: newStatus },
-    }, params, deviceId);
-    await enqueueSyncEvent(client, {
-      event_type: 'BATCH_EXPIRY_CHANGED', entity_type: 'medicine_batch', entity_id: batchId, operation: 'UPDATE',
-      data: async () => ({ batch: await rowJson(client, 'medicine_batches', batchId) }),
-      actor: params, device_id: deviceId,
-    });
-
-    return {
-      success: true,
-      medicine: toMedicineStockDto(updatedMedicine),
-      batch: toBatchDto(saved, medicine.name),
-    };
+  await insertAudit(client, {
+    action: 'ADMIN_EDIT_EXPIRY',
+    entity: 'medicine_batch',
+    entity_id: batchId,
+    previous_value: { expiry_date: previous.expiry_date, expiry_status: previous.expiry_status, status: previous.status },
+    new_value: { expiry_date: expiryDate, expiry_status: expiryStatus, status: newStatus },
+  }, params, deviceId);
+  await enqueueSyncEvent(client, {
+    event_type: 'BATCH_EXPIRY_CHANGED', entity_type: 'medicine_batch', entity_id: batchId, operation: 'UPDATE',
+    data: async () => ({ batch: await rowJson(client, 'medicine_batches', batchId), command_id: params.command_id || null }),
+    actor: params, device_id: deviceId,
   });
+
+  return {
+    success: true,
+    medicine: toMedicineStockDto(updatedMedicine),
+    batch: toBatchDto(saved, medicine.name),
+  };
 }
 
 export interface PhysicalCountBatchInput {
@@ -609,6 +620,11 @@ export interface AdminPhysicalStockCountParams extends StockActor {
  * never distributed across batches.
  */
 export async function adminPhysicalStockCount(params: AdminPhysicalStockCountParams) {
+  return withTransaction((client) => adminPhysicalStockCountTx(client, params));
+}
+
+/** Same operation on the caller's transaction (used by inbound cloud commands). */
+export async function adminPhysicalStockCountTx(client: pg.PoolClient, params: AdminPhysicalStockCountParams) {
   const medicineId = requireUuid(params.medicine_id, 'medicine_id');
   const { counts, notes } = params;
   if (!Array.isArray(counts) || counts.length === 0) {
@@ -635,97 +651,95 @@ export async function adminPhysicalStockCount(params: AdminPhysicalStockCountPar
     seen.add(key);
   }
 
-  return withTransaction(async (client) => {
-    const deviceId = await resolveDeviceId(client, params.device_id);
-    const medicine = await lockMedicine(client, medicineId);
-    const previousTotal = Number(medicine.current_stock) || 0;
+  const deviceId = await resolveDeviceId(client, params.device_id);
+  const medicine = await lockMedicine(client, medicineId);
+  const previousTotal = Number(medicine.current_stock) || 0;
 
-    const updatedBatches: any[] = [];
-    const movements: any[] = [];
+  const updatedBatches: any[] = [];
+  const movements: any[] = [];
 
-    for (const p of parsed) {
-      let existing: any = null;
-      if (p.batchId) {
-        existing = await lockBatch(client, p.batchId, medicineId);
-      } else {
-        const r = await client.query(
-          'SELECT * FROM medicine_batches WHERE medicine_id = $1 AND UPPER(batch_number) = $2 FOR UPDATE',
-          [medicineId, p.batchNumber]
-        );
-        existing = r.rows[0] || null;
-      }
-
-      let previousQty = 0;
-      let saved: any;
-      if (existing) {
-        previousQty = Number(existing.quantity_available) || 0;
-        const effectiveExpiry = p.expiryProvided ? p.expiryDate : existing.expiry_date;
-        const upd = await client.query(`
-          UPDATE medicine_batches
-          SET quantity_available = $1, expiry_date = $2, expiry_status = $3, status = $4,
-              updated_at = CURRENT_TIMESTAMP
-          WHERE id = $5
-          RETURNING *
-        `, [
-          p.quantity, effectiveExpiry, deriveExpiryStatus(effectiveExpiry),
-          deriveBatchStatus(p.quantity, effectiveExpiry, existing.status), existing.id,
-        ]);
-        saved = upd.rows[0];
-      } else {
-        const ins = await client.query(`
-          INSERT INTO medicine_batches (
-            id, medicine_id, batch_number, quantity_received, quantity_available,
-            purchase_price, selling_price_override, expiry_date, expiry_status,
-            received_date, status, created_at
-          ) VALUES ($1, $2, $3, $4, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP)
-          RETURNING *
-        `, [
-          crypto.randomUUID(), medicineId, p.batchNumber, p.quantity,
-          p.purchasePrice ?? (Number(medicine.purchase_price) || 0),
-          p.sellingPriceOverride ?? null, p.expiryDate, deriveExpiryStatus(p.expiryDate),
-          localDateStr(), deriveBatchStatus(p.quantity, p.expiryDate),
-        ]);
-        saved = ins.rows[0];
-      }
-
-      updatedBatches.push(saved);
-      const movement = await insertMovement(client, {
-        medicine_id: medicineId,
-        batch_id: saved.id,
-        previous_quantity: previousQty,
-        new_quantity: p.quantity,
-        movement_type: 'PHYSICAL_STOCK_COUNT',
-        reason: 'PHYSICAL_STOCK_COUNT',
-        notes: notes?.trim() || `Admin direct physical stock count (batch ${saved.batch_number})`,
-      }, params, deviceId);
-      movements.push({ ...movement, batch_number: saved.batch_number });
+  for (const p of parsed) {
+    let existing: any = null;
+    if (p.batchId) {
+      existing = await lockBatch(client, p.batchId, medicineId);
+    } else {
+      const r = await client.query(
+        'SELECT * FROM medicine_batches WHERE medicine_id = $1 AND UPPER(batch_number) = $2 FOR UPDATE',
+        [medicineId, p.batchNumber]
+      );
+      existing = r.rows[0] || null;
     }
 
-    const updatedMedicine = await reconcileMedicineStock(client, medicineId);
-    const newTotal = Number(updatedMedicine.current_stock) || 0;
+    let previousQty = 0;
+    let saved: any;
+    if (existing) {
+      previousQty = Number(existing.quantity_available) || 0;
+      const effectiveExpiry = p.expiryProvided ? p.expiryDate : existing.expiry_date;
+      const upd = await client.query(`
+        UPDATE medicine_batches
+        SET quantity_available = $1, expiry_date = $2, expiry_status = $3, status = $4,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $5
+        RETURNING *
+      `, [
+        p.quantity, effectiveExpiry, deriveExpiryStatus(effectiveExpiry),
+        deriveBatchStatus(p.quantity, effectiveExpiry, existing.status), existing.id,
+      ]);
+      saved = upd.rows[0];
+    } else {
+      const ins = await client.query(`
+        INSERT INTO medicine_batches (
+          id, medicine_id, batch_number, quantity_received, quantity_available,
+          purchase_price, selling_price_override, expiry_date, expiry_status,
+          received_date, status, created_at
+        ) VALUES ($1, $2, $3, $4, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP)
+        RETURNING *
+      `, [
+        crypto.randomUUID(), medicineId, p.batchNumber, p.quantity,
+        p.purchasePrice ?? (Number(medicine.purchase_price) || 0),
+        p.sellingPriceOverride ?? null, p.expiryDate, deriveExpiryStatus(p.expiryDate),
+        localDateStr(), deriveBatchStatus(p.quantity, p.expiryDate),
+      ]);
+      saved = ins.rows[0];
+    }
 
-    await insertAudit(client, {
-      action: 'ADMIN_PHYSICAL_STOCK_COUNT',
-      entity: 'medicine',
-      entity_id: medicineId,
-      previous_value: { current_stock: previousTotal },
-      new_value: { current_stock: newTotal, delta: newTotal - previousTotal, batches: movements, notes },
+    updatedBatches.push(saved);
+    const movement = await insertMovement(client, {
+      medicine_id: medicineId,
+      batch_id: saved.id,
+      previous_quantity: previousQty,
+      new_quantity: p.quantity,
+      movement_type: 'PHYSICAL_STOCK_COUNT',
+      reason: 'PHYSICAL_STOCK_COUNT',
+      notes: notes?.trim() || `Admin direct physical stock count (batch ${saved.batch_number})`,
     }, params, deviceId);
-    await enqueueSyncEvent(client, {
-      event_type: 'PHYSICAL_COUNT', entity_type: 'medicine', entity_id: medicineId, operation: 'COUNT',
-      data: { medicine_id: medicineId, notes: notes || null },
-      actor: params, device_id: deviceId,
-    });
+    movements.push({ ...movement, batch_number: saved.batch_number });
+  }
 
-    return {
-      success: true,
-      medicine: toMedicineStockDto(updatedMedicine),
-      batches: updatedBatches.map((b) => toBatchDto(b, medicine.name)),
-      movements,
-      total_stock: newTotal,
-      previous_stock: previousTotal,
-      delta: newTotal - previousTotal,
-    };
+  const updatedMedicine = await reconcileMedicineStock(client, medicineId);
+  const newTotal = Number(updatedMedicine.current_stock) || 0;
+
+  await insertAudit(client, {
+    action: 'ADMIN_PHYSICAL_STOCK_COUNT',
+    entity: 'medicine',
+    entity_id: medicineId,
+    previous_value: { current_stock: previousTotal },
+    new_value: { current_stock: newTotal, delta: newTotal - previousTotal, batches: movements, notes },
+  }, params, deviceId);
+  await enqueueSyncEvent(client, {
+    event_type: 'PHYSICAL_COUNT', entity_type: 'medicine', entity_id: medicineId, operation: 'COUNT',
+    data: { medicine_id: medicineId, notes: notes || null, command_id: params.command_id || null },
+    actor: params, device_id: deviceId,
   });
+
+  return {
+    success: true,
+    medicine: toMedicineStockDto(updatedMedicine),
+    batches: updatedBatches.map((b) => toBatchDto(b, medicine.name)),
+    movements,
+    total_stock: newTotal,
+    previous_stock: previousTotal,
+    delta: newTotal - previousTotal,
+  };
 }
 

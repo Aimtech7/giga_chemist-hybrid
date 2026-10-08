@@ -16,6 +16,7 @@ import { getAllSuppliers } from '../db/suppliers';
 import { getAllPurchases } from '../db/purchases';
 import { getAllExpenses } from '../db/expenses';
 import { getPharmacySettings, toSettings } from '../db/settings';
+import { buildRemoteAdminRouter } from './remoteAdmin';
 import type { UserRole } from '../../src/types';
 
 /**
@@ -25,6 +26,10 @@ import type { UserRole } from '../../src/types';
  *    read through the giga_online views (cloud migration 002). Never the shop's local PostgreSQL.
  *  - READ-ONLY: selling, stock, returns, purchases and every other write happen only on the shop
  *    server, whose local PostgreSQL is authoritative. Writes here answer 409 ONLINE_READ_ONLY.
+ *  - ONE exception, ADMIN only: /api/admin/commands/* QUEUES a remote-administration command
+ *    (giga_cloud.commands) for the shop. Nothing is changed in the cloud copy: the shop's sync
+ *    worker pulls the command, applies it in its own PostgreSQL transaction and syncs the result
+ *    back. The command's status (PENDING / DELIVERED / APPLIED / REJECTED) is readable here.
  *  - The same report / Sales History SQL as the shop server runs inside a READ ONLY transaction with
  *    search_path = giga_online and giga.shop_id = SHOP_ID, so figures match the shop's definitions.
  *  - Accounts: giga_cloud.online_users (separate from shop staff; shop password/PIN hashes are
@@ -196,7 +201,7 @@ export function buildOnlineRouter() {
 
   r.get('/health', async (_req, res) => {
     const cfg = getOnlineConfig();
-    const base = { status: 'online', system: 'GIGA CHEMIST POS API', mode: 'online', app_mode: 'online', version, timestamp: Date.now(), read_only: true };
+    const base = { status: 'online', system: 'GIGA CHEMIST POS API', mode: 'online', app_mode: 'online', version, timestamp: Date.now(), read_only: true, remote_admin_commands: true };
     if (cfg.error) return res.json({ ...base, database: { provider: 'Supabase PostgreSQL', connected: false, configured: false, error: cfg.error } });
     try {
       const info = await withCloud(async (c) => {
@@ -311,6 +316,9 @@ export function buildOnlineRouter() {
   r.get('/purchases', requireAdmin, route('GET /purchases', () => withShop((c) => getAllPurchases(c))));
   r.get('/expenses', requireAdmin, route('GET /expenses', () => withShop((c) => getAllExpenses(c))));
 
+  // Remote administration (ADMIN only): queue commands for the shop; never a direct cloud write.
+  r.use(buildRemoteAdminRouter({ shopId: () => getOnlineConfig().shopId, withShop, withCloud, requireAdmin, route }));
+
   // Shop-only features: not available from the cloud copy (yet).
   for (const p of ['/inventory/movements', '/audit', '/admin/health', '/email/settings', '/email/jobs', '/backups/status']) {
     r.get(p, requireAuth, (_req, res) => res.status(501).json({ error: 'Not available online: this information lives on the shop server.', code: 'SHOP_SERVER_ONLY' }));
@@ -320,7 +328,8 @@ export function buildOnlineRouter() {
   r.all('*', (req, res, next) => {
     if (req.method === 'GET' || req.method === 'HEAD') return next();
     res.status(409).json({
-      error: 'The online app is read-only. Sales, stock, returns, purchases and other changes are made on the shop POS; they reach the cloud through sync.',
+      error: 'The online app is read-only. Sales, stock, returns, purchases and other changes are made on the shop POS; they reach the cloud through sync. ' +
+        'Administrators can request stock, price and catalog changes through Remote Admin (they are applied by the shop computer).',
       code: 'ONLINE_READ_ONLY',
     });
   });

@@ -135,7 +135,7 @@ if (-not (Test-Path $DistIndex)) {
 $env:NODE_ENV = "production"
 $env:PORT = "3000"
 $env:API_HOST = "0.0.0.0"
-$env:APP_MODE = "local"
+# APP_MODE is NOT set here: it comes from .env (dotenv never overrides an existing variable, so forcing it would switch hybrid sync off). Superseded by install-giga-service.ps1.
 
 Write-StartupLog "Launching GIGA CHEMIST Production Server on http://0.0.0.0:3000..." "START"
 

@@ -1,4 +1,6 @@
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
 import { spawn, spawnSync, type ChildProcess } from 'child_process';
 import { api, check, pool, section, startServer, stopServer, upsertFixtureMedicine } from './harness';
 import { setupHybridCloud, CLOUD_TEST_DB, type HybridEnv } from './hybrid.test';
@@ -192,6 +194,8 @@ export async function onlineTests(ctx: Ctx, env: HybridEnv) {
     await stopOnline();
   }
 
+  await remoteAdminTests(ctx, env, { med, onlineEnv, adminPw, cashPw });
+
   // ------------------------------------------------------------------ 3. config refusals
   section('ONLINE API — refuses shop databases');
   const devUrl = cloudUrl().replace(`/${CLOUD_TEST_DB}`, '/giga_chemist_dev');
@@ -205,6 +209,136 @@ export async function onlineTests(ctx: Ctx, env: HybridEnv) {
   }
   const fresh = spawnSync(process.execPath, ['scripts/build-online-api.mjs', '--check'], { encoding: 'utf-8' });
   check(fresh.status === 0, 'committed api/index.js bundle is up to date with the source', fresh.stderr);
+}
+
+/**
+ * Remote administration end to end: online Admin (Vercel bundle) queues commands; the real local
+ * hybrid server pulls, applies them to giga_chemist_dev in its own transactions and syncs back.
+ */
+async function remoteAdminTests(ctx: Ctx, env: HybridEnv, o: { med: string; onlineEnv: Record<string, string>; adminPw: string; cashPw: string }) {
+  section('REMOTE ADMIN — phone -> Vercel API -> cloud command -> shop PostgreSQL -> cloud');
+  const { med } = o;
+  await startServer(); // the shop server (hybrid, sync worker on)
+  await spawnOnline(['scripts/online/serve-vercel-bundle.mjs'], BUNDLE_PORT, o.onlineEnv);
+  const c = (m: string, p: string, t?: string | null, b?: unknown) => call(BUNDLE_PORT, m, p, t, b);
+  const A = (await c('POST', '/api/auth/login', null, { email: 'itest-online-admin@itest.local', password: o.adminPw })).data?.token;
+  const C = (await c('POST', '/api/auth/login', null, { email: 'itest-online-cashier@itest.local', password: o.cashPw })).data?.token;
+  check(Boolean(A && C), 'online Admin and Cashier logged in');
+  const batchId = (await pool.query(`SELECT id FROM medicine_batches WHERE medicine_id = $1 AND batch_number = 'ONL-B1'`, [med])).rows[0].id;
+  const batchQty = async () => Number((await pool.query('SELECT quantity_available FROM medicine_batches WHERE id = $1', [batchId])).rows[0].quantity_available);
+  const localMed = async () => (await pool.query('SELECT current_stock, selling_price::float AS sp FROM medicines WHERE id = $1', [med])).rows[0];
+  const follow = async (id: string, ms = 40_000) => {
+    const seen: string[] = [];
+    const last = await waitFor(async () => {
+      const r = await c('GET', `/api/admin/commands/${id}`, A);
+      if (r.data?.status && seen[seen.length - 1] !== r.data.status) seen.push(r.data.status);
+      return r.data;
+    }, (d) => d?.status === 'APPLIED' || d?.status === 'REJECTED', ms);
+    return { ...last, seen };
+  };
+  const stockAdd = { medicine_id: med, batch_id: batchId, quantity: 7, reason: 'ITEST phone delivery' };
+
+  // Access control and validation
+  check((await c('POST', '/api/admin/commands/stock-add', null, stockAdd)).status === 401, 'unauthenticated command request -> 401');
+  check((await c('POST', '/api/admin/commands/stock-add', C, stockAdd)).status === 403, 'Cashier cannot queue stock commands -> 403');
+  for (const p of ['/api/admin/commands', '/api/admin/remote-status']) check((await c('GET', p, C)).status === 403, `Cashier GET ${p} -> 403`);
+  const bad = await c('POST', '/api/admin/commands/stock-add', A, { ...stockAdd, quantity: 0 });
+  check(bad.status === 400 && /whole number/.test(bad.data?.error || ''), 'invalid quantity -> 400 with reason', bad.data);
+  const shopOverride = await c('POST', '/api/admin/commands/stock-add', A, { ...stockAdd, shop_id: crypto.randomUUID() });
+  check(shopOverride.status === 400 && /shop_id/.test(shopOverride.data?.error || ''), 'browser cannot choose the shop (shop_id refused; server SHOP_ID used)', shopOverride.data);
+  const snap = await c('POST', '/api/admin/commands/stock-set', A, { medicine_id: med, batch_id: batchId, quantity: 5, reason: 'x y z', current_stock: 5 });
+  check(snap.status === 400, 'stock snapshot fields refused online too');
+  check((await c('POST', '/api/admin/commands/stock-add', A, { ...stockAdd, medicine_id: crypto.randomUUID() })).status === 404, 'unknown medicine -> 404');
+  check((await c('POST', '/api/admin/commands/drop-tables', A, {})).status === 404, 'unknown action -> 404');
+
+  // 1. Queue STOCK_ADD (a retried phone request queues it once)
+  const rid = crypto.randomUUID();
+  const q0 = await batchQty();
+  const s0 = Number((await localMed()).current_stock);
+  const q = await c('POST', '/api/admin/commands/stock-add', A, { ...stockAdd, request_id: rid });
+  const q2 = await c('POST', '/api/admin/commands/stock-add', A, { ...stockAdd, request_id: rid });
+  check(q.status === 202 && q.data?.status === 'PENDING' && /^[0-9a-f-]{36}$/.test(q.data?.command_id || ''), 'ADMIN queues STOCK_ADD -> 202 PENDING (not "done")', q.data);
+  check(q2.status === 202 && q2.data?.command_id === q.data?.command_id && q2.data?.duplicate === true, 'retried request with the same request_id -> same command (no double queue)', q2.data);
+  const cmdRow = (await env.emu.pool.query('SELECT shop_id, created_by, source, created_by_user_id FROM giga_cloud.commands WHERE command_id = $1', [q.data?.command_id])).rows[0];
+  check(cmdRow?.shop_id === env.shopId && cmdRow.source === 'ONLINE_ADMIN' && /itest-online-admin@itest\.local/.test(cmdRow.created_by || ''), 'command row: server SHOP_ID, source ONLINE_ADMIN, admin identity', cmdRow);
+  check(Number((await env.emu.pool.query(`SELECT COUNT(*) n FROM giga_cloud.online_audit WHERE command_id = $1 AND action = 'REMOTE_COMMAND_QUEUED'`, [q.data?.command_id])).rows[0].n) === 1, 'remote request audited in the cloud (online_audit)');
+  const f1 = await follow(q.data?.command_id);
+  check(f1.status === 'APPLIED' && f1.result?.delta === 7, `command APPLIED by the shop (statuses seen: ${f1.seen.join(' -> ')})`, f1);
+  check((await batchQty()) === q0 + 7 && Number((await localMed()).current_stock) === s0 + 7, `local PostgreSQL stock +7 exactly once (${q0} -> ${await batchQty()})`);
+  check(Number((await pool.query('SELECT COUNT(*) n FROM sync_inbound_commands WHERE command_id = $1', [q.data?.command_id])).rows[0].n) === 1, 'applied once (sync_inbound_commands)');
+  const cloudStock = await waitFor(async () => (await c('GET', '/api/medicines', A)).data?.find((x: any) => x.id === med)?.current_stock, (v) => v === s0 + 7, 15_000);
+  check(cloudStock === s0 + 7, `online medicine list shows the shop's new stock (${cloudStock})`);
+  const list = await c('GET', '/api/admin/commands?limit=10', A);
+  check(list.status === 200 && list.data?.commands?.some((x: any) => x.command_id === q.data?.command_id && x.status === 'APPLIED'), 'GET /api/admin/commands lists it as APPLIED');
+  const rs = await c('GET', '/api/admin/remote-status', A);
+  check(rs.status === 200 && rs.data?.shop_registered && rs.data.shop_in_contact === true && rs.data.commands?.applied >= 1 && rs.data.last_successful_command?.command_id,
+    'remote status: shop registered + in contact, applied count, last successful command', rs.data);
+
+  // 2. Shop offline: the command waits as PENDING, then applies once on reconnect
+  await env.emu.stop();
+  await sleep(1500);
+  const q3 = await c('POST', '/api/admin/commands/stock-remove', A, { medicine_id: med, batch_id: batchId, quantity: 3, reason: 'Damaged' });
+  check(q3.status === 202 && q3.data?.status === 'PENDING', 'command accepted while the shop is offline -> PENDING', q3.data);
+  const before3 = await batchQty();
+  await sleep(4000);
+  check((await c('GET', `/api/admin/commands/${q3.data?.command_id}`, A)).data?.status === 'PENDING' && (await batchQty()) === before3, 'still PENDING and nothing applied while offline');
+  await env.emu.restart();
+  const f3 = await follow(q3.data?.command_id);
+  check(f3.status === 'APPLIED' && (await batchQty()) === before3 - 3, 'after reconnect: APPLIED, stock -3 once', f3);
+
+  // 3. Rejected command exposes a safe reason
+  const q4 = await c('POST', '/api/admin/commands/stock-remove', A, { medicine_id: med, batch_id: batchId, quantity: 999_999, reason: 'Lost' });
+  const f4 = await follow(q4.data?.command_id);
+  check(f4.status === 'REJECTED' && /Cannot remove/.test(f4.error || '') && !/postgres|SELECT|\.ts:|at /i.test(f4.error || ''), 'over-removal REJECTED; safe error shown to the Admin', f4.error);
+  check((await batchQty()) === before3 - 3, 'stock never negative / unchanged by the rejection');
+
+  // 4. Physical count, price, expiry
+  const prev5 = await batchQty();
+  const f5 = await follow((await c('POST', '/api/admin/commands/stock-set', A, { medicine_id: med, batch_id: batchId, quantity: 30, reason: 'ITEST phone count' })).data?.command_id);
+  check(f5.status === 'APPLIED' && (await batchQty()) === 30 && f5.result?.delta === 30 - prev5, `STOCK_SET -> 30 (delta ${f5.result?.delta})`, f5.result);
+  const f6 = await follow((await c('POST', '/api/admin/commands/price-update', A, { medicine_id: med, selling_price: 175, wholesale_price: 160 })).data?.command_id);
+  check(f6.status === 'APPLIED' && (await localMed()).sp === 175, 'PRICE_UPDATE from the phone applied (selling 175)', f6);
+  const onlinePrice = await waitFor(async () => (await c('GET', '/api/medicines', A)).data?.find((x: any) => x.id === med)?.selling_price, (v) => v === 175, 15_000);
+  check(onlinePrice === 175, 'online list shows the new price');
+  const f7 = await follow((await c('POST', '/api/admin/commands/batch-expiry', A, { medicine_id: med, batch_id: batchId, expiry_date: '2032-01-31' })).data?.command_id);
+  const onlineExp = await waitFor(async () => (await c('GET', '/api/batches', A)).data?.find((x: any) => x.id === batchId)?.expiry_date, (v) => String(v || '').startsWith('2032-01-31'), 15_000);
+  check(f7.status === 'APPLIED' && String(onlineExp).startsWith('2032-01-31'), 'batch expiry changed from the phone and visible online', { s: f7.status, onlineExp });
+
+  // 5. Still read-only for operations
+  for (const [t, label] of [[A, 'Admin'], [C, 'Cashier']] as const) {
+    const w = await c('POST', '/api/sales/checkout', t, { items: [] });
+    check(w.status === 409 && w.data?.code === 'ONLINE_READ_ONLY', `${label}: online sales remain read-only (409)`);
+  }
+  check((await c('POST', '/api/inventory/add-stock', A, {})).status === 409, 'direct stock endpoints stay closed online (only commands)');
+
+  // 6. No shop secrets reach the browser
+  const bodies = JSON.stringify([q.data, f1, list.data, rs.data, (await c('GET', '/api/health')).data]);
+  check(!bodies.includes(env.token) && !bodies.includes(env.apiKey), 'API responses never contain the shop sync token or cloud key');
+  const leaks: string[] = [];
+  const scan = (dir: string) => {
+    if (!fs.existsSync(dir)) return;
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) scan(p);
+      else if (/\.(js|html|css|json|webmanifest)$/.test(e.name)) {
+        const t = fs.readFileSync(p, 'utf-8');
+        for (const needle of ['SYNC_SHOP_TOKEN', 'SUPABASE_SERVICE_ROLE_KEY', 'DATABASE_URL', 'service_role', env.token]) if (t.includes(needle)) leaks.push(`${p}: ${needle === env.token ? '<token>' : needle}`);
+      }
+    }
+  };
+  scan('dist');
+  scan('src');
+  check(leaks.length === 0, 'frontend source and built bundle contain no SYNC_SHOP_TOKEN / service-role key / DATABASE_URL', leaks);
+  await stopOnline();
+
+  // 7. Rate limit on remote changes
+  await spawnOnline(['scripts/online/serve-vercel-bundle.mjs'], BUNDLE_PORT, { ...o.onlineEnv, ONLINE_COMMAND_RATE_PER_MINUTE: '4' });
+  const A2 = (await c('POST', '/api/auth/login', null, { email: 'itest-online-admin@itest.local', password: o.adminPw })).data?.token;
+  const codes: number[] = [];
+  for (let i = 0; i < 6; i++) codes.push((await c('POST', '/api/admin/commands/stock-add', A2, { ...stockAdd, quantity: 0 })).status);
+  check(codes.slice(0, 4).every((x) => x === 400) && codes.slice(4).every((x) => x === 429), `remote change requests rate-limited per Admin (${codes.join(',')})`);
+  await stopOnline();
+  await stopServer();
 }
 
 /** Unreachable cloud database: data and login answer 503 (never a fake/local fallback). */

@@ -19,6 +19,9 @@ import {
   LogOut,
   ChevronDown,
   KeyRound,
+  Smartphone,
+  Menu,
+  X,
 } from 'lucide-react';
 import { PWAInstallButton } from '../common/PWAInstallButton';
 import { ChangePasswordModal } from '../users/ChangePasswordModal';
@@ -28,6 +31,7 @@ import { SyncIndicator } from '../common/SyncIndicator';
 import { runSync, subscribeToSyncStatus } from '../../services/syncEngine';
 import { getOrRegisterDevice } from '../../services/device';
 import { canAccessModule, isCashier } from '../../services/permissions';
+import { getServerMode } from '../../services/remoteAdmin';
 import type { User, PharmacySettings, DeviceInfo } from '../../types';
 
 export type AppModule =
@@ -47,7 +51,8 @@ export type AppModule =
   | 'reports'
   | 'users'
   | 'audit'
-  | 'settings';
+  | 'settings'
+  | 'remote';
 
 interface AppShellProps {
   currentModule: AppModule;
@@ -74,6 +79,12 @@ export const AppShell: React.FC<AppShellProps> = ({
   const [isSyncing, setIsSyncing] = useState<boolean>(false);
   const [showUserMenu, setShowUserMenu] = useState<boolean>(false);
   const [isChangePasswordOpen, setIsChangePasswordOpen] = useState<boolean>(false);
+  const [navOpen, setNavOpen] = useState<boolean>(false);
+  const [serverMode, setServerMode] = useState<string | null>(null);
+
+  useEffect(() => {
+    void getServerMode().then(setServerMode);
+  }, []);
 
   useEffect(() => {
     getOrRegisterDevice().then(setDevice);
@@ -120,6 +131,8 @@ export const AppShell: React.FC<AppShellProps> = ({
     { id: 'audit' as AppModule, label: 'Audit Logs', icon: FileText },
     { id: 'settings' as AppModule, label: 'Settings', icon: SettingsIcon },
   ];
+  // Online app (Vercel): remote administration of the shop, listed first for the Administrator.
+  if (serverMode === 'online') allNavItems.unshift({ id: 'remote' as AppModule, label: 'Remote Admin', icon: Smartphone });
 
   // STRICT RBAC: Filter navigation items based on user role.
   // Cashiers ONLY see permitted modules: Dashboard, POS Register, Medicine Lookup, Customers, Sales History, Returns.
@@ -129,13 +142,20 @@ export const AppShell: React.FC<AppShellProps> = ({
   return (
     <div className="h-screen w-screen flex flex-col overflow-hidden bg-slate-100 font-sans select-none">
       {/* Top Application Bar */}
-      <header className="h-12 bg-slate-900 text-white flex items-center justify-between px-3 sm:px-4 z-30 shrink-0 border-b border-slate-800">
-        <div className="flex items-center gap-3">
+      <header className="h-12 bg-slate-900 text-white flex items-center justify-between gap-2 px-2 sm:px-4 z-30 shrink-0 border-b border-slate-800">
+        <div className="flex items-center gap-2 sm:gap-3 min-w-0">
+          <button
+            onClick={() => setNavOpen(true)}
+            className="md:hidden p-1.5 rounded hover:bg-slate-800 text-slate-200"
+            aria-label="Open menu"
+          >
+            <Menu className="w-5 h-5" />
+          </button>
           <div className="flex items-center justify-center w-7 h-7 rounded bg-teal-700 text-white font-bold text-xs tracking-tight">
             GC
           </div>
           <div className="flex items-baseline gap-2">
-            <span className="font-bold text-sm tracking-tight text-white">
+            <span className="font-bold text-sm tracking-tight text-white truncate max-w-[9rem] sm:max-w-none">
               {settings.pharmacy_name || 'GIGA CHEMIST'}
             </span>
             {isCashier(currentUser) && (
@@ -147,7 +167,9 @@ export const AppShell: React.FC<AppShellProps> = ({
         </div>
 
         {/* Center: local POS server vs cloud sync status (kept separate) */}
-        <SyncIndicator currentUser={currentUser} onRefreshCache={handleManualSync} isRefreshing={isSyncing} />
+        <div className="min-w-0 overflow-hidden hidden sm:block">
+          <SyncIndicator currentUser={currentUser} onRefreshCache={handleManualSync} isRefreshing={isSyncing} />
+        </div>
 
         {/* Right: Actions & User Menu */}
         <div className="flex items-center gap-2 sm:gap-3">
@@ -246,7 +268,19 @@ export const AppShell: React.FC<AppShellProps> = ({
       {/* Main Body */}
       <div className="flex-1 flex overflow-hidden">
         {/* Navigation Sidebar */}
-        <aside className="w-48 bg-slate-900 border-r border-slate-800 flex flex-col shrink-0 text-slate-300 overflow-y-auto">
+        {/* Phones: the sidebar becomes a slide-in drawer (menu button in the top bar). */}
+        {navOpen && <div className="fixed inset-0 bg-slate-900/60 z-40 md:hidden" onClick={() => setNavOpen(false)} />}
+        <aside
+          className={`bg-slate-900 border-r border-slate-800 flex-col shrink-0 text-slate-300 overflow-y-auto w-60 md:w-48 ${
+            navOpen ? 'flex fixed inset-y-0 left-0 z-50' : 'hidden'
+          } md:flex md:static md:z-auto`}
+        >
+          <div className="md:hidden flex items-center justify-between px-3 h-12 border-b border-slate-800">
+            <span className="text-sm font-bold text-white">Menu</span>
+            <button onClick={() => setNavOpen(false)} className="p-1.5 rounded hover:bg-slate-800" aria-label="Close menu">
+              <X className="w-5 h-5" />
+            </button>
+          </div>
           <nav className="flex-1 px-1.5 py-2 space-y-0.5">
             {visibleNavItems.map((item) => {
               const active = currentModule === item.id;
@@ -255,8 +289,11 @@ export const AppShell: React.FC<AppShellProps> = ({
               return (
                 <button
                   key={item.id}
-                  onClick={() => onSelectModule(item.id)}
-                  className={`w-full flex items-center gap-2.5 px-2.5 py-2 rounded text-xs font-medium transition cursor-pointer ${
+                  onClick={() => {
+                    setNavOpen(false);
+                    onSelectModule(item.id);
+                  }}
+                  className={`w-full flex items-center gap-2.5 px-2.5 py-2.5 md:py-2 rounded text-sm md:text-xs font-medium transition cursor-pointer ${
                     active
                       ? 'bg-teal-700 text-white font-semibold shadow-xs'
                       : 'text-slate-300 hover:bg-slate-800/80 hover:text-white'

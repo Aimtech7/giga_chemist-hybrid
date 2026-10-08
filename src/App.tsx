@@ -27,7 +27,15 @@ import { ReportsDashboard } from './components/reports/ReportsDashboard';
 import { UserManagement } from './components/users/UserManagement';
 import { AuditLogViewer } from './components/audit/AuditLogViewer';
 import { SettingsView } from './components/settings/SettingsView';
+import { RemoteAdminPanel } from './components/remote/RemoteAdminPanel';
+import { getServerMode } from './services/remoteAdmin';
 import type { PharmacySettings, User } from './types';
+
+// '#app' (or any unknown hash) is not a module and must never become the current one (blank screen).
+const KNOWN_MODULES: AppModule[] = [
+  'dashboard', 'pos', 'medicines', 'inventory', 'stocktake', 'batches', 'expiry', 'purchases', 'suppliers',
+  'customers', 'expenses', 'sales', 'returns', 'reports', 'users', 'audit', 'settings', 'remote',
+];
 
 export default function App() {
   const [viewMode, setViewMode] = useState<'landing' | 'login' | 'app'>('landing');
@@ -36,6 +44,7 @@ export default function App() {
   const [settings, setSettings] = useState<PharmacySettings | null>(null);
   const [isLoginOpen, setIsLoginOpen] = useState(false);
   const [isInitialized, setIsInitialized] = useState(false);
+  const [serverMode, setServerMode] = useState<string | null>(null);
 
   useEffect(() => {
     // Check initial route from hash or path with strict protection
@@ -73,7 +82,8 @@ export default function App() {
         if (cached) {
           // Check if specific module in hash or path is allowed for this user
           const rawModule = hash.replace('#', '').replace('/app/', '') as AppModule;
-          if (rawModule && canAccessModule(cached, rawModule)) {
+          // Only real module names ("#app" is the shell, not a module: it used to blank the screen for Admins).
+          if (rawModule && KNOWN_MODULES.includes(rawModule) && canAccessModule(cached, rawModule)) {
             setCurrentModule(rawModule);
           } else if (isCashier(cached)) {
             // Cashier defaults to POS register
@@ -205,6 +215,15 @@ export default function App() {
     return () => window.removeEventListener(SESSION_EXPIRED_EVENT, onExpired);
   }, []);
 
+  // Online app (Vercel): there is no till online, so the Administrator lands on Remote Admin.
+  useEffect(() => {
+    if (currentUser?.role !== 'ADMIN') return;
+    void getServerMode().then((mode) => {
+      setServerMode(mode);
+      if (mode === 'online') setCurrentModule((m) => (m === 'pos' ? 'remote' : m));
+    });
+  }, [currentUser]);
+
   if (!isInitialized || !settings) {
     return (
       <div className="h-screen w-screen flex flex-col items-center justify-center bg-slate-900 text-white">
@@ -284,8 +303,11 @@ export default function App() {
         <PosScreen currentUser={currentUser} settings={settings} />
       )}
 
-      {/* MEDICINES / MEDICINE LOOKUP */}
-      {currentModule === 'medicines' && (
+      {/* MEDICINES / MEDICINE LOOKUP (online Administrator: the remote-management view of the same catalog) */}
+      {currentModule === 'medicines' && serverMode === 'online' && currentUser?.role === 'ADMIN' && (
+        <RemoteAdminPanel currentUser={currentUser} settings={settings} />
+      )}
+      {currentModule === 'medicines' && !(serverMode === 'online' && currentUser?.role === 'ADMIN') && (
         <MedicineList currentUser={currentUser} settings={settings} />
       )}
 
@@ -361,6 +383,11 @@ export default function App() {
           settings={settings}
           onSettingsUpdated={(updated) => setSettings(updated)}
         />
+      )}
+
+      {/* REMOTE ADMIN - online app, Administrator only (changes are queued for the shop computer) */}
+      {currentModule === 'remote' && canAccessModule(currentUser, 'remote') && (
+        <RemoteAdminPanel currentUser={currentUser} settings={settings} />
       )}
 
       {/* Login Modal */}

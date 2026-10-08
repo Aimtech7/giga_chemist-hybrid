@@ -305,6 +305,7 @@ class SyncWorker {
     }
     const outcome = await this.noteSuccess();
     const commands: CloudCommand[] = Array.isArray(response?.commands) ? response.commands : [];
+    const outcomes: { cmd: CloudCommand; result: Awaited<ReturnType<typeof applyCloudCommand>> }[] = [];
     for (const cmd of commands) {
       let result;
       try {
@@ -324,8 +325,14 @@ class SyncWorker {
       if (!result.duplicate) {
         console.log(`[Sync] Cloud command ${cmd.command_type} ${cmd.command_id}: ${result.status}${result.error ? ` (${result.error})` : ''}`);
       }
-      await this.ack(cmd.command_id, result.status, result.result, result.error);
+      outcomes.push({ cmd, result });
     }
+    // Ship the events the applied commands produced (stock movements, prices) BEFORE acknowledging,
+    // so a command reported APPLIED in the cloud is already reflected in the cloud copy.
+    if (outcomes.some((o) => o.result.status === 'APPLIED' && !o.result.duplicate)) {
+      if ((await this.pushDueEvents()) === 'unreachable') return 'unreachable';
+    }
+    for (const { cmd, result } of outcomes) await this.ack(cmd.command_id, result.status, result.result, result.error);
     return outcome;
   }
 

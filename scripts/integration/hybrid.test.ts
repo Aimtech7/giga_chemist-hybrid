@@ -310,7 +310,7 @@ export async function hybridTests(ctx: Ctx, env: HybridEnv) {
   check(price === 123.45, 'current local price changed by the cloud command', price);
   check(Number((await pool.query('SELECT unit_price FROM sale_items WHERE sale_id = $1', [sale1.id])).rows[0].unit_price) === histPrice, `historical sale_items price unchanged (${histPrice})`);
   check(Number((await pool.query(`SELECT COUNT(*) n FROM audit_logs WHERE action = 'CLOUD_COMMAND_APPLIED' AND entity_id = $1`, [cmd11])).rows[0].n) === 1 &&
-        Number((await pool.query(`SELECT COUNT(*) n FROM audit_logs WHERE action = 'ADMIN_PRICE_UPDATE' AND entity_id = $1 AND user_name = 'CLOUD'`, [med])).rows[0].n) >= 1,
+        Number((await pool.query(`SELECT COUNT(*) n FROM audit_logs WHERE action = 'ADMIN_PRICE_UPDATE' AND entity_id = $1 AND user_name LIKE 'CLOUD%'`, [med])).rows[0].n) >= 1,
     'audit rows written (command + price update by CLOUD)');
   const c11 = await waitFor(async () => (await emu.pool.query('SELECT status FROM giga_cloud.commands WHERE command_id = $1', [cmd11])).rows[0].status, (s) => s === 'APPLIED');
   check(c11 === 'APPLIED', 'command acknowledged APPLIED in the cloud');
@@ -348,6 +348,101 @@ export async function hybridTests(ctx: Ctx, env: HybridEnv) {
   check(Number((await pool.query(`SELECT COUNT(*) n FROM audit_logs WHERE action = 'CLOUD_COMMAND_APPLIED' AND entity_id = $1`, [cmd12])).rows[0].n) === 1, 'applied (audited) exactly once');
   check(Number((await pool.query(`SELECT COUNT(*) n FROM sync_events WHERE event_type = 'MEDICINE_PRICE_CHANGED' AND payload->'data'->>'command_id' = $1`, [cmd12])).rows[0].n) === 1, 'exactly one outbound price event for it');
   check(Number((await pool.query('SELECT selling_price FROM medicines WHERE id = $1', [med])).rows[0].selling_price) === 130, 'price applied (130)');
+
+  // ------------------------------------------------------------------ TEST 13
+  section('TEST 13 — Remote admin stock commands (applied by the shop in its own transaction)');
+  const issue = async (type: string, payload: any, k = key()) => (await emu.pool.query(
+    `SELECT giga_cloud.issue_command($1, $2, $3::jsonb, $4, 'Remote Admin <itest-online-admin@itest.local>') AS id`,
+    [shopId, type, JSON.stringify(payload), k])).rows[0].id as string;
+  const cmdRow = async (id: string) => (await emu.pool.query(
+    'SELECT status, error, result, delivery_count FROM giga_cloud.commands WHERE command_id = $1', [id])).rows[0];
+  const waitFinal = (id: string, ms = 30_000) => waitFor(() => cmdRow(id), (x) => x?.status === 'APPLIED' || x?.status === 'REJECTED', ms);
+  const batchQty = async () => Number((await pool.query('SELECT quantity_available FROM medicine_batches WHERE id = $1', [batchId])).rows[0].quantity_available);
+  const n = async (sql: string, params: any[]) => Number((await pool.query(sql, params)).rows[0].n);
+  const sale1Items = async () => JSON.stringify((await pool.query('SELECT medicine_id, batch_id, quantity, unit_price FROM sale_items WHERE sale_id = $1 ORDER BY id', [sale1.id])).rows);
+  const itemsBefore = await sale1Items();
+  await waitFor(() => n(`SELECT COUNT(*) n FROM sync_events WHERE entity_id = $1 AND status <> 'SYNCED'`, [med]), (x) => x === 0, 20_000);
+
+  // 13a STOCK_ADD delivered several times (acknowledgements fail) -> applied exactly once
+  const q0 = await batchQty();
+  const s0 = await localStock(med);
+  emu.setFault({ mode: 'error500', functions: ['gc_ack_command'], times: 3 });
+  const add = await issue('STOCK_ADD', { medicine_id: med, batch_id: batchId, quantity: 20, reason: 'ITEST new delivery' });
+  const addR = await waitFor(() => cmdRow(add), (x) => x?.status === 'APPLIED', 30_000);
+  emu.setFault({ mode: 'none' });
+  check(addR?.status === 'APPLIED' && addR.delivery_count >= 2, `STOCK_ADD APPLIED after ${addR?.delivery_count} deliveries (ack failures)`, addR);
+  check((await batchQty()) === q0 + 20 && (await localStock(med)) === s0 + 20, `stock added exactly once (+20: batch ${q0} -> ${await batchQty()})`);
+  check(await n('SELECT COUNT(*) n FROM sync_inbound_commands WHERE command_id = $1', [add]) === 1, 'command recorded once in sync_inbound_commands');
+  const addMovId = addR?.result?.movement_id;
+  const mv = (await pool.query('SELECT previous_quantity, new_quantity, adjustment_quantity, notes, movement_type FROM inventory_movements WHERE id = $1', [addMovId])).rows[0];
+  check(mv && Number(mv.adjustment_quantity) === 20 && Number(mv.previous_quantity) === q0 && /Remote admin CLOUD \(Remote Admin/.test(mv.notes),
+    'inventory movement written (+20, previous quantity, remote admin named)', mv);
+  check(await n(`SELECT COUNT(*) n FROM inventory_movements WHERE notes LIKE '%ITEST new delivery%' AND batch_id = $1`, [batchId]) === 1, 'exactly one movement for the command');
+  check(await n(`SELECT COUNT(*) n FROM audit_logs WHERE action = 'ADMIN_ADD_STOCK' AND new_value->>'movement_id' = $1 AND user_name LIKE 'CLOUD (%'`, [addMovId]) === 1 &&
+        await n(`SELECT COUNT(*) n FROM audit_logs WHERE action = 'CLOUD_COMMAND_APPLIED' AND entity_id = $1`, [add]) === 1,
+    'audit: stock change (by the remote admin) + command applied, once each');
+  const addEv = (await pool.query(`SELECT status, payload FROM sync_events WHERE event_type = 'STOCK_ADDED' AND payload->'data'->>'command_id' = $1`, [add])).rows;
+  check(addEv.length === 1 && addEv[0].payload.movements?.[0]?.delta === 20, 'one STOCK_ADDED outbox event carrying the movement (delta +20)', addEv.length);
+  check(addEv[0]?.status === 'SYNCED', 'its event was delivered before the command was acknowledged APPLIED', addEv[0]?.status);
+  const cm13 = await waitFor(() => cloudQty(), (x) => x?.q === q0 + 20, 15_000);
+  check(cm13?.q === q0 + 20, `cloud stock reflects the shop's movement (${cm13?.q})`, cm13);
+
+  // 13b STOCK_REMOVE larger than the batch -> REJECTED, nothing changes (never negative)
+  const q1 = await batchQty();
+  const big = await issue('STOCK_REMOVE', { medicine_id: med, batch_id: batchId, quantity: q1 + 1, reason: 'Damaged' });
+  const bigR = await waitFinal(big);
+  check(bigR?.status === 'REJECTED' && /Cannot remove/.test(bigR.error || '') && !/at |\.ts|SELECT/i.test(bigR.error || ''), 'over-removal REJECTED with a clear, safe reason', bigR?.error);
+  check((await batchQty()) === q1 && await n(`SELECT COUNT(*) n FROM sync_events WHERE payload->'data'->>'command_id' = $1`, [big]) === 0, 'stock unchanged, no outbox event for the rejected command');
+
+  // 13c valid STOCK_REMOVE
+  const rem = await issue('STOCK_REMOVE', { medicine_id: med, batch_id: batchId, quantity: 5, reason: 'Expired' });
+  const remR = await waitFinal(rem);
+  check(remR?.status === 'APPLIED' && (await batchQty()) === q1 - 5 && remR.result?.delta === -5, `STOCK_REMOVE applied (-5 -> ${await batchQty()})`, remR);
+
+  // 13d STOCK_SET issued while the shop is offline; a sale happens before it is applied.
+  await emu.stop();
+  await sleep(1500);
+  const setCmd = await issue('STOCK_SET', { medicine_id: med, batch_id: batchId, quantity: 50, reason: 'ITEST shelf count' });
+  const offSale = await sell(ctx.cashierToken, 2);
+  await sleep(3000);
+  check(offSale.status === 201, 'POS keeps selling while the shop is offline', offSale.status);
+  check((await cmdRow(setCmd))?.status === 'PENDING' && await n('SELECT COUNT(*) n FROM sync_inbound_commands WHERE command_id = $1', [setCmd]) === 0,
+    'command stays PENDING (not applied, not reported APPLIED) while the shop is offline');
+  const beforeSet = await batchQty();
+  await emu.restart();
+  const setR = await waitFinal(setCmd);
+  check(setR?.status === 'APPLIED', 'command APPLIED once the shop reconnects', setR);
+  check((await batchQty()) === 50 && setR?.result?.previous_quantity === beforeSet && setR?.result?.delta === 50 - beforeSet,
+    `STOCK_SET uses the quantity locked at apply time (${beforeSet} -> 50, delta ${setR?.result?.delta})`, setR?.result);
+  check(await n(`SELECT COUNT(*) n FROM inventory_movements WHERE batch_id = $1 AND movement_type = 'PHYSICAL_STOCK_COUNT' AND notes LIKE '%ITEST shelf count%' AND adjustment_quantity = $2`, [batchId, 50 - beforeSet]) === 1,
+    'physical-count movement records the computed delta');
+  const setEv = await waitFor(async () => (await pool.query(`SELECT status FROM sync_events WHERE event_type = 'PHYSICAL_COUNT' AND payload->'data'->>'command_id' = $1`, [setCmd])).rows, (r) => r[0]?.status === 'SYNCED');
+  check(setEv.length === 1 && setEv[0].status === 'SYNCED', 'PHYSICAL_COUNT event synced back to the cloud');
+  const again13 = await issue('STOCK_SET', { medicine_id: med, batch_id: batchId, quantity: 50, reason: 'ITEST shelf count' }, `dup-${setCmd}`);
+  await waitFinal(again13);
+  check((await batchQty()) === 50, 'a second identical count is harmless (sets 50 again, no drift)');
+
+  // 13e BATCH_EXPIRY_UPDATE
+  const expCmd = await issue('BATCH_EXPIRY_UPDATE', { medicine_id: med, batch_id: batchId, expiry_date: '2030-11-30', reason: 'ITEST label check' });
+  const expCmdR = await waitFinal(expCmd);
+  const localExp = (await pool.query(`SELECT to_char(expiry_date, 'YYYY-MM-DD') AS d FROM medicine_batches WHERE id = $1`, [batchId])).rows[0].d;
+  check(expCmdR?.status === 'APPLIED' && localExp === '2030-11-30', 'batch expiry updated by command', { expCmdR, localExp });
+  check(await n(`SELECT COUNT(*) n FROM sync_events WHERE event_type = 'BATCH_EXPIRY_CHANGED' AND payload->'data'->>'command_id' = $1`, [expCmd]) === 1 &&
+        await n(`SELECT COUNT(*) n FROM audit_logs WHERE action = 'ADMIN_EDIT_EXPIRY' AND entity_id = $1 AND user_name LIKE 'CLOUD (%'`, [batchId]) >= 1,
+    'expiry change audited and queued for the cloud');
+  const cloudExp = await waitFor(async () => (await emu.pool.query(`SELECT to_char(expiry_date, 'YYYY-MM-DD') AS d FROM giga_cloud.medicine_batches WHERE shop_id = $1 AND batch_id = $2`, [shopId, batchId])).rows[0]?.d, (d) => d === '2030-11-30');
+  check(cloudExp === '2030-11-30', 'cloud batch shows the new expiry');
+
+  // 13f invalid commands are REJECTED with safe reasons (validated again by the shop)
+  const neg = await issue('STOCK_ADD', { medicine_id: med, batch_id: batchId, quantity: -3, reason: 'bad' });
+  const ghost = await issue('STOCK_REMOVE', { medicine_id: med, batch_id: crypto.randomUUID(), quantity: 1, reason: 'Lost' });
+  const snap = await issue('STOCK_SET', { medicine_id: med, batch_id: batchId, quantity: 7, reason: 'x', current_stock: 7 });
+  const [negR, ghostR, snapR] = [await waitFinal(neg), await waitFinal(ghost), await waitFinal(snap)];
+  check(negR?.status === 'REJECTED' && /whole number/.test(negR.error || ''), 'negative quantity REJECTED', negR?.error);
+  check(ghostR?.status === 'REJECTED' && /does not exist/.test(ghostR.error || ''), 'unknown batch REJECTED', ghostR?.error);
+  check(snapR?.status === 'REJECTED' && /current_stock/.test(snapR.error || ''), 'stock snapshot field refused', snapR?.error);
+  check((await batchQty()) === 50, 'rejected commands changed nothing');
+  check((await sale1Items()) === itemsBefore, 'historical sale_items untouched by remote stock commands');
 
   // ------------------------------------------------------------------ SECURITY / STATUS
   section('SYNC STATUS & SECURITY');
