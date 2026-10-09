@@ -2,6 +2,8 @@ import { assertDevDatabase, cleanupFixtures, login, pool, startServer, stopServe
 import { setupHybridCloud, type HybridEnv } from './hybrid.test';
 import { onlineTests, onlineUnreachableTests, stopOnline } from './online.test';
 import type { Ctx } from './auth-users.test';
+import { apiUrlTests } from './api-url.test';
+import { check, section } from './harness';
 
 /**
  * Online (Vercel) API suite.   npm run test:online
@@ -30,6 +32,8 @@ async function guard() {
 }
 
 async function main() {
+  section('FRONTEND API URL RESOLUTION');
+  apiUrlTests(check);
   await guard();
   const savedState = (await pool.query('SELECT key, value, updated_at FROM sync_state')).rows;
   console.log('[online] pre-run fixture cleanup:', await cleanupFixtures());

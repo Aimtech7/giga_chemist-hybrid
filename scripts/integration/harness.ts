@@ -224,6 +224,7 @@ export async function cleanupFixtures(): Promise<Record<string, number>> {
     counts.sync_events = (await client.query(
       `DELETE FROM sync_events WHERE actor_user_id IN (${itestUsers})
          OR (entity_type = 'medicine' AND entity_id IN (${itestMeds}))
+         OR (entity_type = 'medicine_batch' AND entity_id IN (SELECT b.id::text FROM medicine_batches b JOIN medicines m ON m.id = b.medicine_id WHERE m.barcode LIKE 'ITEST-%'))
          OR (entity_type = 'user' AND entity_id IN (SELECT id::text FROM users WHERE email LIKE 'itest-%@gigachemist.local'))`
     )).rowCount || 0;
     counts.sync_inbound_commands = (await client.query(

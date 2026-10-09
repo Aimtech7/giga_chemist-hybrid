@@ -4,7 +4,7 @@ import { getCachedUser, setCachedUser, logoutUser, verifySession } from './servi
 import { SESSION_EXPIRED_EVENT } from './services/session';
 import { getOrRegisterDevice } from './services/device';
 import { refreshNetworkStatus } from './services/network';
-import { syncFromLocalApiToDexie, syncFromSupabaseToDexie } from './services/syncEngine';
+import { syncFromLocalApiToDexie } from './services/syncEngine';
 import { canAccessModule, isCashier } from './services/permissions';
 import { AppShell, type AppModule } from './components/layout/AppShell';
 import { LoginModal } from './components/common/LoginModal';

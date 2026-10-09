@@ -24,7 +24,7 @@ const BASE_RETRY_SECONDS = 5;
 const MAX_BATCHES_PER_CYCLE = 20;
 const MANUAL_WAKE_MIN_INTERVAL_MS = 3000;
 
-type StateKey = 'last_success_at' | 'last_error' | 'last_error_at' | 'last_contact_at';
+type StateKey = 'last_success_at' | 'last_error' | 'last_error_at' | 'last_contact_at' | 'last_heartbeat_at';
 
 class SyncWorker {
   private timer: NodeJS.Timeout | null = null;
@@ -175,6 +175,7 @@ class SyncWorker {
       });
       await callCloud('gc_heartbeat', { p_shop_id: identity.shop_id, p_token: cfg.shopToken, p_status: status });
       this.heartbeatNotice = false;
+      await this.saveState({ last_heartbeat_at: new Date().toISOString() });
     } catch (err: any) {
       // Never affects sync or the POS. A cloud without migration 004 answers 404: logged once.
       if (!this.heartbeatNotice) {

@@ -153,7 +153,14 @@ UPDATE_REQUIRE_APPROVAL=true
 REMOTE_BACKUP_ENABLED=false
 ```
 
-### Pharmacy PC deployment (operator on site, elevated PowerShell, `C:\GIGA-CHEMIST-POS`)
+### Pharmacy PC deployment
+
+Preferred: the flash-drive kit (a clean clone of `production` with dependencies and the build
+pre-installed, plus the target `.env` / `.env.online`) and the numbered scripts in `TARGET-RUN\`
+(`run1.ps1` ... `run8.ps1`, see `TARGET-RUN/README-FIRST.txt`). They perform the steps below with
+PASS/FAIL gates.
+
+Manual equivalent (operator on site, elevated PowerShell, `C:\GIGA-CHEMIST-POS`):
 1. `npm run backup -- --dir C:\GIGA-CHEMIST-BACKUPS\pre-deploy` (verified backup of `giga_chemist`).
 2. Get the code as a **git clone** (required for updates): if the folder is not a clone yet, clone
    `https://github.com/Aimtech7/giga_chemist-hybrid.git` next to it, copy `.env` / `.env.online` /

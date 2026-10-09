@@ -49,23 +49,10 @@ export default defineConfig(() => {
           navigateFallback: '/index.html',
           // /api/* must always reach the server (JSON), never the cached SPA shell.
           navigateFallbackDenylist: [/^\/api(\/|$)/],
-          runtimeCaching: [
-            {
-              urlPattern: /^\/api\/.*/i,
-              handler: 'NetworkFirst',
-              options: {
-                cacheName: 'api-runtime-cache',
-                networkTimeoutSeconds: 3,
-                expiration: {
-                  maxEntries: 100,
-                  maxAgeSeconds: 60 * 60 * 24, // 24 hours
-                },
-                cacheableResponse: {
-                  statuses: [0, 200],
-                },
-              },
-            },
-          ],
+          // No runtime caching of /api: every API request (GET or mutation) goes to the network;
+          // offline data lives in Dexie, hydrated from the server. Authenticated responses are
+          // never stored in the service-worker cache.
+          runtimeCaching: [],
         },
         devOptions: {
           enabled: false,
@@ -79,7 +66,8 @@ export default defineConfig(() => {
     },
     build: {
       assetsDir: 'app-assets',
-      emptyOutDir: false,
+      // Clean dist/ on every build so stale bundles never linger or get served.
+      emptyOutDir: true,
     },
     server: {
       cors: true,

@@ -234,6 +234,36 @@ function deployScriptTests() {
   check(/-Mode auto/.test(upd) && /RepetitionInterval \(New-TimeSpan -Minutes \$IntervalMinutes\)/.test(upd) && /\[int\]\$IntervalMinutes = 10/.test(upd) && /NT AUTHORITY\\SYSTEM/.test(upd),
     'updater task: SYSTEM, every 10 minutes, approval-gated auto mode');
   check(!/github_pat_|ghp_[A-Za-z0-9]/.test(all), 'no GitHub token in deployment scripts');
+
+  section('TARGET-RUN — numbered installation scripts');
+  const runDir = path.join(ROOT, 'TARGET-RUN');
+  const runs = ['run1.ps1', 'run2.ps1', 'run3.ps1', 'run4.ps1', 'run5.ps1', 'run6.ps1', 'run7.ps1', 'run8.ps1', 'lib/common.ps1', 'README-FIRST.txt'];
+  check(runs.every((f) => fs.existsSync(path.join(runDir, f))), 'run1..run8, lib/common.ps1 and README-FIRST.txt exist');
+  const rt = (f: string) => fs.readFileSync(path.join(runDir, f), 'utf-8');
+  check(runs.every((f) => fs.readFileSync(path.join(runDir, f)).every((b) => b < 128)), 'all TARGET-RUN files are ASCII');
+  if (process.platform === 'win32') {
+    const list = runs.filter((f) => f.endsWith('.ps1')).map((f) => `'${path.join(runDir, f).replace(/'/g, "''")}'`).join(',');
+    const ps = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+      `$bad=0; foreach ($f in @(${list})) { $e=$null; [void][System.Management.Automation.Language.Parser]::ParseFile($f,[ref]$null,[ref]$e); if ($e.Count) { $bad++; Write-Output "$f $($e[0].Message)" } }; Write-Output "BAD=$bad"`],
+    { encoding: 'utf-8' });
+    check(/BAD=0/.test(ps.stdout), 'all TARGET-RUN scripts parse in Windows PowerShell', ps.stdout.slice(-300));
+  }
+  const allRuns = runs.filter((f) => f.endsWith('.ps1')).map(rt).join('\n');
+  check(runs.filter((f) => /^run\d\.ps1$/.test(f)).every((f) => /Write-Title/.test(rt(f)) && /Assert-Admin/.test(rt(f)) && /Done |exit 0/.test(rt(f))), 'every step prints a title, requires Administrator and ends with PASS');
+  check(/function Fail[\s\S]*exit 1/.test(rt('lib/common.ps1')), 'any FAIL stops the step (exit 1)');
+  const withBootstrap = runs.filter((f) => f.endsWith('.ps1') && /sync:bootstrap/.test(rt(f)) && !/^lib/.test(f));
+  check(withBootstrap.length === 1 && withBootstrap[0] === 'run6.ps1' && /Confirm-Text[^\n]*"BOOTSTRAP TARGET SHOP1"/.test(rt('run6.ps1')) && /bootstrap-done\.json/.test(rt('run6.ps1')) &&
+        rt('run6.ps1').indexOf('Invoke-Check "bootstrap-guard"') > 0 &&
+        rt('run6.ps1').indexOf('Invoke-Check "bootstrap-guard"') < rt('run6.ps1').indexOf('Confirm-Text') &&
+        rt('run6.ps1').indexOf('Confirm-Text') < rt('run6.ps1').indexOf('Invoke-Npm @("run", "sync:bootstrap"'),
+    'only run6 bootstraps: guard first, typed confirmation, one-time marker');
+  check(!/dev-reset|db:seed|giga_chemist_dev|DROP DATABASE|TRUNCATE|install-autostart|remove-autostart|restart-service/i.test(allRuns.replace(/NEVER[^\n]*/g, '')), 'no destructive / development / legacy script is referenced');
+  check(/backup/.test(rt('run1.ps1')) && rt('run1.ps1').indexOf('"preflight"') < rt('run1.ps1').indexOf('"backup"'), 'run1 makes the verified backup after the preflight');
+  check(/--source-db giga_chemist/.test(rt('run2.ps1')) && /result -ne "PASS"/.test(rt('run3.ps1')) && rt('run3.ps1').indexOf('PASS') < rt('run3.ps1').indexOf('db:migrate'),
+    'migrations only after a PASS rehearsal (run2 -> run3)');
+  check(/install-giga-service\.ps1/.test(rt('run5.ps1')) && /install-updater-task\.ps1/.test(rt('run5.ps1')) && /check-giga-service\.ps1/.test(rt('run5.ps1')), 'run5 uses the new service / updater installers and checks');
+  check(/Read-Host[\s\S]*REBOOT/.test(rt('run8.ps1')) && /-ceq "REBOOT"/.test(rt('run8.ps1')), 'run8 reboots only after the operator types REBOOT');
+  check(!/Write-Host[^\n]*\$envMap\[/.test(allRuns) && !/Write-Host[^\n]*(DB_PASSWORD|SYNC_SHOP_TOKEN|JWT_SECRET)/.test(allRuns), 'scripts never print .env secret values');
 }
 
 async function main() {

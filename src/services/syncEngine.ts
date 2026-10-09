@@ -2,7 +2,6 @@ import { db, getDeviceId, getSettings, saveSettings } from '../db/dexie';
 import { setSyncingState, refreshNetworkStatus } from './network';
 import { apiFetch } from './http';
 import { getCachedUser, hasUsableToken } from './session';
-import { supabase } from '../lib/supabase';
 import type {
   Sale,
   InventoryMovement,
@@ -231,87 +230,6 @@ export async function syncFromLocalApiToDexie(): Promise<boolean> {
   currentSummary.pendingCount = await getPendingCount();
   notifyListeners();
   return medsOk && batchesOk;
-}
-
-/**
- * Cloud-to-Dexie Hydration Helper (for Vercel & Online Web Mode)
- */
-export async function syncFromSupabaseToDexie(): Promise<boolean> {
-  // If Supabase is not configured or in local offline mode, use local API hydration
-  if (!supabase) {
-    return syncFromLocalApiToDexie();
-  }
-
-  try {
-    console.log('[SyncEngine] Fetching catalog and formulary from Supabase...');
-
-    // 1. Fetch categories
-    const { data: categories } = await supabase.from('categories').select('*');
-    if (categories && categories.length > 0) {
-      await db.categories.bulkPut(categories);
-    }
-
-    // 2. Fetch suppliers
-    const { data: suppliers } = await supabase.from('suppliers').select('*');
-    if (suppliers && suppliers.length > 0) {
-      await db.suppliers.bulkPut(suppliers);
-    }
-
-    // 3. Fetch customers
-    const { data: customers } = await supabase.from('customers').select('*');
-    if (customers && customers.length > 0) {
-      await db.customers.bulkPut(customers);
-    }
-
-    // 4. Fetch all medicines in paginated chunks of 1000
-    let allMeds: any[] = [];
-    let start = 0;
-    const chunkSize = 1000;
-    while (true) {
-      const { data: chunk, error } = await supabase
-        .from('medicines')
-        .select('*')
-        .range(start, start + chunkSize - 1);
-
-      if (error || !chunk || chunk.length === 0) break;
-      allMeds.push(...chunk);
-      if (chunk.length < chunkSize) break;
-      start += chunkSize;
-    }
-
-    if (allMeds.length > 0) {
-      await db.medicines.bulkPut(allMeds);
-      console.log(`[SyncEngine] Loaded ${allMeds.length} medicines from Supabase into Dexie store.`);
-    }
-
-    // 5. Fetch all medicine batches in paginated chunks of 1000
-    let allBatches: any[] = [];
-    start = 0;
-    while (true) {
-      const { data: chunk, error } = await supabase
-        .from('medicine_batches')
-        .select('*')
-        .range(start, start + chunkSize - 1);
-
-      if (error || !chunk || chunk.length === 0) break;
-      allBatches.push(...chunk);
-      if (chunk.length < chunkSize) break;
-      start += chunkSize;
-    }
-
-    if (allBatches.length > 0) {
-      await db.medicine_batches.bulkPut(allBatches);
-      console.log(`[SyncEngine] Loaded ${allBatches.length} batches from Supabase into Dexie store.`);
-    }
-
-    currentSummary.state = 'synced';
-    currentSummary.lastSyncedAt = new Date();
-    notifyListeners();
-    return true;
-  } catch (err) {
-    console.warn('[SyncEngine] Cloud sync fallback to local API:', err);
-    return syncFromLocalApiToDexie();
-  }
 }
 
 // Global auto-sync lifecycle listeners
