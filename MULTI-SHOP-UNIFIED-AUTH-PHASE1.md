@@ -6,7 +6,7 @@ Status: **feature branch, tested, NOT deployed.** No credential hash, password, 
 |---|---|
 | Production (`origin/production`) at start | `f93c8c42e8a7100734fbae6e9d1f88246a06cf74` (unchanged; `main` identical) |
 | Feature branch | `feature/multi-shop-unified-auth` (from `origin/production`) |
-| Feature branch SHA | see the commit on the branch (`git rev-parse feature/multi-shop-unified-auth`) |
+| Feature branch SHA | `3732143935d205a2085256c769025ac4f4c9e342` (implementation) + this documentation commit; local only, not pushed |
 | Production branch modified / deployed | NO / NO |
 | Supabase production migrations applied | NO (cloud 005 prepared only) |
 | Shop 1 (live) touched | NO: no restart, no `.env`, no data, no credential, no command |
@@ -246,4 +246,31 @@ Run it on the live target later with `npm run auth:credential-dryrun` (adds the 
 
 ## 12. Tests
 
-See the final report in the session (counts per suite). Every suite runs only against `giga_chemist_dev` and the local cloud emulator `giga_chemist_cloud_test`. The wrapper blanks every real cloud credential, so no test reached Supabase, Vercel or Shop 1.
+Every suite runs only against `giga_chemist_dev` and the local cloud emulator `giga_chemist_cloud_test`. The wrapper blanks every real cloud credential, so no test reached Supabase, Vercel or Shop 1.
+
+| Suite | Result |
+|---|---|
+| `npm run lint` (tsc) / typecheck | PASS |
+| `npm run build` (Vercel API bundle + Vite) | PASS |
+| `test:unified-auth` (new: unified login, credential sync, password reset, Global Admin, multi-shop, cross-shop, concurrency, migration 005 re-run) | **96 passed, 0 failed** |
+| `test:integration` (local mode) | 285 passed, 0 failed |
+| `ITEST_MODE=hybrid test:integration` | 285 passed, 0 failed |
+| `test:hybrid` (sync protocol; unchanged RPCs) | 151 passed, 0 failed |
+| `test:online` (online API + Vercel bundle + remote admin) | 177 passed, 0 failed |
+| `test:api-url` | 30 passed, 0 failed |
+| `test:updater` | 58 passed, 0 failed |
+| `test:ops` | 111 passed, **1 failed: environment, not code** (see below) |
+
+**The `test:ops` failure** is the check "upgrade-target.ps1 refuses a non-giga_chemist database (dev PC)". The script reads PC2's `.env` file, which since the target-dump restore names `DB_NAME=giga_chemist` (it said `giga_chemist_dev` before). So on PC2 the script validates instead of refusing. Neither the script nor the test changed on this branch. The run was `-ValidateOnly`, and `giga_chemist` was verified untouched afterwards (migration level 012, 135,915 sales).
+
+Regressions found and fixed during testing:
+- A new guard had blocked the existing Security-tab online-account kill switch for linked staff. It was restored (`test:online`).
+- Legacy LOCKED accounts would have been retried forever. They are now skipped and reported.
+
+Test-matrix mapping (brief numbering) → `scripts/integration/unified-auth.test.ts` labels:
+- Unified auth 1–16 → `TEST 1` … `TEST 16`.
+- Global Admin 17–26 → `TEST 17` … `TEST 26`.
+- Multi-shop 27–33 → `TEST 27` … `TEST 33`.
+- Phase-1 multi-shop matrix → `TEST 1/16`, `TEST 2`–`TEST 15`.
+- Local/hybrid unchanged (17) → `test:integration` in both modes.
+- Sync protocol unchanged (18) → `test:hybrid`.
