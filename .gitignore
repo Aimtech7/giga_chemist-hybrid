@@ -22,6 +22,10 @@ coverage/
 data/
 logs/
 backups/
+# documentation inside the XAMPP package (checked by npm run package:validate)
+!deployment/xampp/backups/
+deployment/xampp/backups/*
+!deployment/xampp/backups/README.md
 *.log
 *.dump
 *.backup
