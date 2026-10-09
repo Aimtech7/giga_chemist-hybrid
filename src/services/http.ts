@@ -1,5 +1,6 @@
 import { apiUrl } from './api';
 import { getAuthToken, hasUsableToken, expireSession } from './session';
+import { selectedShopId, setSelectedShop } from './shopContext';
 
 /**
  * Canonical client for the local GIGA CHEMIST API. Every protected request goes through apiFetch so
@@ -51,6 +52,10 @@ export async function apiFetch<T = any>(endpoint: string, options: ApiFetchOptio
     }
     headers.Authorization = `Bearer ${getAuthToken()}`;
   }
+  // Online app: the shop the Administrator selected (re-authorized by the server on every request).
+  // Never set on the local pharmacy app, so local requests are unchanged.
+  const shopId = auth ? selectedShopId() : null;
+  if (shopId) headers['X-GIGA-SHOP-ID'] = shopId;
 
   let res: Response;
   try {
@@ -71,6 +76,11 @@ export async function apiFetch<T = any>(endpoint: string, options: ApiFetchOptio
   if (res.status === 401 && auth) {
     expireSession('rejected_by_server');
     throw new ApiError(401, data?.error || 'Your session has expired. Please log in again.', data);
+  }
+  if (shopId && ['SHOP_ACCESS_DENIED', 'SHOP_NOT_FOUND', 'SHOP_ID_INVALID'].includes(data?.code)) {
+    // The remembered shop is no longer allowed (deactivated, other account): fall back to the default.
+    setSelectedShop(null);
+    if (typeof window !== 'undefined') window.location.reload();
   }
   if (!res.ok) {
     throw new ApiError(res.status, data?.error || `Request failed: ${method} ${endpoint} (HTTP ${res.status})`, data);

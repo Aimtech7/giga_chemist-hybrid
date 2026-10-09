@@ -2,6 +2,7 @@ import { db, getDeviceId, getSettings, saveSettings } from '../db/dexie';
 import { setSyncingState, refreshNetworkStatus } from './network';
 import { apiFetch } from './http';
 import { getCachedUser, hasUsableToken } from './session';
+import { shopCacheKey } from './shopContext';
 import type {
   Sale,
   InventoryMovement,
@@ -186,6 +187,33 @@ async function markLegacyQueueFailed(): Promise<number> {
   });
 }
 
+const CACHE_SHOP_KEY = 'giga_cache_shop';
+
+/** Empties every cached table that holds one shop's business data (online shop switch). */
+export async function purgeShopScopedCache(): Promise<void> {
+  const tables = [db.categories, db.customers, db.medicines, db.medicine_batches, db.sales, db.customer_returns,
+    db.suppliers, db.purchases, db.inventory_movements, db.expenses];
+  await db.transaction('rw', tables, async () => {
+    for (const t of tables) await t.clear();
+  });
+  try {
+    localStorage.setItem(CACHE_SHOP_KEY, shopCacheKey());
+  } catch {
+    /* ignore */
+  }
+}
+
+async function purgeIfShopChanged(): Promise<void> {
+  let cached: string | null = null;
+  try {
+    cached = localStorage.getItem(CACHE_SHOP_KEY);
+  } catch {
+    return;
+  }
+  // No marker yet = the cache predates shop selection = the default shop (local app: always).
+  if ((cached || 'default') !== shopCacheKey()) await purgeShopScopedCache();
+}
+
 /**
  * Hydrates this browser's Dexie cache from the authenticated local API (PostgreSQL).
  * Admin-only resources are skipped for Cashiers (the server would answer 403 anyway).
@@ -209,6 +237,10 @@ export async function syncFromLocalApiToDexie(): Promise<boolean> {
     if (!Array.isArray(rows)) throw new Error('expected a JSON array');
     for (let i = 0; i < rows.length; i += 500) await table.bulkPut(rows.slice(i, i + 500));
   };
+
+  // Online app: the cache holds ONE shop's data. A different selected shop starts from an empty cache,
+  // so rows of the previous shop can never be shown under the new shop's name.
+  await purgeIfShopChanged();
 
   // Keyed bulkPut: re-hydration overwrites cached rows with the server version, never duplicates.
   await load('Categories', '/api/categories', (rows) => putAll(db.categories, rows));

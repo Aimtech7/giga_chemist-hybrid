@@ -23,6 +23,7 @@ import {
   duration, inputCls, labelCls, when, type Draft,
 } from './remoteUi';
 import type { User } from '../../types';
+import { currentShopLabel } from '../../services/shopContext';
 
 const errText = (err: any) => (err instanceof ApiError ? err.message : 'Could not reach the online server.');
 
@@ -340,7 +341,7 @@ export const SecurityTab: React.FC<{ currentUser: User | null }> = ({ currentUse
   const [msg, setMsg] = useState('');
   const [note, setNote] = useState<string | null>(null);
   const act = async (fn: () => Promise<any>, confirmText: string) => {
-    if (!window.confirm(confirmText)) return;
+    if (!window.confirm(`[${currentShopLabel()}] ${confirmText}`)) return;
     setBusy(true);
     try {
       const r = await fn();

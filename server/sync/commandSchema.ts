@@ -21,6 +21,8 @@ export const COMMAND_TYPES = [
   'USER_SET_ACTIVE',
   'USER_ROLE_UPDATE',
   'APP_UPDATE_APPROVE',
+  'USER_CREATE',
+  'USER_CREDENTIAL_REFRESH',
 ] as const;
 export type CommandType = (typeof COMMAND_TYPES)[number];
 
@@ -208,6 +210,26 @@ export function validateCommandPayload(type: string, payload: unknown): Record<s
       onlyKeys(p, ['user_id', 'role', 'reason'], 'USER_ROLE_UPDATE');
       if (!ASSIGNABLE_ROLES.includes(p.role)) throw new HttpError(400, `role must be one of: ${ASSIGNABLE_ROLES.join(', ')}.`);
       return { user_id: uuid(p.user_id, 'user_id'), role: p.role, reason: reasonText(p.reason, true) };
+    }
+    // Credentials are NEVER in a command: the shop fetches the password hash for this one account
+    // through the shop-authenticated gc_fetch_user_credential while the command is open.
+    case 'USER_CREATE': {
+      onlyKeys(p, ['user_id', 'name', 'email', 'username', 'role', 'credential_version'], 'USER_CREATE');
+      if (!ASSIGNABLE_ROLES.includes(p.role)) throw new HttpError(400, `role must be one of: ${ASSIGNABLE_ROLES.join(', ')}.`);
+      const name = typeof p.name === 'string' ? p.name.trim() : '';
+      if (!name || name.length > 255) throw new HttpError(400, 'name is required (max 255 characters).');
+      const email = typeof p.email === 'string' ? p.email.trim().toLowerCase() : '';
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 255) throw new HttpError(400, 'A valid email address is required.');
+      let username: string | null = null;
+      if (p.username !== undefined && p.username !== null && p.username !== '') {
+        username = typeof p.username === 'string' ? p.username.trim().toLowerCase() : '';
+        if (!/^[a-z0-9][a-z0-9._-]{2,49}$/.test(username)) throw new HttpError(400, 'username must be 3-50 characters: letters, digits, dot, underscore or hyphen.');
+      }
+      return { user_id: uuid(p.user_id, 'user_id'), name, email, username, role: p.role, credential_version: wholeNumber(p.credential_version, 'credential_version', 1) };
+    }
+    case 'USER_CREDENTIAL_REFRESH': {
+      onlyKeys(p, ['user_id', 'credential_version', 'reason'], 'USER_CREDENTIAL_REFRESH');
+      return { user_id: uuid(p.user_id, 'user_id'), credential_version: wholeNumber(p.credential_version, 'credential_version', 1), reason: reasonText(p.reason, false) };
     }
     case 'APP_UPDATE_APPROVE': {
       onlyKeys(p, ['target_commit', 'reason'], 'APP_UPDATE_APPROVE');

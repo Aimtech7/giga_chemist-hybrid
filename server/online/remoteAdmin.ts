@@ -7,7 +7,8 @@ import { validateCommandPayload, STOCK_REMOVE_REASONS, ASSIGNABLE_ROLES, type Co
 /**
  * Remote administration from the online app (ADMIN only).
  *
- *   POST /api/admin/commands/<action>    queue one command for THIS deployment's shop (SHOP_ID)
+ *   GET  /api/admin/shops                shops this account may manage (+ the request's selected shop)
+ *   POST /api/admin/commands/<action>    queue one command for the request's AUTHORIZED shop
  *   GET  /api/admin/commands[/:id]       commands + lifecycle (PENDING/DELIVERED/APPLIED/REJECTED)
  *   GET  /api/admin/remote-status        short status (shop in contact? counts)
  *   GET  /api/admin/shop-health          heartbeat-based shop PC health + sanitized diagnostics
@@ -17,8 +18,10 @@ import { validateCommandPayload, STOCK_REMOVE_REASONS, ASSIGNABLE_ROLES, type Co
  *
  * Queueing never changes data in the cloud copy. The shop's local PostgreSQL applies the command
  * and its sync reports the result back, so a queued command is "PENDING", never "done". shop_id
- * always comes from the server configuration, never from the browser; command ids and
- * idempotency keys are generated here. Shop credentials (passwords / PINs) are never accepted.
+ * always comes from the server-side shop resolution (app.ts resolveShop: X-GIGA-SHOP-ID re-authorized
+ * per request, default SHOP_ID otherwise), never from the request body; the database function
+ * re-checks the account may manage that shop. Command ids and idempotency keys are generated here.
+ * Shop credentials (passwords / PINs) are never accepted.
  */
 export interface RemoteControl {
   remote_writes_enabled: boolean;
@@ -27,15 +30,18 @@ export interface RemoteControl {
 }
 
 export interface RemoteAdminDeps {
-  shopId: () => string | null;
-  /** Read-only transaction over the giga_online views of this shop. */
-  withShop: <T>(fn: (c: pg.PoolClient) => Promise<T>) => Promise<T>;
+  /** The request's authorized shop (never module state: concurrent requests may target different shops). */
+  shopId: (req: Request) => string;
+  /** Read-only transaction over the giga_online views of the request's shop. */
+  withShop: <T>(req: Request, fn: (c: pg.PoolClient) => Promise<T>) => Promise<T>;
   /** Plain connection to the cloud database. */
   withCloud: <T>(fn: (c: pg.PoolClient) => Promise<T>) => Promise<T>;
   requireAdmin: (req: any, res: Response, next: NextFunction) => unknown;
   route: (label: string, fn: (req: any, res: Response) => Promise<unknown>) => (req: any, res: Response) => Promise<void>;
-  getRemoteControl: (fresh?: boolean) => Promise<RemoteControl>;
-  clearRemoteControlCache: () => void;
+  getRemoteControl: (shopId: string | null, fresh?: boolean) => Promise<RemoteControl>;
+  clearRemoteControlCache: (shopId?: string | null) => void;
+  /** True for an ADMIN account not bound to one shop (online_users.shop_id IS NULL). */
+  isGlobalAdmin: (user: any) => boolean;
   securityEvent: (req: Request, action: string, email: string | null, userId: string | null, details?: Record<string, unknown>) => Promise<void>;
 }
 
@@ -113,9 +119,9 @@ function clientIp(req: Request): string {
  * Checks the medicine / batch / user named in a payload exist in this shop's cloud copy and returns
  * what the Admin was looking at (names, values before the change) for the activity history.
  */
-async function contextFor(deps: RemoteAdminDeps, type: CommandType, p: Record<string, any>): Promise<Record<string, unknown>> {
+async function contextFor(deps: RemoteAdminDeps, req: Request, type: CommandType, p: Record<string, any>): Promise<Record<string, unknown>> {
   const display: Record<string, unknown> = {};
-  await deps.withShop(async (c) => {
+  await deps.withShop(req, async (c) => {
     if (p.medicine_id) {
       const m = (await c.query(
         `SELECT name, current_stock, selling_price, wholesale_price, min_selling_price, purchase_price, reorder_level, status FROM medicines WHERE id = $1`,
@@ -176,6 +182,35 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
   const r = express.Router();
   const { requireAdmin, route } = deps;
 
+  // Shops this account may manage. Safe fields only (never token_hash or any credential).
+  r.get('/admin/shops', requireAdmin, route('GET /admin/shops', async (req) => {
+    const u = req.onlineUser;
+    const global = deps.isGlobalAdmin(u);
+    const selected = deps.shopId(req);
+    const select = `SELECT s.shop_id, s.shop_code, s.name, s.active, s.last_seen_at, s.last_event_at FROM giga_cloud.shops s`;
+    const rows = await deps.withCloud(async (c) => (global
+      ? await c.query(`${select} WHERE s.active ORDER BY s.shop_code, s.shop_id`)
+      : await c.query(`${select} WHERE s.shop_id = $1`, [selected])).rows);
+    let beats: Record<string, number> = {};
+    try {
+      beats = Object.fromEntries((await deps.withCloud((c) => c.query(
+        `SELECT shop_id, EXTRACT(EPOCH FROM (now() - reported_at))::int AS age FROM giga_cloud.shop_runtime_status WHERE shop_id = ANY($1::uuid[])`,
+        [rows.map((x: any) => x.shop_id)]))).rows.map((x: any) => [x.shop_id, Number(x.age)]));
+    } catch (err: any) {
+      if (err?.code !== '42P01') throw err; // migration 004 not applied: no heartbeat information
+    }
+    return {
+      scope: global ? 'GLOBAL' : 'SHOP',
+      selected_shop_id: selected,
+      shops: rows.map((x: any) => ({
+        shop_id: x.shop_id, shop_code: x.shop_code, name: x.name, active: x.active,
+        last_seen_at: x.last_seen_at, last_event_at: x.last_event_at,
+        online: x.shop_id in beats ? beats[x.shop_id] <= HEARTBEAT_ONLINE_SECONDS : null,
+        heartbeat_age_seconds: beats[x.shop_id] ?? null,
+      })),
+    };
+  }));
+
   r.get('/admin/commands/options', requireAdmin, (_req, res) => {
     res.json({ actions: Object.keys(ACTIONS), stock_remove_reasons: STOCK_REMOVE_REASONS, assignable_roles: ASSIGNABLE_ROLES });
   });
@@ -183,16 +218,18 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
   r.post('/admin/commands/:action', requireAdmin, commandRateLimit, route('POST /admin/commands', async (req, res) => {
     const type = ACTIONS[String(req.params.action)];
     if (!type) throw new HttpError(404, `Unknown remote action "${req.params.action}".`);
-    const shopId = deps.shopId();
-    if (!shopId) throw new HttpError(503, 'Online API not configured: SHOP_ID is missing.');
-    const ctl = await deps.getRemoteControl(true);
+    const shopId = deps.shopId(req);
+    const ctl = await deps.getRemoteControl(shopId, true);
     if (!ctl.remote_writes_enabled) throw new HttpError(423, 'Remote changes are disabled (emergency switch). Re-enable them under Security.');
     const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? { ...req.body } : {};
     // Optional client request id: the SAME phone request retried (bad network) queues ONE command.
     const requestId = body.request_id;
     delete body.request_id;
     const payload = validateCommandPayload(type, body);
-    const display = await contextFor(deps, type, payload);
+    const display = await contextFor(deps, req, type, payload);
+    // Target shop recorded with the command, so its history always names the shop it was sent to.
+    const target = (await deps.withCloud((c) => c.query('SELECT shop_code, name FROM giga_cloud.shops WHERE shop_id = $1', [shopId]))).rows[0];
+    display.target_shop = { shop_id: shopId, shop_code: target?.shop_code ?? null, name: target?.name ?? null };
     if (type === 'APP_UPDATE_APPROVE') {
       const rt = await runtimeRow(deps, shopId);
       const available = rt?.update_state?.available_commit;
@@ -226,6 +263,8 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
     return {
       command_id: row.command_id,
       command_type: type,
+      shop_id: shopId,
+      shop_code: target?.shop_code ?? null,
       status: row.status,
       created_at: row.created_at,
       duplicate: row.duplicate,
@@ -238,13 +277,13 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
     const status = typeof req.query.status === 'string' ? req.query.status.toUpperCase() : '';
     const statuses = status ? status.split(',').filter((s: string) => ['PENDING', 'DELIVERED', 'APPLIED', 'REJECTED'].includes(s)) : [];
     const rows = await commandQuery(deps, `shop_id = $1 AND ($2::text[] IS NULL OR status = ANY($2::text[]))`,
-      [deps.shopId(), statuses.length ? statuses : null, limit], 'ORDER BY created_at DESC LIMIT $3');
+      [deps.shopId(req), statuses.length ? statuses : null, limit], 'ORDER BY created_at DESC LIMIT $3');
     return { commands: rows.map(toCommand) };
   }));
 
   r.get('/admin/commands/:id', requireAdmin, route('GET /admin/commands/:id', async (req) => {
     if (!isValidUuid(req.params.id)) throw new HttpError(400, 'Command id must be a UUID.');
-    const row = (await commandQuery(deps, 'command_id = $1 AND shop_id = $2', [req.params.id, deps.shopId()]))[0];
+    const row = (await commandQuery(deps, 'command_id = $1 AND shop_id = $2', [req.params.id, deps.shopId(req)]))[0];
     if (!row) throw new HttpError(404, 'Command not found.');
     return toCommand(row);
   }));
@@ -262,8 +301,8 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
          FROM giga_cloud.commands WHERE shop_id = $1`, [shopId])).rows[0];
   }
 
-  r.get('/admin/remote-status', requireAdmin, route('GET /admin/remote-status', async () => {
-    const shopId = deps.shopId();
+  r.get('/admin/remote-status', requireAdmin, route('GET /admin/remote-status', async (req) => {
+    const shopId = deps.shopId(req);
     const rt = await runtimeRow(deps, shopId);
     return deps.withCloud(async (c) => {
       const shop = (await c.query(
@@ -278,6 +317,7 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
       )).rows[0];
       const heartbeat = rt ? rt.age_seconds <= HEARTBEAT_ONLINE_SECONDS : null;
       return {
+        shop_id: shopId,
         shop_registered: Boolean(shop),
         shop_active: shop?.active ?? false,
         shop_code: shop?.shop_code ?? null,
@@ -299,10 +339,10 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
     });
   }));
 
-  r.get('/admin/shop-health', requireAdmin, route('GET /admin/shop-health', async () => {
-    const shopId = deps.shopId();
+  r.get('/admin/shop-health', requireAdmin, route('GET /admin/shop-health', async (req) => {
+    const shopId = deps.shopId(req);
     const rt = await runtimeRow(deps, shopId);
-    const ctl = await deps.getRemoteControl(true);
+    const ctl = await deps.getRemoteControl(shopId, true);
     const counts = await deps.withCloud((c) => commandCounts(c, shopId));
     if (rt === undefined) return { heartbeat_supported: false, online: null, message: 'Apply cloud migration 004 to receive shop heartbeats.', commands: counts, controls: ctl };
     if (!rt) return { heartbeat_supported: true, online: false, message: 'The shop computer has not sent a heartbeat yet.', commands: counts, controls: ctl };
@@ -340,7 +380,7 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
 
   // ------------------------------------------------------------------ alerts
   r.get('/admin/alerts', requireAdmin, route('GET /admin/alerts', async (req) => {
-    const shopId = deps.shopId();
+    const shopId = deps.shopId(req);
     const which = String(req.query.status || 'open').toLowerCase();
     try {
       return await deps.withCloud(async (c) => {
@@ -363,7 +403,7 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
     if (!Number.isInteger(id) || id <= 0) throw new HttpError(400, 'Alert id must be a number.');
     const row = (await deps.withCloud((c) => c.query(
       `UPDATE giga_cloud.alerts SET status = 'ACKNOWLEDGED', acknowledged_by = $3, acknowledged_at = now()
-        WHERE id = $1 AND shop_id = $2 AND status = 'ACTIVE' RETURNING id, status`, [id, deps.shopId(), req.onlineUser.email]))).rows[0];
+        WHERE id = $1 AND shop_id = $2 AND status = 'ACTIVE' RETURNING id, status`, [id, deps.shopId(req), req.onlineUser.email]))).rows[0];
     if (!row) throw new HttpError(404, 'No active alert with that id.');
     await deps.securityEvent(req, 'ALERT_ACKNOWLEDGED', req.onlineUser.email, req.onlineUser.id, { alert_id: id });
     return { id, status: row.status };
@@ -373,7 +413,7 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
   r.get('/admin/insights', requireAdmin, route('GET /admin/insights', async (req) => {
     const days = Math.min(Math.max(Number(req.query.days) || 30, 7), 180);
     const coverDays = 30;
-    return deps.withShop(async (c) => {
+    return deps.withShop(req, async (c) => {
       const meds = (await c.query(
         `WITH sold AS (
            SELECT si.medicine_id, SUM(si.quantity)::int AS qty, SUM(si.total)::numeric AS revenue
@@ -439,18 +479,22 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
   }));
 
   // ------------------------------------------------------------------ emergency controls / sessions
-  r.get('/admin/security', requireAdmin, route('GET /admin/security', async () => {
-    const shopId = deps.shopId();
-    const controls = await deps.getRemoteControl(true);
+  // Online accounts an Administrator may see and manage for the request's shop ($1 = shop id):
+  // a global Administrator: global accounts + that shop's accounts; a shop Administrator: only its shop's.
+  const accountScope = (req: any) => (deps.isGlobalAdmin(req.onlineUser) ? '(shop_id IS NULL OR shop_id = $1)' : 'shop_id = $1');
+
+  r.get('/admin/security', requireAdmin, route('GET /admin/security', async (req) => {
+    const shopId = deps.shopId(req);
+    const controls = await deps.getRemoteControl(shopId, true);
     return deps.withCloud(async (c) => {
       let users;
       try {
         users = (await c.query(
           `SELECT id, email, name, role, active, last_login_at, token_version FROM giga_cloud.online_users
-            WHERE shop_id IS NULL OR shop_id = $1 ORDER BY role, email`, [shopId])).rows;
+            WHERE ${accountScope(req)} ORDER BY role, email`, [shopId])).rows;
       } catch (err: any) {
         if (err?.code !== '42703') throw err;
-        users = (await c.query(`SELECT id, email, name, role, active, last_login_at FROM giga_cloud.online_users WHERE shop_id IS NULL OR shop_id = $1 ORDER BY role, email`, [shopId])).rows;
+        users = (await c.query(`SELECT id, email, name, role, active, last_login_at FROM giga_cloud.online_users WHERE ${accountScope(req)} ORDER BY role, email`, [shopId])).rows;
       }
       const events = (await c.query(
         `SELECT at, user_email, action, command_type, client_ip FROM giga_cloud.online_audit WHERE shop_id = $1 ORDER BY at DESC LIMIT 50`, [shopId])).rows;
@@ -467,13 +511,13 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
            maintenance_mode = COALESCE($3, giga_cloud.remote_control.maintenance_mode),
            maintenance_message = CASE WHEN $3 IS NULL THEN giga_cloud.remote_control.maintenance_message ELSE $4 END,
            updated_by = $5, updated_at = now()`,
-        [deps.shopId(), fields.remote_writes_enabled ?? null, fields.maintenance_mode ?? null, fields.maintenance_message ?? null, req.onlineUser.email]));
+        [deps.shopId(req), fields.remote_writes_enabled ?? null, fields.maintenance_mode ?? null, fields.maintenance_message ?? null, req.onlineUser.email]));
     } catch (err: any) {
       if (err?.code === '42P01') throw new HttpError(503, 'Apply cloud migration 004 to enable emergency controls.');
       throw err;
     }
-    deps.clearRemoteControlCache();
-    return deps.getRemoteControl(true);
+    deps.clearRemoteControlCache(deps.shopId(req));
+    return deps.getRemoteControl(deps.shopId(req), true);
   }
 
   const bool = (v: unknown, name: string) => {
@@ -505,7 +549,7 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
     try {
       n = (await deps.withCloud((c) => c.query(
         `UPDATE giga_cloud.online_users SET token_version = token_version + 1, updated_at = now()
-          WHERE (shop_id IS NULL OR shop_id = $1) AND ($2::boolean OR id = $3::uuid)`, [deps.shopId(), all, all ? null : userId]))).rowCount;
+          WHERE ${accountScope(req)} AND ($2::boolean OR id = $3::uuid)`, [deps.shopId(req), all, all ? null : userId]))).rowCount;
     } catch (err: any) {
       if (err?.code === '42703') throw new HttpError(503, 'Apply cloud migration 004 to enable session revocation.');
       throw err;
@@ -518,13 +562,16 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
   r.post('/admin/security/online-users/:id/active', requireAdmin, securityRateLimit, route('POST /admin/security/online-users/:id/active', async (req) => {
     if (!isValidUuid(req.params.id)) throw new HttpError(400, 'Account id must be a UUID.');
     const active = bool(req.body?.active, 'active');
-    const shopId = deps.shopId();
+    const shopId = deps.shopId(req);
     const out = await deps.withCloud(async (c) => {
       await c.query('BEGIN');
       try {
-        const target = (await c.query(`SELECT id, email, role, active FROM giga_cloud.online_users WHERE id = $1 AND (shop_id IS NULL OR shop_id = $2) FOR UPDATE`,
+        const target = (await c.query(`SELECT id, email, role, active, local_user_id FROM giga_cloud.online_users WHERE ${accountScope(req).replace(/\$1/g, () => '$2')} AND id = $1 FOR UPDATE`,
           [req.params.id, shopId])).rows[0];
         if (!target) throw new HttpError(404, 'Online account not found.');
+        // Emergency switch for the ONLINE login only (unchanged behaviour). For a shop staff login with
+        // unified credential sync enabled, a later publish from the shop restores the shop's status:
+        // a durable staff deactivation is done under User Management (it also deactivates at the shop).
         if (!active && target.role === 'ADMIN') {
           const others = (await c.query(`SELECT COUNT(*)::int AS n FROM giga_cloud.online_users WHERE role = 'ADMIN' AND active AND id <> $1 AND (shop_id IS NULL OR shop_id = $2)`,
             [target.id, shopId])).rows[0].n;

@@ -127,6 +127,8 @@ export const COMMAND_LABELS: Record<string, string> = {
   USER_SET_ACTIVE: 'Staff account on/off',
   USER_ROLE_UPDATE: 'Staff role',
   APP_UPDATE_APPROVE: 'Software update approval',
+  USER_CREATE: 'New staff account',
+  USER_CREDENTIAL_REFRESH: 'Staff password reset',
 };
 
 // ---------------------------------------------------------------- health, alerts, insights, security
@@ -157,3 +159,32 @@ export function downloadCsv(filename: string, rows: Record<string, unknown>[]) {
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
+
+// ---------------------------------------------------------------- multi-shop + user management (online)
+export interface OnlineShop {
+  shop_id: string;
+  shop_code: string | null;
+  name: string | null;
+  active: boolean;
+  last_seen_at: string | null;
+  last_event_at: string | null;
+  online: boolean | null;
+  heartbeat_age_seconds: number | null;
+}
+export const getShops = () => apiFetch<{ scope: 'GLOBAL' | 'SHOP'; selected_shop_id: string; shops: OnlineShop[] }>('/api/admin/shops');
+
+export const getAccounts = (shop: 'all' | 'selected' = 'selected') =>
+  apiFetch<{ shop_filter: string; global_admins: any[]; shop_users: any[] }>(`/api/admin/accounts${shop === 'all' ? '?shop=all' : ''}`);
+export const createShopUser = (body: { name: string; email: string; username?: string; role: string; password: string }) =>
+  apiFetch<any>('/api/admin/accounts/shop-users', { body });
+const su = (id: string, action: string) => `/api/admin/accounts/shop-users/${encodeURIComponent(id)}/${action}`;
+export const resetShopUserPassword = (localUserId: string, password: string) => apiFetch<any>(su(localUserId, 'password'), { body: { password } });
+export const setShopUserActive = (localUserId: string, active: boolean, reason?: string) => apiFetch<any>(su(localUserId, 'active'), { body: { active, reason } });
+export const setShopUserRole = (localUserId: string, role: string, reason?: string) => apiFetch<any>(su(localUserId, 'role'), { body: { role, reason } });
+export const revokeShopUserSessions = (localUserId: string) => apiFetch<any>(su(localUserId, 'revoke-sessions'), { body: {} });
+export const createGlobalAdmin = (body: { name: string; email: string; password: string }) => apiFetch<any>('/api/admin/accounts/global-admins', { body });
+const ga = (id: string, action: string) => `/api/admin/accounts/global-admins/${encodeURIComponent(id)}/${action}`;
+export const setGlobalAdminActive = (id: string, active: boolean) => apiFetch<any>(ga(id, 'active'), { body: { active } });
+export const resetGlobalAdminPassword = (id: string, password: string) => apiFetch<any>(ga(id, 'password'), { body: { password } });
+export const revokeGlobalAdminSessions = (id: string) => apiFetch<any>(ga(id, 'revoke-sessions'), { body: {} });
+export const deleteGlobalAdmin = (id: string) => apiFetch<any>(`/api/admin/accounts/global-admins/${encodeURIComponent(id)}`, { method: 'DELETE' });

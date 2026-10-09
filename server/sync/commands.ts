@@ -4,10 +4,11 @@ import { recordAuditLog } from '../db/audit';
 import { applyPricingUpdate, updateMedicineDetailsTx, type MedicineActor } from '../db/medicines';
 import { updatePharmacySettingsTx } from '../db/settings';
 import { adminAddStockTx, adminEditBatchExpiryTx, adminPhysicalStockCountTx, adminRemoveStockTx, type StockActor } from '../db/inventory';
-import { enqueueSyncEvent, medicineJson } from './outbox';
+import { enqueueSyncEvent, medicineJson, userJson } from './outbox';
 import { getShopIdentity } from './identity';
 import { COMMAND_TYPES, validateCommandPayload } from './commandSchema';
-import { updateUserTx } from '../db/users';
+import { updateUserTx, unusablePinHash } from '../db/users';
+import type { FetchedCredential } from './credentials';
 import { readUpdateState } from '../ops/runtime';
 
 /**
@@ -31,6 +32,32 @@ export interface CloudCommand {
   payload: any;
   idempotency_key: string;
   created_by?: string | null;
+  /**
+   * USER_CREATE / USER_CREDENTIAL_REFRESH only: the password hash fetched for this one account just
+   * before applying (gc_fetch_user_credential). In memory only — never stored with the command,
+   * its result or the audit row.
+   */
+  credential?: FetchedCredential | null;
+  credential_error?: string | null;
+}
+
+/** Commands about one staff account (payload.user_id). */
+const USER_COMMANDS = ['USER_SET_ACTIVE', 'USER_ROLE_UPDATE', 'USER_CREATE', 'USER_CREDENTIAL_REFRESH'];
+export const CREDENTIAL_COMMANDS = ['USER_CREATE', 'USER_CREDENTIAL_REFRESH'];
+
+/** (version, timestamp) ordering shared with the cloud: true when a is strictly newer than b. */
+async function credentialNewer(client: pg.PoolClient, a: { v: number; at: string }, b: { v: number; at: string }): Promise<boolean> {
+  const r = await client.query('SELECT ($1::bigint, $2::timestamptz) > ($3::bigint, $4::timestamptz) AS newer', [a.v, a.at, b.v, b.at]);
+  return Boolean(r.rows[0].newer);
+}
+
+function requireCredential(cmd: CloudCommand, userId: string): FetchedCredential {
+  if (cmd.credential_error) throw new HttpError(409, cmd.credential_error);
+  const c = cmd.credential;
+  if (!c) throw new Error('credential not fetched yet'); // infrastructure: retried next cycle
+  if (String(c.local_user_id).toLowerCase() !== userId) throw new HttpError(409, 'Fetched credential belongs to another account.');
+  if (typeof c.password_hash !== 'string' || !c.password_hash.includes('$') || c.password_hash.length < 40) throw new HttpError(409, 'Fetched credential has an unsupported format.');
+  return c;
 }
 
 export interface CommandOutcome {
@@ -243,6 +270,62 @@ const HANDLERS: Record<string, Handler> = {
     return { user_id: p.user_id, name: saved.name, previous_role: before.role, role: saved.role };
   },
 
+  // A staff account created by an online Global Administrator. The password HASH comes from the
+  // cloud login mirror (fetched for this command only); the PIN is unusable until set at the shop.
+  async USER_CREATE(client, cmd) {
+    const p = validateCommandPayload('USER_CREATE', cmd.payload);
+    const cred = requireCredential(cmd, p.user_id);
+    const existing = (await client.query('SELECT id, email FROM users WHERE id = $1 FOR UPDATE', [p.user_id])).rows[0];
+    if (existing) {
+      if (String(existing.email).toLowerCase() !== p.email) throw new HttpError(409, 'A different staff account already uses this id.');
+      return { user_id: p.user_id, already_existed: true };
+    }
+    const clash = (await client.query(
+      `SELECT CASE WHEN LOWER(email) = $1 THEN 'email' ELSE 'username' END AS field FROM users WHERE LOWER(email) = $1 OR ($2::text IS NOT NULL AND LOWER(username) = $2) LIMIT 1`,
+      [p.email, p.username])).rows[0];
+    if (clash) throw new HttpError(409, `Another staff account in this shop already uses that ${clash.field}.`);
+    await client.query(
+      `INSERT INTO users (id, name, email, username, role, active, password_hash, pin_hash, credential_version, credential_updated_at, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::timestamptz, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+      [p.user_id, p.name, p.email, p.username, p.role, cred.active !== false, cred.password_hash, unusablePinHash(),
+       Number(cred.credential_version), cred.credential_updated_at]
+    );
+    await enqueueSyncEvent(client, {
+      event_type: 'USER_UPSERTED', entity_type: 'user', entity_id: p.user_id, operation: 'CLOUD_COMMAND',
+      data: async () => ({ user: await userJson(client, p.user_id), command_id: cmd.command_id }),
+      actor: cloudActor(cmd),
+    });
+    await recordAuditLog({
+      ...cloudActor(cmd), action: 'REMOTE_USER_CREATED', entity: 'user', entity_id: p.user_id,
+      new_value: { name: p.name, email: p.email, username: p.username, role: p.role, command_id: cmd.command_id },
+    } as any, client);
+    return { user_id: p.user_id, name: p.name, role: p.role, created: true };
+  },
+
+  // A password reset by an online Global Administrator. Applied only when the cloud credential is
+  // newer than the shop's (an offline password change made here later is kept and published instead).
+  async USER_CREDENTIAL_REFRESH(client, cmd) {
+    const p = validateCommandPayload('USER_CREDENTIAL_REFRESH', cmd.payload);
+    const cred = requireCredential(cmd, p.user_id);
+    const local = (await client.query(
+      'SELECT id, credential_version, credential_updated_at::text AS at FROM users WHERE id = $1 FOR UPDATE', [p.user_id])).rows[0];
+    if (!local) throw new HttpError(404, 'This user does not exist in the shop.');
+    const newer = await credentialNewer(client, { v: Number(cred.credential_version), at: cred.credential_updated_at },
+      { v: Number(local.credential_version), at: local.at });
+    if (newer) {
+      await client.query(
+        `UPDATE users SET password_hash = $2, credential_version = $3, credential_updated_at = $4::timestamptz, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+        [p.user_id, cred.password_hash, Number(cred.credential_version), cred.credential_updated_at]);
+    }
+    await recordAuditLog({
+      ...cloudActor(cmd), action: newer ? 'REMOTE_USER_PASSWORD_RESET' : 'REMOTE_USER_PASSWORD_RESET_SUPERSEDED', entity: 'user', entity_id: p.user_id,
+      new_value: { credential_version: Number(newer ? cred.credential_version : local.credential_version), reason: p.reason, command_id: cmd.command_id },
+    } as any, client);
+    return newer
+      ? { user_id: p.user_id, credential_version: Number(cred.credential_version), applied: true }
+      : { user_id: p.user_id, applied: false, note: 'The shop has a newer password for this account; it is kept and published to the cloud.' };
+  },
+
   // ---------------------------------------------------------------- software update approval
   // Records the approval only. The updater (scripts/updater/updater.mjs) installs it after checking
   // independently that the commit is the tip of the approved production branch, with a verified
@@ -335,6 +418,17 @@ export async function applyCloudCommand(cmd: CloudCommand): Promise<CommandOutco
         : `The shop database refused this change as invalid data (code ${err.code}).`;
     }
 
+    // A refused staff command left the cloud's immediate value (active / role / password) ahead of
+    // the shop: re-publish this account so the cloud converges back to the shop's actual state.
+    if (status === 'REJECTED' && USER_COMMANDS.includes(cmd.command_type) && isValidUuid(cmd.payload?.user_id)) {
+      await client.query('SAVEPOINT gc_user_republish');
+      try {
+        await client.query(`UPDATE users SET auth_sync_seq = nextval('users_auth_sync_seq') WHERE id = $1`, [cmd.payload.user_id]);
+        await client.query('RELEASE SAVEPOINT gc_user_republish');
+      } catch {
+        await client.query('ROLLBACK TO SAVEPOINT gc_user_republish'); // before local migration 016: nothing to re-publish
+      }
+    }
     await client.query(
       `INSERT INTO sync_inbound_commands (command_id, idempotency_key, shop_id, command_type, payload, status, result, error, applied_at)
        VALUES ($1, $2, $3, $4, $5, $6::text, $7, $8, CASE WHEN $6::text = 'APPLIED' THEN CURRENT_TIMESTAMP END)`,

@@ -34,6 +34,8 @@ import {
 } from '../../services/remoteAdmin';
 import { Sheet, StatusBadge, STATUS_TEXT, ago, when, inputCls, labelCls, btnPrimary, btnSecondary, describeResult, describeRequest, type Draft } from './remoteUi';
 import { AlertsTab, CommandDetail, HealthTab, InsightsTab, SecurityTab, StaffTab } from './RemoteOps';
+import { UsersTab } from './UserManagement';
+import { isGlobalAdminAccount } from '../../services/shopContext';
 import type { Medicine, MedicineBatch, PharmacySettings, User } from '../../types';
 
 /**
@@ -46,7 +48,7 @@ interface Props {
   settings: PharmacySettings;
 }
 
-type Tab = 'medicines' | 'changes' | 'health' | 'alerts' | 'insights' | 'staff' | 'security' | 'shop';
+type Tab = 'medicines' | 'changes' | 'health' | 'alerts' | 'insights' | 'staff' | 'users' | 'security' | 'shop';
 
 type ActionKind = 'add' | 'remove' | 'count' | 'price' | 'details' | 'expiry';
 
@@ -257,7 +259,7 @@ export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings }) => 
         <p className="text-[11px] text-slate-500">Changes are sent to the shop computer, which applies them to the shop database and syncs the result back.</p>
         <div className="flex gap-1 mt-2 bg-slate-100 p-1 rounded-lg overflow-x-auto">
           {([['medicines', 'Medicines'], ['changes', 'Activity'], ['health', 'Health'], ['alerts', 'Alerts'], ['insights', 'Reports'],
-            ['staff', 'Staff'], ['security', 'Security'], ['shop', 'Settings']] as [Tab, string][]).map(([id, label]) => (
+            ['staff', 'Staff'], ...(isGlobalAdminAccount() ? [['users', 'Users']] : []), ['security', 'Security'], ['shop', 'Settings']] as [Tab, string][]).map(([id, label]) => (
             <button key={id} onClick={() => setTab(id)} className={`shrink-0 px-3 py-2 rounded-md text-xs font-semibold whitespace-nowrap ${tab === id ? 'bg-white text-teal-800 shadow-xs' : 'text-slate-600'}`}>
               {label}
               {id === 'changes' && status && status.commands.pending + status.commands.delivered > 0 ? ` (${status.commands.pending + status.commands.delivered})` : ''}
@@ -379,6 +381,7 @@ export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings }) => 
         {tab === 'alerts' && <AlertsTab />}
         {tab === 'insights' && <InsightsTab currency={cur} />}
         {tab === 'staff' && <StaffTab onDraft={(d) => { setSendError(null); setDraft(d); }} />}
+        {tab === 'users' && isGlobalAdminAccount() && <UsersTab currentUser={currentUser} />}
         {tab === 'security' && <SecurityTab currentUser={currentUser} />}
 
         {tab === 'shop' && (
@@ -402,7 +405,12 @@ export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings }) => 
       )}
 
       {draft && (
-        <Sheet title="Confirm remote change" onClose={() => (sending ? null : setDraft(null))}>
+        <Sheet title={`${status?.shop_code || 'Shop'} — Confirm remote change`} onClose={() => (sending ? null : setDraft(null))}>
+          {/* The shop the server resolved for this very request context: never an earlier selection. */}
+          <div className="mb-2 rounded-lg border-2 border-amber-400 bg-amber-50 px-3 py-2 text-sm">
+            <div className="text-[10px] font-bold uppercase tracking-wide text-amber-700">Target shop</div>
+            <div className="font-bold text-amber-900">{status?.shop_name || status?.shop_code || 'Unknown shop'}{status?.shop_code ? ` (${status.shop_code})` : ''}</div>
+          </div>
           <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 space-y-1.5 text-sm">
             {draft.lines.map(([k, v]) => (
               <div key={k} className="flex justify-between gap-3"><span className="text-slate-500">{k}</span><span className="font-semibold text-slate-900 text-right break-words">{v}</span></div>

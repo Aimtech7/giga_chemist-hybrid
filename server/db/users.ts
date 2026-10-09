@@ -103,7 +103,7 @@ function validatePin(pin: unknown): string {
 }
 
 /** pin_hash is NOT NULL: accounts without a PIN get a hash of random bytes nobody knows. */
-function unusablePinHash(): string {
+export function unusablePinHash(): string {
   return hashCredential(crypto.randomBytes(32).toString('hex')).combined;
 }
 

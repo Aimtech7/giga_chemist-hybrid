@@ -32,6 +32,7 @@ import { runSync, subscribeToSyncStatus } from '../../services/syncEngine';
 import { getOrRegisterDevice } from '../../services/device';
 import { canAccessModule, isCashier } from '../../services/permissions';
 import { getServerMode } from '../../services/remoteAdmin';
+import { ShopSelector } from './ShopSelector';
 import type { User, PharmacySettings, DeviceInfo } from '../../types';
 
 export type AppModule =
@@ -164,6 +165,8 @@ export const AppShell: React.FC<AppShellProps> = ({
               </span>
             )}
           </div>
+          {/* Online app only: the shop every screen and remote change applies to (never on the shop POS). */}
+          {serverMode === 'online' && currentUser?.role === 'ADMIN' && <ShopSelector />}
         </div>
 
         {/* Center: local POS server vs cloud sync status (kept separate) */}

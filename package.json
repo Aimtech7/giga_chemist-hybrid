@@ -34,6 +34,8 @@
     "test:ops": "tsx scripts/integration/run-ops.ts",
     "build:api": "node scripts/build-online-api.mjs",
     "test:online": "tsx scripts/integration/run-online.ts",
+    "test:unified-auth": "tsx scripts/integration/run-unified-auth.ts",
+    "auth:credential-dryrun": "tsx scripts/auth/credential-sync-dryrun.ts",
     "online:create-user": "tsx scripts/online/create-online-user.ts",
     "test:api-url": "tsx scripts/integration/api-url.test.ts",
     "test:updater": "tsx scripts/integration/updater.test.ts",
