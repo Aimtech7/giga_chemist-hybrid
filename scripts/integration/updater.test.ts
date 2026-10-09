@@ -44,7 +44,7 @@ function writeProject(dir: string, version: string, healthy = true) {
     name: 'gc-updater-fixture', version, private: true,
     scripts: {
       lint: 'node -e "process.exit(0)"',
-      build: 'node -e "require(\'fs\').writeFileSync(\'built.txt\', \'' + version + '\')"',
+      build: 'node build.mjs',
       'db:migrate': 'node -e "require(\'fs\').appendFileSync(\'migrated.log\', \'' + version + '\\n\')"',
       'db:check': 'node -e "process.exit(0)"',
     },
@@ -53,6 +53,14 @@ function writeProject(dir: string, version: string, healthy = true) {
     name: 'gc-updater-fixture', version, lockfileVersion: 3, requires: true, packages: { '': { name: 'gc-updater-fixture', version } },
   }, null, 2));
   fs.writeFileSync(path.join(dir, 'health.json'), JSON.stringify({ healthy }));
+  // Like the real build (api/index.js): rewrites a TRACKED generated file, always with LF endings.
+  const generated = `export const version = ${JSON.stringify(version)};\n// generated\n`;
+  fs.writeFileSync(path.join(dir, 'generated.js'), generated);
+  fs.writeFileSync(path.join(dir, 'build.mjs'), [
+    "import fs from 'fs';",
+    `fs.writeFileSync('built.txt', ${JSON.stringify(version)});`,
+    `fs.writeFileSync('generated.js', ${JSON.stringify(generated)});`,
+  ].join('\n'));
   fs.writeFileSync(path.join(dir, '.gitignore'), '.env\n.env.online\nlogs/\nnode_modules/\nbuilt.txt\nmigrated.log\n');
 }
 function commit(msg: string, version: string, healthy = true, branches: string[] = ['main']) {
@@ -111,7 +119,9 @@ async function updaterTests() {
   sh(tmp, 'git', ['clone', '-q', origin, dev]);
   git(dev, 'checkout', '-q', '-b', 'main');
   const a = commit('A', '1.0.0', true, ['main', 'production']);
-  sh(tmp, 'git', ['clone', '-q', '--branch', 'production', origin, target]);
+  // The pharmacy PC checks out with Windows line endings (core.autocrlf=true).
+  sh(tmp, 'git', ['-c', 'core.autocrlf=true', 'clone', '-q', '--branch', 'production', origin, target]);
+  git(target, 'config', 'core.autocrlf', 'true');
   const SECRET = `JWT_SECRET=${'s'.repeat(48)}\nDB_PASSWORD=itest-not-real\n`;
   fs.writeFileSync(path.join(target, '.env'), SECRET);
   fs.writeFileSync(path.join(target, '.env.online'), 'SHOP_ID=c2a176c8-a50f-456f-a370-225c11d2e32f\n');
@@ -145,6 +155,8 @@ async function updaterTests() {
   check(fs.readFileSync(path.join(target, '.env'), 'utf-8') === envBefore && fs.existsSync(path.join(target, '.env.online')), '.env and .env.online preserved');
   check(fs.readFileSync(path.join(target, 'built.txt'), 'utf-8') === '1.1.0' && /1\.1\.0/.test(fs.readFileSync(path.join(target, 'migrated.log'), 'utf-8')), 'new version built and migrations run');
   check(JSON.parse(fs.readFileSync(approvalFile, 'utf-8')).consumed === true, 'approval consumed (one approval = one install)');
+  check(sh(target, 'git', ['status', '--porcelain', '--untracked-files=no']) === '' && fs.readFileSync(path.join(target, 'generated.js'), 'utf-8').includes('\r\n'),
+    'working copy clean after the build (tracked generated file differing only in line endings restored)');
 
   const d = commit('D unhealthy', '1.3.0', false, ['main', 'production']);
   await updater('check');
@@ -234,6 +246,8 @@ function deployScriptTests() {
   check(/-Mode auto/.test(upd) && /RepetitionInterval \(New-TimeSpan -Minutes \$IntervalMinutes\)/.test(upd) && /\[int\]\$IntervalMinutes = 10/.test(upd) && /NT AUTHORITY\\SYSTEM/.test(upd),
     'updater task: SYSTEM, every 10 minutes, approval-gated auto mode');
   check(!/github_pat_|ghp_[A-Za-z0-9]/.test(all), 'no GitHub token in deployment scripts');
+  check(/^api\/index\.js\s+text\s+eol=lf$/m.test(fs.readFileSync(path.join(ROOT, '.gitattributes'), 'utf-8')),
+    '.gitattributes pins api/index.js to LF (a build never dirties the pharmacy working copy)');
 
   section('TARGET-RUN — numbered installation scripts');
   const runDir = path.join(ROOT, 'TARGET-RUN');

@@ -299,6 +299,22 @@ function buildActivate(commit, { lint }) {
   npm(['ci', '--no-audit', '--no-fund']);
   if (lint && !CFG.skipLint) npm(['run', 'lint']);
   npm(['run', 'build']);
+  normalizeTree();
+}
+
+// A build may rewrite tracked generated files (api/index.js) with other line endings. Restore them
+// when the ONLY difference is line endings; any real content change to tracked files is an error.
+function normalizeTree() {
+  const dirty = git(['status', '--porcelain', '--untracked-files=no'], { quiet: true }).out;
+  if (!dirty) return;
+  // A full patch with CR-at-EOL ignored is empty when only line endings differ.
+  const real = git(['diff', '--ignore-cr-at-eol'], { quiet: true }).out;
+  if (real) {
+    const files = git(['diff', '--name-only'], { quiet: true }).out.split(/\r?\n/).slice(0, 5).join(', ');
+    throw new Error(`the build changed tracked files: ${files}`);
+  }
+  git(['checkout', '--', '.']);
+  log(`build: restored ${dirty.split(/\r?\n/).length} tracked file(s) that differed only in line endings`);
 }
 
 async function install(requested) {
