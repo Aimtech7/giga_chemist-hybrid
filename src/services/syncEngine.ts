@@ -245,8 +245,7 @@ export async function syncFromLocalApiToDexie(): Promise<boolean> {
   // Keyed bulkPut: re-hydration overwrites cached rows with the server version, never duplicates.
   await load('Categories', '/api/categories', (rows) => putAll(db.categories, rows));
   await load('Customers', '/api/customers', (rows) => putAll(db.customers, rows));
-  const medsOk = await load('Medicines', '/api/medicines', (rows) => putAll(db.medicines, rows));
-  const batchesOk = await load('Batches', '/api/batches', (rows) => putAll(db.medicine_batches, rows));
+  const catalogOk = await replaceCatalog();
   await load<any>('Sales', '/api/sales?limit=500', (data) => putAll(db.sales, Array.isArray(data) ? data : data?.sales || []));
   await load('Returns', '/api/returns', (rows) => putAll(db.customer_returns, rows));
   if (isAdmin) {
@@ -261,7 +260,50 @@ export async function syncFromLocalApiToDexie(): Promise<boolean> {
 
   currentSummary.pendingCount = await getPendingCount();
   notifyListeners();
-  return medsOk && batchesOk;
+  return catalogOk;
+}
+
+/** Fired on window after the cached catalogue was replaced; open screens re-read Dexie. */
+export const CATALOG_REFRESHED_EVENT = 'giga:catalog-refreshed';
+
+/**
+ * Authoritative catalogue refresh: the server's COMPLETE medicines and batches replace the cached
+ * ones in ONE Dexie transaction, so rows removed or re-based on the server never linger here.
+ * Both downloads must succeed first; if either fails the existing cache is left untouched.
+ *
+ * Multi-shop: the snapshot is always the request's shop (the API resolves it), and the replace is
+ * total, so a shop switch followed by this call leaves no row of the previous shop in these two
+ * tables. Screens listening for CATALOG_REFRESHED_EVENT re-read after the replace commits.
+ */
+export async function replaceCatalog(): Promise<boolean> {
+  let medicines: unknown;
+  let batches: unknown;
+  try {
+    [medicines, batches] = await Promise.all([apiFetch<unknown>('/api/medicines'), apiFetch<unknown>('/api/batches')]);
+  } catch (err: any) {
+    console.error('[SyncEngine] Catalogue download failed; keeping the cached catalogue:', err?.message || err);
+    return false;
+  }
+  if (!Array.isArray(medicines) || !Array.isArray(batches)) {
+    console.error('[SyncEngine] Catalogue download was not a complete list; keeping the cached catalogue.');
+    return false;
+  }
+  try {
+    await db.transaction('rw', db.medicines, db.medicine_batches, async () => {
+      await db.medicines.clear();
+      await db.medicine_batches.clear();
+      await db.medicines.bulkPut(medicines as any[]);
+      await db.medicine_batches.bulkPut(batches as any[]);
+    });
+  } catch (err: any) {
+    console.error('[SyncEngine] Catalogue cache update failed (rolled back):', err?.message || err);
+    return false;
+  }
+  console.log(`[SyncEngine] Catalogue refreshed: ${medicines.length} medicines, ${batches.length} batches.`);
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent(CATALOG_REFRESHED_EVENT, { detail: { medicines: medicines.length, batches: batches.length } }));
+  }
+  return true;
 }
 
 // Global auto-sync lifecycle listeners

@@ -52,6 +52,16 @@ type Tab = 'medicines' | 'changes' | 'health' | 'alerts' | 'insights' | 'staff' 
 
 type ActionKind = 'add' | 'remove' | 'count' | 'price' | 'details' | 'expiry';
 
+/** Rows rendered at a time (phone-friendly); "Show more" reveals the rest — nothing is hidden. */
+const PAGE = 60;
+const stockState = (m: Medicine): 'in' | 'low' | 'out' =>
+  m.current_stock <= 0 ? 'out' : m.current_stock <= m.reorder_level ? 'low' : 'in';
+const STOCK_BADGE = {
+  in: { label: 'In stock', cls: 'text-emerald-700 bg-emerald-50 border-emerald-200' },
+  low: { label: 'Low stock', cls: 'text-amber-700 bg-amber-50 border-amber-200' },
+  out: { label: 'Out of stock', cls: 'text-rose-700 bg-rose-50 border-rose-200' },
+} as const;
+
 export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings }) => {
   const [tab, setTab] = useState<Tab>('medicines');
   const [status, setStatus] = useState<RemoteStatus | null>(null);
@@ -62,6 +72,9 @@ export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings }) => 
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [search, setSearch] = useState('');
+  const [statusFilter, setStatusFilter] = useState<'all' | 'active' | 'inactive'>('all');
+  const [stockFilter, setStockFilter] = useState<'all' | 'in' | 'low' | 'out'>('all');
+  const [shown, setShown] = useState(PAGE);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [form, setForm] = useState<{ kind: ActionKind; batchId?: string } | null>(null);
   const [draft, setDraft] = useState<Draft | null>(null);
@@ -153,13 +166,19 @@ export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings }) => 
     () => batches.filter((b) => b.medicine_id === selectedId).sort((a, b) => (a.expiry_date || '9999').localeCompare(b.expiry_date || '9999')),
     [batches, selectedId]
   );
-  const results = useMemo(() => {
+  const counts = useMemo(() => {
+    const active = medicines.filter((m) => m.status === 'active').length;
+    return { total: medicines.length, active, inactive: medicines.length - active };
+  }, [medicines]);
+  const matches = useMemo(() => {
     const q = search.trim().toLowerCase();
-    const list = q
-      ? medicines.filter((m) => [m.name, m.generic_name, m.brand_name, m.barcode, m.sku].some((v) => (v || '').toLowerCase().includes(q)))
-      : medicines;
-    return list.slice(0, 60);
-  }, [medicines, search]);
+    return medicines.filter((m) =>
+      (statusFilter === 'all' || (statusFilter === 'active') === (m.status === 'active'))
+      && (stockFilter === 'all' || stockState(m) === stockFilter)
+      && (!q || [m.name, m.generic_name, m.brand_name, m.barcode, m.sku].some((v) => (v || '').toLowerCase().includes(q))));
+  }, [medicines, search, statusFilter, stockFilter]);
+  useEffect(() => setShown(PAGE), [search, statusFilter, stockFilter]);
+  const results = useMemo(() => matches.slice(0, shown), [matches, shown]);
 
   const openCommandsFor = (medicineId: string) =>
     [...tracked, ...history].filter((c, i, all) => all.findIndex((x) => x.command_id === c.command_id) === i)
@@ -285,6 +304,26 @@ export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings }) => 
               <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search medicine, barcode…" className={`${inputCls} pl-9`} />
             </div>
             {loadError && <div className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded p-2">{loadError}</div>}
+            {medicines.length > 0 && (
+              <div className="space-y-2">
+                <div className="text-[11px] text-slate-600" data-testid="catalog-counts">
+                  {counts.total} medicines · {counts.active} active · {counts.inactive} inactive
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value as typeof statusFilter)} className={`${inputCls} w-auto`} aria-label="Status filter">
+                    <option value="all">All statuses</option>
+                    <option value="active">Active</option>
+                    <option value="inactive">Inactive</option>
+                  </select>
+                  <select value={stockFilter} onChange={(e) => setStockFilter(e.target.value as typeof stockFilter)} className={`${inputCls} w-auto`} aria-label="Stock filter">
+                    <option value="all">All stock</option>
+                    <option value="in">In stock</option>
+                    <option value="low">Low stock</option>
+                    <option value="out">Out of stock</option>
+                  </select>
+                </div>
+              </div>
+            )}
             {loading && medicines.length === 0 ? (
               <div className="text-xs text-slate-500 flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin" /> Loading from the cloud…</div>
             ) : (
@@ -301,10 +340,19 @@ export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings }) => 
                         <div className="text-[11px] text-slate-500">{cur} {Number(m.selling_price).toFixed(2)}</div>
                       </div>
                     </div>
+                    <div className="mt-1.5 flex gap-1.5 text-[10px] font-semibold uppercase tracking-wider">
+                      <span className={`px-1.5 py-0.5 rounded border ${m.status === 'active' ? 'text-slate-700 bg-slate-50 border-slate-200' : 'text-slate-500 bg-slate-100 border-slate-300'}`}>{m.status === 'active' ? 'Active' : 'Inactive'}</span>
+                      <span className={`px-1.5 py-0.5 rounded border ${STOCK_BADGE[stockState(m)].cls}`}>{STOCK_BADGE[stockState(m)].label}</span>
+                    </div>
                     {openCommandsFor(m.id).length > 0 && <div className="mt-1 text-[11px] text-amber-700 font-medium">{openCommandsFor(m.id).length} change(s) waiting for the shop</div>}
                   </button>
                 ))}
                 {results.length === 0 && !loading && <div className="text-xs text-slate-500 p-4 text-center">No medicines match.</div>}
+                {matches.length > results.length && (
+                  <button onClick={() => setShown((n) => n + PAGE)} className={`${btnSecondary} w-full`}>
+                    Show more ({results.length} of {matches.length})
+                  </button>
+                )}
               </div>
             )}
           </>

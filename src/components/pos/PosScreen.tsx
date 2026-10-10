@@ -27,6 +27,7 @@ import { HeldSalesModal } from './HeldSalesModal';
 import { ReceiptModal } from './ReceiptModal';
 import { apiFetch, ApiError } from '../../services/http';
 import { applyServerStockResult, refreshCacheAfterCommit } from '../../services/stockCache';
+import { CATALOG_REFRESHED_EVENT } from '../../services/syncEngine';
 import type {
   Medicine,
   MedicineBatch,
@@ -138,8 +139,8 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
 
       const custs = await db.customers.toArray();
       setCustomers(custs);
-      if (!selectedCustomer && custs.length > 0) {
-        setSelectedCustomer(custs[0]); // default to Walk-in
+      if (custs.length > 0) {
+        setSelectedCustomer((prev) => prev ?? custs[0]); // default to Walk-in
       }
 
       const held = await db.held_sales.toArray();
@@ -151,6 +152,11 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
 
   useEffect(() => {
     loadData();
+    // A completed catalogue refresh (login, manual sync, shop switch) replaces the cached snapshot:
+    // re-read it so the till never keeps showing the previous one.
+    const onCatalog = () => void loadData();
+    window.addEventListener(CATALOG_REFRESHED_EVENT, onCatalog);
+    return () => window.removeEventListener(CATALOG_REFRESHED_EVENT, onCatalog);
   }, []);
 
   // Universal Search Integration with Category Filter

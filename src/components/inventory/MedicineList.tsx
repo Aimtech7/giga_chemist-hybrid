@@ -20,6 +20,7 @@ import { PriceEditModal } from '../medicines/PriceEditModal';
 import { downloadCSV } from '../../services/exportUtils';
 import { searchMedicines } from '../../services/searchEngine';
 import { canViewCostData, isCashier } from '../../services/permissions';
+import { CATALOG_REFRESHED_EVENT } from '../../services/syncEngine';
 import type { Category, Medicine, PharmacySettings, User } from '../../types';
 
 interface MedicineListProps {
@@ -54,6 +55,9 @@ export const MedicineList: React.FC<MedicineListProps> = ({ currentUser, setting
 
   useEffect(() => {
     loadMedicines();
+    const onCatalog = () => void loadMedicines();
+    window.addEventListener(CATALOG_REFRESHED_EVENT, onCatalog);
+    return () => window.removeEventListener(CATALOG_REFRESHED_EVENT, onCatalog);
   }, []);
 
   const handleExportCSV = () => {

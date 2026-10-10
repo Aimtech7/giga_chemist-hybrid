@@ -39,6 +39,7 @@
     "online:create-user": "tsx scripts/online/create-online-user.ts",
     "test:api-url": "tsx scripts/integration/api-url.test.ts",
     "test:updater": "tsx scripts/integration/updater.test.ts",
+    "test:pos-cache": "tsx scripts/integration/pos-cache.test.ts",
     "scan:dist": "node scripts/scan-dist.mjs",
     "updater:check": "node scripts/updater/updater.mjs check"
   },
