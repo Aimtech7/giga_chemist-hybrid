@@ -12,6 +12,8 @@ import {
 } from 'lucide-react';
 import { db } from '../../db/dexie';
 import { getInventoryValuation } from '../../services/inventoryEngine';
+import { CATALOG_REFRESHED_EVENT, isCatalogForCurrentShop } from '../../services/syncEngine';
+import { CatalogStatusBanner } from '../common/CatalogStatusBanner';
 import { downloadCSV } from '../../services/exportUtils';
 import { StockAdjustmentModal } from './StockAdjustmentModal';
 import { PriceEditModal } from '../medicines/PriceEditModal';
@@ -42,18 +44,25 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({ currentUser,
   const isAdmin = currentUser?.role === 'ADMIN';
 
   const loadData = async () => {
-    const val = await getInventoryValuation();
+    // Cross-shop guard: figures from a catalogue cached for another shop are never shown.
+    const catalogOk = await isCatalogForCurrentShop();
+    const val = catalogOk
+      ? await getInventoryValuation()
+      : { totalItems: 0, totalQuantity: 0, purchaseValuation: 0, retailValuation: 0, lowStockCount: 0, outOfStockCount: 0 };
     setValuation(val);
 
     const movs = await db.inventory_movements.reverse().sortBy('timestamp');
     setMovements(movs);
 
-    const meds = await db.medicines.where('status').equals('active').toArray();
+    const meds = catalogOk ? await db.medicines.where('status').equals('active').toArray() : [];
     setMedicines(meds);
   };
 
   useEffect(() => {
     loadData();
+    const onCatalog = () => void loadData();
+    window.addEventListener(CATALOG_REFRESHED_EVENT, onCatalog);
+    return () => window.removeEventListener(CATALOG_REFRESHED_EVENT, onCatalog);
   }, []);
 
   const handleExportCSV = () => {
@@ -106,6 +115,7 @@ export const InventoryManager: React.FC<InventoryManagerProps> = ({ currentUser,
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden bg-slate-50">
+      <CatalogStatusBanner />
       <div className="p-4 bg-white border-b border-slate-200 flex flex-col md:flex-row md:items-center justify-between gap-3 shrink-0">
         <div>
           <h1 className="text-base font-bold text-slate-900 tracking-tight">

@@ -28,19 +28,31 @@ What the screens show from the cache:
 
 Tests: `npm run test:pos-cache` (headless Chrome, real IndexedDB, real `syncEngine` module, stubbed API).
 
-## Multi-shop isolation (for the multi-shop phase)
+## Multi-shop isolation (one shared snapshot, stamped with its shop)
 
-The cache holds exactly ONE shop's data. The multi-shop branch (`feature/multi-shop-unified-auth`) adds:
+The browser keeps ONE catalogue snapshot. It is safe across shops because of four rules:
 
-- `purgeIfShopChanged()`: before any hydration, if the selected shop differs from the shop the cache was filled
-  for (`giga_cache_shop` marker), every shop-scoped table is emptied.
-- Switching shop confirms, purges and reloads the page (other tabs reload too).
+1. **Shop key.** `shopCacheKey()` = the selected shop (Global Admin), else the account's own shop (shop users),
+   else `default` (the server's default shop; always `default` on the single-shop local pharmacy app). Two shop
+   users of different shops never share a key, even though neither selects a shop.
+2. **Identity stamped atomically.** `replaceCatalog()` writes `db.meta['catalogue'] = { shop_key, refreshed_at,
+   medicines, batches }` in the SAME transaction as the rows. A download that finishes after the shop changed is
+   discarded. Concurrent refreshes for the same shop share one download.
+3. **Guard before every read.** POS, Medicines and Inventory call `isCatalogForCurrentShop()` before reading the
+   catalogue. If the snapshot belongs to another shop they read nothing and `CatalogStatusBanner` shows
+   "Loading the catalogue for <shop>…" or, after a failure, an error with **Retry**. A cache without identity
+   (filled before this existed) is accepted only by the local pharmacy app, so it keeps working offline.
+4. **Purge before render.** `purgeIfShopChanged()` (awaited at login and at session restore, and run before
+   every hydration) empties all shop-scoped tables and the identity when the key changed. The shop selector
+   (Global Admin only) selects, purges and reloads.
 
-With `replaceCatalog` the catalogue tables are additionally replaced as a whole snapshot of the request's shop
-(the API resolves the shop from the authorized `X-GIGA-SHOP-ID`), so even without the purge no Shop 1 medicine
-or batch could remain under Shop 2. When this fix is merged into the multi-shop branch:
+Switching Shop 1 -> Shop 2 therefore goes: selection changes -> guard refuses the Shop 1 snapshot at once ->
+purge -> reload -> complete Shop 2 download -> validated -> one transaction replaces rows + identity ->
+`giga:catalog-refreshed` -> screens re-read. If the Shop 2 download fails, nothing of Shop 1 is shown as Shop 2:
+the error banner offers Retry.
 
-1. Keep `purgeIfShopChanged()` as the first step of `syncFromLocalApiToDexie()`.
-2. Replace that branch's medicines/batches `putAll` lines with `replaceCatalog()` (the only overlapping lines).
-3. Shop-specific screens re-read on `CATALOG_REFRESHED_EVENT`, which fires only after the new shop's snapshot
-   has committed.
+The server side is independent of the browser: every request's shop is resolved and authorized per request
+(`X-GIGA-SHOP-ID`), a shop-scoped account gets 403 for another shop, and concurrent requests for different
+shops never share context (`test:unified-auth`).
+
+Tests: `npm run test:pos-cache` (browser cache, incl. cross-shop) and `npm run test:unified-auth` (server).

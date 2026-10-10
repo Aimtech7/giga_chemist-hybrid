@@ -79,14 +79,19 @@ async function openPage(): Promise<{ evaluate: <T>(expr: string) => Promise<T>; 
 const HARNESS = `(async () => {
   const b64 = (o) => btoa(JSON.stringify(o)).replace(/=+$/, '');
   localStorage.setItem('giga_chemist_auth_token', b64({ alg: 'none' }) + '.' + b64({ exp: Math.floor(Date.now() / 1000) + 3600 }) + '.x');
+  localStorage.setItem('giga_chemist_current_user', JSON.stringify({ id: 'u-global', name: 'Test', email: 't@x', role: 'ADMIN', active: true }));
   const { db } = await import('/src/db/dexie.ts');
   const se = await import('/src/services/syncEngine.ts');
+  const sc = await import('/src/services/shopContext.ts');
   const realFetch = window.fetch.bind(window);
   window.__routes = {};
+  window.__requests = [];
   window.fetch = async (url, init) => {
     const p = new URL(String(url), location.href).pathname;
-    const r = window.__routes[p];
+    let r = window.__routes[p];
     if (!r) return realFetch(url, init);
+    window.__requests.push({ path: p, shop: (init && init.headers && init.headers['X-GIGA-SHOP-ID']) || null });
+    if (typeof r === 'function') r = await r(init);
     if (r === 'NETWORK') throw new TypeError('Failed to fetch');
     return new Response(JSON.stringify(r.body), { status: r.status, headers: { 'content-type': 'application/json' } });
   };
@@ -97,7 +102,7 @@ const HARNESS = `(async () => {
   const bat = (id, medicine_id, q) => ({ id, medicine_id, batch_number: 'BN-' + id, quantity_available: q, quantity_received: q,
     expiry_date: '2030-01-01', expiry_status: 'ok', status: 'active' });
   window.__t = {
-    db, se, med, bat,
+    db, se, sc, med, bat,
     async seed() {
       await db.transaction('rw', db.medicines, db.medicine_batches, async () => {
         await db.medicines.clear(); await db.medicine_batches.clear();
@@ -173,6 +178,116 @@ async function run(page: Awaited<ReturnType<typeof openPage>>) {
     `2181 medicines / 2181 batches replaced (2035 active, 146 inactive) in ${big.ms} ms`, big);
 }
 
+const S1 = '11111111-1111-4111-8111-111111111111';
+const S2 = '22222222-2222-4222-8222-222222222222';
+
+async function runMultiShop(page: Awaited<ReturnType<typeof openPage>>) {
+  const ev = page.evaluate;
+  console.log('\n=== MULTI-SHOP CACHE ISOLATION (synthetic Shop 1 / Shop 2)');
+  await ev<number>(`(async () => {
+    window.S1 = '${S1}'; window.S2 = '${S2}';
+    const m = __t.med, b = __t.bat;
+    window.CAT = {
+      [S1]: { meds: [m('s1-m1', 'Shop1 Amox', 1), m('s1-m2', 'Shop1 Zero', 1, { current_stock: 0 }), m('s1-m3', 'Shop1 Retired', 1, { status: 'inactive' })],
+              bats: [b('s1-b1', 's1-m1', 5), b('s1-b2', 's1-m2', 0), b('s1-b3', 's1-m3', 2)] },
+      [S2]: { meds: [m('s2-m1', 'Shop2 Paracetamol', 1)], bats: [b('s2-b1', 's2-m1', 9)] },
+    };
+    window.__fail = {}; window.__delay = {};
+    const route = (kind) => async (init) => {
+      const shop = init && init.headers && init.headers['X-GIGA-SHOP-ID'];
+      if (window.__delay[shop]) await new Promise((r) => setTimeout(r, window.__delay[shop]));
+      if (window.__fail[shop + ':' + kind]) return { status: 500, body: { error: 'shop ' + kind + ' down' } };
+      return CAT[shop] ? { status: 200, body: CAT[shop][kind] } : { status: 403, body: { error: 'no shop' } };
+    };
+    __t.route('/api/medicines', route('meds')); __t.route('/api/batches', route('bats'));
+    window.ids = async () => ({ m: (await __t.db.medicines.toArray()).map((x) => x.id).sort(), b: (await __t.db.medicine_batches.toArray()).map((x) => x.id).sort() });
+    window.asGlobal = async (shop) => {
+      localStorage.setItem('giga_chemist_current_user', JSON.stringify({ id: 'u-global', name: 'G', email: 'g@x', role: 'ADMIN', active: true }));
+      __t.sc.setOnlineAccount({ type: 'GLOBAL_ADMIN', shop_id: null, local_user_id: null, username: null });
+      __t.sc.setSelectedShop({ shop_id: shop, shop_code: shop === S1 ? 'SHOP1' : 'SHOP2', name: shop === S1 ? 'Shop 1' : 'Shop 2' });
+    };
+    return 1;
+  })()`);
+
+  // TEST 1 + 2 + 7a: Global Admin on Shop 1
+  let r = await ev<any>(`(async () => {
+    await asGlobal(S1); await __t.se.purgeIfShopChanged(); window.__requests = [];
+    const ok = await __t.se.replaceCatalog();
+    return { ok, ids: await ids(), meta: await __t.se.getCatalogMeta(), gate: await __t.se.isCatalogForCurrentShop(), shops: __requests.map((x) => x.shop) };
+  })()`);
+  check(r.ok && JSON.stringify(r.ids.m) === '["s1-m1","s1-m2","s1-m3"]' && JSON.stringify(r.ids.b) === '["s1-b1","s1-b2","s1-b3"]', 'TEST 1: Shop 1 refresh stores exactly the Shop 1 catalogue', r.ids);
+  check(r.meta?.shop_key === S1 && r.meta.medicines === 3 && r.meta.batches === 3 && Boolean(r.meta.refreshed_at) && r.gate,
+    'TEST 2: cache metadata records Shop 1 (shop id + refreshed_at), stamped in the same transaction', r.meta);
+  check(r.shops.length === 2 && r.shops.every((x: string) => x === S1), 'TEST 7a: every catalogue request carried the selected Shop 1 header', r.shops);
+  check(r.ids.m.includes('s1-m2') && r.ids.m.includes('s1-m3'), 'TEST 9/10 (cache): zero-stock and inactive medicines kept in the snapshot');
+
+  // TEST 3: switching to Shop 2 hides Shop 1 even before anything is purged
+  r = await ev<any>(`(async () => { await asGlobal(S2); return { gate: await __t.se.isCatalogForCurrentShop(), stillThere: (await ids()).m.length }; })()`);
+  check(r.gate === false && r.stillThere === 3, 'TEST 3: with Shop 2 selected the Shop 1 snapshot is refused by the cross-shop guard (screens read nothing)', r);
+
+  // TEST 4 + 7b: successful Shop 2 refresh replaces the Shop 1 snapshot
+  r = await ev<any>(`(async () => {
+    await __t.se.purgeIfShopChanged(); window.__requests = [];
+    const ok = await __t.se.replaceCatalog();
+    return { ok, ids: await ids(), meta: await __t.se.getCatalogMeta(), gate: await __t.se.isCatalogForCurrentShop(), shops: __requests.map((x) => x.shop) };
+  })()`);
+  check(r.ok && JSON.stringify(r.ids.m) === '["s2-m1"]' && JSON.stringify(r.ids.b) === '["s2-b1"]' && r.meta?.shop_key === S2 && r.gate,
+    'TEST 4: Shop 2 refresh replaces the Shop 1 snapshot completely (no Shop 1 row left)', r);
+  check(r.shops.length === 2 && r.shops.every((x: string) => x === S2), 'TEST 7b: after the switch only the selected Shop 2 was requested', r.shops);
+
+  // TEST 5 + 11 + 12: a failed Shop 2 refresh never labels the Shop 1 cache as Shop 2
+  for (const kind of ['meds', 'bats']) {
+    r = await ev<any>(`(async () => {
+      await asGlobal(S1); await __t.se.purgeIfShopChanged(); await __t.se.replaceCatalog();
+      await asGlobal(S2); window.__fail = { [S2 + ':${kind}']: true };
+      const ok = await __t.se.replaceCatalog(); window.__fail = {};
+      return { ok, ids: await ids(), meta: await __t.se.getCatalogMeta(), gate: await __t.se.isCatalogForCurrentShop(), state: __t.se.getCatalogState() };
+    })()`);
+    check(!r.ok && r.meta?.shop_key === S1 && r.gate === false && r.ids.m.length === 3 && r.state?.status === 'error' && r.state?.shop_key === S2,
+      `TEST 5/${kind === 'meds' ? '11' : '12'}: Shop 2 ${kind === 'meds' ? 'medicines' : 'batches'} failure -> old snapshot kept, still labelled Shop 1, not shown for Shop 2, error state`, r);
+  }
+
+  // A download that finishes after a shop switch is discarded
+  r = await ev<any>(`(async () => {
+    await asGlobal(S1); await __t.se.purgeIfShopChanged(); await __t.se.replaceCatalog();
+    window.__delay = { [S1]: 300 };
+    const p = __t.se.replaceCatalog();
+    await new Promise((res) => setTimeout(res, 50)); await asGlobal(S2);
+    const ok = await p; window.__delay = {};
+    return { ok, meta: await __t.se.getCatalogMeta(), gate: await __t.se.isCatalogForCurrentShop() };
+  })()`);
+  check(r.ok === false && r.meta?.shop_key === S1 && r.gate === false, 'a Shop 1 download that finishes after switching to Shop 2 is discarded', r);
+
+  // Concurrent refreshes for the same shop share one download
+  r = await ev<any>(`(async () => {
+    await asGlobal(S1); await __t.se.purgeIfShopChanged(); window.__requests = [];
+    const [a, b] = await Promise.all([__t.se.replaceCatalog(), __t.se.replaceCatalog()]);
+    return { a, b, n: __requests.length };
+  })()`);
+  check(r.a && r.b && r.n === 2, 'two simultaneous refreshes (login + app start) share one medicines + one batches download', r);
+
+  // TEST 8 (browser side): a shop user is keyed to its OWN shop; another user's selection is ignored
+  r = await ev<any>(`(async () => {
+    await asGlobal(S1); await __t.se.purgeIfShopChanged(); await __t.se.replaceCatalog();
+    localStorage.setItem('giga_chemist_current_user', JSON.stringify({ id: 'u-shop2', name: 'C2', email: 'c2@x', role: 'CASHIER', active: true }));
+    __t.sc.setOnlineAccount({ type: 'SHOP_USER', shop_id: S2, local_user_id: 'l2', username: null });
+    const key = __t.sc.shopCacheKey(), selected = __t.sc.selectedShopId();
+    const gateBefore = await __t.se.isCatalogForCurrentShop();
+    await __t.se.purgeIfShopChanged();
+    return { key, selected, gateBefore, left: (await ids()).m.length, meta: await __t.se.getCatalogMeta() };
+  })()`);
+  check(r.key === S2 && r.selected === null, "TEST 8: a Shop 2 user ignores the Global Admin's selection and is keyed to its own shop", r);
+  check(r.gateBefore === false && r.left === 0 && r.meta === null, 'TEST 8: the Shop 1 cache is refused and emptied (identity cleared) when a Shop 2 user signs in', r);
+
+  // Single-shop local app: an existing cache without identity stays usable (no offline regression)
+  r = await ev<any>(`(async () => {
+    localStorage.setItem('giga_chemist_current_user', JSON.stringify({ id: 'u-local', name: 'L', email: 'l@x', role: 'CASHIER', active: true }));
+    __t.sc.setOnlineAccount(null); await __t.seed(); await __t.db.meta.delete('catalogue');
+    return { key: __t.sc.shopCacheKey(), gate: await __t.se.isCatalogForCurrentShop() };
+  })()`);
+  check(r.key === 'default' && r.gate === true, 'local pharmacy app: a pre-existing cache (no identity yet) remains usable', r);
+}
+
 async function main() {
   let vite: ViteDevServer | null = null;
   let page: Awaited<ReturnType<typeof openPage>> | null = null;
@@ -181,6 +296,7 @@ async function main() {
     await vite.listen();
     page = await openPage();
     await run(page);
+    await runMultiShop(page);
   } catch (err: any) {
     check(false, `suite aborted: ${err?.message || err}`);
   } finally {

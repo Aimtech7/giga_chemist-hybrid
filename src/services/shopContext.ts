@@ -83,9 +83,14 @@ export function currentShopLabel(): string {
   return [s.name, s.shop_code ? `(${s.shop_code})` : ''].filter(Boolean).join(' ');
 }
 
-/** Cache key of the data currently in this browser's local cache (per shop). */
+/**
+ * Which shop's data this browser's cache must hold for the signed-in account: the selected shop
+ * (Global Admin), else the account's own shop (shop users), else 'default' (the server's default
+ * shop — and always 'default' on the single-shop local pharmacy app). Two shop users of different
+ * shops therefore never share a cache key, even though neither selects a shop.
+ */
 export function shopCacheKey(): string {
-  return selectedShopId() || 'default';
+  return selectedShopId() || getOnlineAccount()?.shop_id || 'default';
 }
 
 // Another tab switched shop: reload so this tab never shows one shop's data under another's name.
