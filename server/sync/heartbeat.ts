@@ -60,6 +60,36 @@ async function staffCredentialSummary() {
   }
 }
 
+/**
+ * Slower operational checks (cached 10 minutes): dead stock, data integrity, failed logins. Counts
+ * only; null when a check cannot run (e.g. before its migration).
+ */
+let checksCache: { at: number; value: any } | null = null;
+export function resetOperationalChecksCache() {
+  checksCache = null;
+}
+async function operationalChecks() {
+  const ttl = (Number(process.env.OPS_CHECKS_CACHE_SECONDS) > 0 ? Number(process.env.OPS_CHECKS_CACHE_SECONDS) : 600) * 1000;
+  if (checksCache && Date.now() - checksCache.at < ttl) return checksCache.value;
+  const value = await q<any>(`
+    SELECT
+      (SELECT COUNT(*) FROM medicines m WHERE m.status = 'active' AND m.current_stock > 0
+          AND NOT EXISTS (SELECT 1 FROM sale_items i JOIN sales s ON s.id = i.sale_id
+                           WHERE i.medicine_id = m.id AND s.status <> 'voided' AND s.date >= (now() AT TIME ZONE 'Africa/Nairobi')::date - 89))::int AS dead_stock,
+      (SELECT COUNT(*) FROM medicine_batches WHERE quantity_available < 0)::int AS negative_batches,
+      (SELECT COUNT(*) FROM medicines WHERE current_stock < 0)::int AS negative_medicines,
+      -- medicines.current_stock is refreshed when a batch changes: a batch that expired since then is still
+      -- counted. Mismatch = matches NEITHER the unexpired sum NOR the sum including expired active batches.
+      (SELECT COUNT(*) FROM medicines m
+        CROSS JOIN LATERAL (SELECT COALESCE(SUM(b.quantity_available) FILTER (WHERE b.expiry_date IS NULL OR b.expiry_date > CURRENT_DATE), 0) AS fresh,
+                                   COALESCE(SUM(b.quantity_available), 0) AS all_active
+                              FROM medicine_batches b WHERE b.medicine_id = m.id AND b.status = 'active') t
+        WHERE m.current_stock <> t.fresh AND m.current_stock <> t.all_active)::int AS stock_mismatch,
+      (SELECT COUNT(*) FROM audit_logs WHERE action = 'LOGIN_FAILED' AND created_at > now() - interval '1 hour')::int AS failed_logins_1h`);
+  checksCache = { at: Date.now(), value };
+  return value;
+}
+
 export interface WorkerSnapshot {
   running: boolean;
   leader: boolean;
@@ -102,6 +132,7 @@ async function buildStatus(worker: WorkerSnapshot) {
     backup = { error: sanitizeText(err?.message || err) };
   }
   const staff = await staffCredentialSummary();
+  const checks = await operationalChecks();
   const update = readUpdateState();
   const d = disk(path.parse(getBackupConfig().dir).root || getBackupConfig().dir) || disk(process.cwd());
   const status = {
@@ -129,6 +160,7 @@ async function buildStatus(worker: WorkerSnapshot) {
     restarts_last_hour: recentRestarts(1),
     inventory: inv,
     staff,
+    checks,
   };
   return status;
 }
@@ -166,6 +198,13 @@ export function deriveAlerts(s: Status): ShopAlert[] {
     else if (li.result === 'FAILED') a.push({ key: `UPDATE_FAILED:${li.to}`, kind: 'UPDATE', severity: 'CRITICAL', title: 'Update failed', detail: sanitizeText(li.detail) || undefined });
   }
   if (s.restarts_last_hour >= 3) a.push({ key: 'SERVICE_CRASHING', kind: 'SERVICE', severity: 'CRITICAL', title: `Server restarted ${s.restarts_last_hour} times in the last hour` });
+  const c = s.checks;
+  if (c?.dead_stock) a.push({ key: 'DEAD_STOCK', kind: 'STOCK', severity: 'INFO', title: `${c.dead_stock} medicine(s) in stock with no sale in 90 days` });
+  if (c && (c.negative_batches || c.negative_medicines || c.stock_mismatch)) {
+    a.push({ key: 'DATA_INTEGRITY_WARNING', kind: 'INTEGRITY', severity: c.negative_batches || c.negative_medicines ? 'CRITICAL' : 'WARNING',
+      title: 'Stock data needs attention', detail: `negative batches ${c.negative_batches}, negative medicines ${c.negative_medicines}, medicine total != batches ${c.stock_mismatch}` });
+  }
+  if ((c?.failed_logins_1h || 0) >= 10) a.push({ key: 'LOGIN_SECURITY_WARNING', kind: 'SECURITY', severity: 'WARNING', title: `${c.failed_logins_1h} failed logins at the shop in the last hour` });
   if ((s.inbound?.rejected_24h || 0) > 0) a.push({ key: 'COMMANDS_REJECTED_24H', kind: 'COMMAND', severity: 'INFO', title: `${s.inbound!.rejected_24h} remote change(s) rejected in the last 24 h` });
   return a;
 }

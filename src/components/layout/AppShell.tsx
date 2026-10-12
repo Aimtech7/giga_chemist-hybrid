@@ -13,6 +13,7 @@ import {
   Receipt,
   RotateCcw,
   BarChart3,
+  BellRing,
   ShieldCheck,
   FileText,
   Settings as SettingsIcon,
@@ -44,6 +45,7 @@ export type AppModule =
   | 'stocktake'
   | 'stocktakes'
   | 'insights'
+  | 'alerts'
   | 'batches'
   | 'expiry'
   | 'purchases'
@@ -125,6 +127,7 @@ export const AppShell: React.FC<AppShellProps> = ({
     { id: 'stocktake' as AppModule, label: 'Physical Stock Count', icon: ClipboardCheck },
     { id: 'stocktakes' as AppModule, label: 'Stocktakes', icon: ClipboardCheck },
     { id: 'insights' as AppModule, label: 'Stock Insights', icon: BarChart3 },
+    { id: 'alerts' as AppModule, label: 'Alerts Center', icon: BellRing },
     { id: 'batches' as AppModule, label: 'Batches', icon: Boxes },
     { id: 'expiry' as AppModule, label: 'Expiry Tracking', icon: AlertTriangle },
     { id: 'purchases' as AppModule, label: 'Purchases', icon: Truck },
@@ -149,7 +152,7 @@ export const AppShell: React.FC<AppShellProps> = ({
     ['Directory', ['suppliers', 'customers'] as AppModule[]],
     ['Finance', ['history', 'sales', 'returns', 'expenses', 'reports'] as AppModule[]],
     ['Administration', ['users', 'settings', 'audit'] as AppModule[]],
-    ['System', ['remote'] as AppModule[]],
+    ['System', ['alerts', 'remote'] as AppModule[]],
   ];
 
   // STRICT RBAC: Filter navigation items based on user role.

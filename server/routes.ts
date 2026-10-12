@@ -75,6 +75,7 @@ import { buildHistoryRouter } from './http/historyRoutes';
 import { buildInventoryRouter } from './http/inventoryRoutes';
 import { createDraftPurchaseTx } from './db/purchases';
 import { getPriceHistory } from './db/priceHistory';
+import { acknowledgeLocalAlert, listLocalAlerts } from './ops/alerts';
 import { approveStocktake, cancelStocktake, countLine, createStocktake, getStocktake, listStocktakes, reopenStocktake, startCounting, submitStocktake } from './db/stocktakes';
 import { buildShiftRouter } from './http/shiftRoutes';
 import { openShift, getCurrentShift, closeShift, reviewShift, correctShift, listOpenTills } from './db/shifts';
@@ -302,6 +303,14 @@ apiRouter.post('/auth/login', authRateLimiter, async (req: Request, res: Respons
   } catch (err: any) {
     const status = errorStatus(err);
     if (status >= 500) console.error('[API] /auth/login failed:', err.message);
+    // Failed login: audited WITHOUT the secret (identifier only, truncated); feeds LOGIN_SECURITY_WARNING.
+    if (status < 500) {
+      const ident = String(req.body?.email || req.body?.username || '').trim().slice(0, 100);
+      await recordAuditLog({
+        user_name: ident || 'unknown', role: 'CASHIER' as any, action: 'LOGIN_FAILED', entity: 'auth', entity_id: ident.slice(0, 100) || 'unknown',
+        device_id: normalizeDeviceId(req.headers['x-device-id']) || 'SERVER', new_value: { identifier: ident, via: req.body?.pin ? 'PIN' : 'PASSWORD', status },
+      } as any).catch(() => {});
+    }
     res.status(status === 400 && !err.status ? 401 : status).json({ error: err.message || 'Authentication failed.' });
   }
 });
@@ -669,6 +678,22 @@ apiRouter.post('/purchases/drafts', requireRole('ADMIN'), async (req: Authentica
     res.status(201).json({ success: true, purchase });
   } catch (err: any) {
     sendError(res, err, 'Could not create the purchase draft.', 'POST /purchases/drafts');
+  }
+});
+
+// --- 6c. LOCAL ALERTS CENTER (works offline; same conditions as the heartbeat) ---
+apiRouter.get('/alerts', requirePermission('alerts.view'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    res.json(await listLocalAlerts(req.query as any));
+  } catch (err: any) {
+    sendError(res, err, 'Could not load alerts.', 'GET /alerts');
+  }
+});
+apiRouter.post('/alerts/:id/ack', requirePermission('alerts.manage'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    res.json(await acknowledgeLocalAlert(req.params.id, stockActor(req)));
+  } catch (err: any) {
+    sendError(res, err, 'Could not acknowledge the alert.', 'POST /alerts/:id/ack');
   }
 });
 

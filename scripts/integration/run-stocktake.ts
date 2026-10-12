@@ -1,9 +1,10 @@
 import { assertDevDatabase, cleanupFixtures, getServerLog, pool, startServer, stopServer, summary, upsertFixtureUser, check, section } from './harness';
 import { setupHybridCloud, type HybridEnv } from './hybrid.test';
 import { stocktakeTests } from './stocktake.test';
+import { alertsTests } from './alerts.test';
 
 /**
- * Formal stocktake suite.   npm run test:stocktake
+ * Formal stocktake + Alerts Center suite.   npm run test:stocktake
  * giga_chemist_dev (shop side, hybrid, worker ON; the cloud emulator is STOPPED for the offline part)
  * + giga_chemist_cloud_test (cloud emulator, recreated with every cloud migration). Same guards as the
  * shift suite: no real pending outbox events, no other running sync worker, local migration 022 applied.
@@ -42,9 +43,11 @@ async function main() {
   const manager = await upsertFixtureUser('itest-stk-manager@gigachemist.local', 'ITest Stocktake Manager', 'MANAGER' as any);
   let env: HybridEnv | null = null;
   try {
+    process.env.OPS_CHECKS_CACHE_SECONDS = '2'; // alert checks re-evaluated quickly in tests (default 600)
     env = await setupHybridCloud();
     await startServer();
     await stocktakeTests(env, admin, manager, cashier);
+    await alertsTests(env, admin, manager, cashier);
   } catch (err: any) {
     section('ABORTED');
     check(false, `suite aborted: ${err?.message || err}`);
