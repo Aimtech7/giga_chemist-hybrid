@@ -71,6 +71,8 @@ import { runBackup, getBackupStatus } from './ops/backup';
 import { getSystemHealth } from './ops/health';
 import { appVersion, currentCommit } from './ops/runtime';
 import { pgPool } from './db/client';
+import { buildHistoryRouter } from './http/historyRoutes';
+import { getShopIdentity } from './sync/identity';
 import type {
   User,
   UserRole,
@@ -1086,7 +1088,46 @@ apiRouter.put('/settings', requireRole('ADMIN'), async (req: AuthenticatedReques
   }
 });
 
+// --- ADMIN HISTORY (sales + supply), read only, this shop's own PostgreSQL -------------------------
+apiRouter.use(buildHistoryRouter({
+  canSales: requirePermission('sales.view_all'),
+  canSupplies: requirePermission('stock.receive'),
+  withScope: async (req, fn) => {
+    const identity = await getShopIdentity();
+    const client = await pgPool.connect();
+    try {
+      await client.query('BEGIN READ ONLY');
+      const out = await fn({ q: client, mode: 'local', shopIds: [identity.shop_id.toLowerCase()], includeCost: (req as AuthenticatedRequest).userRole === 'ADMIN' });
+      await client.query('COMMIT');
+      return out;
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+  },
+  auditReprint: async (req, sale) => {
+    const a = saleActor(req as AuthenticatedRequest);
+    await recordAuditLog({
+      user_id: a.user_id, user_name: a.user_name, role: a.role, device_id: a.device_id,
+      action: 'RECEIPT_REPRINTED', entity: 'sale', entity_id: sale.id, new_value: { receipt_number: sale.receipt_number, copy: true },
+    }).catch((e) => console.warn('[API] reprint audit failed:', e.message));
+  },
+  send: (res, err: any, label) => sendError(res, err, 'History request failed.', label),
+}));
+
+// Completed sales and received purchases are history: never edited or deleted in place.
+const immutableSale = (_req: Request, res: Response) =>
+  res.status(405).json({ error: 'A completed sale cannot be edited. Use void, return or refund (audited).', code: 'SALE_IMMUTABLE' });
+apiRouter.put('/sales/:id', requireRole('ADMIN'), immutableSale);
+apiRouter.patch('/sales/:id', requireRole('ADMIN'), immutableSale);
+apiRouter.delete('/sales/:id', requireRole('ADMIN'), immutableSale);
+apiRouter.delete('/purchases/:id', requireRole('ADMIN'), (_req: Request, res: Response) =>
+  res.status(405).json({ error: 'Purchases are never deleted. A pending purchase can be cancelled; a received one needs a correction / return-to-supplier.', code: 'PURCHASE_IMMUTABLE' }));
+
 // Unknown /api paths return JSON 404 instead of falling through to the SPA index.html fallback.
+// Catch-all LAST: every route above must be registered before it.
 apiRouter.use((req: Request, res: Response) => {
   res.status(404).json({ error: `API route not found: ${req.method} ${req.originalUrl}` });
 });

@@ -29,13 +29,15 @@ import { AuditLogViewer } from './components/audit/AuditLogViewer';
 import { SettingsView } from './components/settings/SettingsView';
 import { RemoteAdminPanel } from './components/remote/RemoteAdminPanel';
 import { OnlineAdminModule } from './components/remote/OnlineAdminModule';
+import { HistoryView, type HistoryTab } from './components/history/HistoryView';
+import { NAVIGATE_EVENT } from './services/navigation';
 import { getServerMode } from './services/remoteAdmin';
 import type { PharmacySettings, User } from './types';
 
 // '#app' (or any unknown hash) is not a module and must never become the current one (blank screen).
 const KNOWN_MODULES: AppModule[] = [
   'dashboard', 'pos', 'medicines', 'inventory', 'stocktake', 'batches', 'expiry', 'purchases', 'suppliers',
-  'customers', 'expenses', 'sales', 'returns', 'reports', 'users', 'audit', 'settings', 'remote',
+  'customers', 'expenses', 'sales', 'returns', 'reports', 'users', 'audit', 'settings', 'remote', 'history',
 ];
 
 export default function App() {
@@ -225,6 +227,17 @@ export default function App() {
     });
   }, [currentUser]);
   const onlineAdmin = serverMode === 'online' && currentUser?.role === 'ADMIN';
+  // Dashboard shortcuts ("View All Sales", "View Supply History"): same shop context, chosen tab.
+  const [historyTab, setHistoryTab] = useState<HistoryTab>('sales');
+  useEffect(() => {
+    const go = (e: Event) => {
+      const d = (e as CustomEvent).detail || {};
+      if (d.tab) setHistoryTab(d.tab);
+      if (d.module) setCurrentModule(d.module);
+    };
+    window.addEventListener(NAVIGATE_EVENT, go);
+    return () => window.removeEventListener(NAVIGATE_EVENT, go);
+  }, []);
 
   if (!isInitialized || !settings) {
     return (
@@ -297,7 +310,7 @@ export default function App() {
     >
       {/* ONLINE ADMINISTRATOR: Global Control Center modules (commands to the selected shop only) */}
       {onlineAdmin && canAccessModule(currentUser, currentModule) && (
-        <OnlineAdminModule module={currentModule} currentUser={currentUser} settings={settings} />
+        <OnlineAdminModule module={currentModule} currentUser={currentUser} settings={settings} historyTab={historyTab} />
       )}
       {!onlineAdmin && (<>
       {/* EXECUTIVE & OPERATIONAL DASHBOARD */}
@@ -361,6 +374,11 @@ export default function App() {
       {/* SALES */}
       {currentModule === 'sales' && canAccessModule(currentUser, 'sales') && (
         <SalesHistory currentUser={currentUser} settings={settings} />
+      )}
+
+      {/* HISTORY (Admin / Manager): every past sale and supply, read only */}
+      {currentModule === 'history' && canAccessModule(currentUser, 'history') && (
+        <HistoryView settings={settings} currentUser={currentUser} initialTab={historyTab} />
       )}
 
       {/* RETURNS */}

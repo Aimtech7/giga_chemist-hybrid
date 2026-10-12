@@ -117,6 +117,8 @@ export async function fullWriteTests(env: HybridEnv, admin: Fixture, cashier: Fi
 
   // Synthetic Shop 2: a medicine with the SAME barcode (cross-shop apply) and one Shop 2-only medicine.
   const m2 = crypto.randomUUID(), m2only = crypto.randomUUID(), b2 = crypto.randomUUID();
+  const s2sale = crypto.randomUUID(), s2pur = crypto.randomUUID(), s2sup = crypto.randomUUID();
+  const todayEAT = new Date().toLocaleDateString('en-CA', { timeZone: 'Africa/Nairobi' });
   const ev = (seq: number, type: string, data: any) => ({
     event_id: crypto.randomUUID(), idempotency_key: `itest-fw-s2-${crypto.randomUUID()}`, shop_id: shop2, local_seq: String(seq), event_type: type,
     entity_type: 'x', entity_id: 'x', payload: { data, movements: [], batches: [], audit: [] },
@@ -125,6 +127,15 @@ export async function fullWriteTests(env: HybridEnv, admin: Fixture, cashier: Fi
     ev(1, 'MEDICINE_BASELINE', { medicine: { id: m2, name: 'ZZ ITEST FullWrite Medicine (Shop 2)', barcode: 'ITEST-FW-1', selling_price: 110, purchase_price: 60, status: 'active', category: 'S2' },
       batches: [{ id: b2, medicine_id: m2, batch_number: 'S2-FW-B1', quantity_available: 12, status: 'active', expiry_date: '2031-01-01' }] }),
     ev(2, 'MEDICINE_BASELINE', { medicine: { id: m2only, name: 'ZZ SHOP2 ONLY', barcode: 'S2-ONLY-1', selling_price: 10, purchase_price: 5, status: 'active' }, batches: [] }),
+    // History fixtures for Shop 2: one completed sale and one received purchase (business date = today, Nairobi).
+    ev(3, 'SALE_COMPLETED', { sale: { id: s2sale, sale_number: `S2-HIST-${RUN}`, receipt_number: `S2-HIST-${RUN}`, date: todayEAT, time: '11:00:00', cashier_id: null, device_id: 'S2',
+      subtotal: 220, discount_total: 0, tax_total: 0, total: 220, cost_total: 120, gross_profit: 100, payment_method: 'Cash', status: 'completed', idempotency_key: `s2h-${RUN}`, created_at: new Date().toISOString() },
+      items: [{ id: crypto.randomUUID(), sale_id: s2sale, medicine_id: m2, batch_id: b2, batch_number: 'S2-FW-B1', quantity: 2, unit_price: 110, discount: 0, cost_price_snapshot: 60, total: 220 }],
+      payments: [{ id: crypto.randomUUID(), sale_id: s2sale, method: 'Cash', amount: 220 }], cashier_name: 'ZZ S2 Cashier' }),
+    ev(4, 'PURCHASE_RECEIVED', { purchase: { id: s2pur, order_number: `S2-PO-${RUN}`, invoice_number: `S2-INV-${RUN}`, supplier_id: s2sup, order_date: todayEAT, received_date: todayEAT,
+      status: 'received', total_amount: 120, payment_status: 'paid' },
+      items: [{ id: crypto.randomUUID(), purchase_id: s2pur, medicine_id: m2, batch_number: 'S2-FW-B2', quantity: 4, purchase_price: 30, total: 120 }],
+      supplier: { id: s2sup, name: 'ZZ S2 Supplier', status: 'active' } }),
   ])]))[0].r;
   check(ing.results.every((x: any) => x.status === 'APPLIED'), 'Shop 2 data ingested with its own token', ing);
 
@@ -468,6 +479,100 @@ export async function fullWriteTests(env: HybridEnv, admin: Fixture, cashier: Fi
   check(o1?.online === true && o1.sales_today.count >= 3 && o1.catalogue.total >= 2 && typeof o1.stock_units === 'number' && o1.error === null, 'Shop 1 card: online, sales today, catalogue, stock', o1);
   check(o2?.online === false && o2.pending_commands >= 2 && o2.catalogue.total === 2, 'Shop 2 card: offline, pending commands, its own catalogue', o2);
   check(ov.data?.totals?.shops === 2 && ov.data.totals.shops_online === 1 && ov.data.totals.pending_commands >= o2.pending_commands, 'consolidated totals', ov.data?.totals);
+
+  // ================================================================== HISTORY (sales + supply)
+  section('HISTORY: sales + supply, shop-scoped, paginated, read only');
+  const hq = (path: string, token: string, shop: string | null = shop1, extra: Record<string, string> = {}) => on('GET', `/api/history/${path}`, token, undefined, shop, extra);
+  const ALLS = { 'X-GIGA-SCOPE': 'ALL' };
+  const recA = sA?.receipt_number, recS2 = `S2-HIST-${RUN}`;
+  const recs = (x: any) => new Set((x.data?.rows || []).map((r: any) => r.receipt_number));
+  const day1 = `from=${todayEAT}&to=${todayEAT}`;
+  let h: any = await hq(`sales?${day1}&page_size=100`, GA, shop1);
+  check(h.status === 200 && recs(h).has(recA) && !recs(h).has(recS2) && h.data.rows.every((r: any) => r.shop_id === shop1), 'H1: Global Admin sees Shop 1 sales (only Shop 1)', h.data?.error);
+  h = await hq(`sales?${day1}`, GA, shop2);
+  check(h.status === 200 && recs(h).has(recS2) && !recs(h).has(recA), 'H2: Global Admin sees Shop 2 synthetic sales (only Shop 2)', h.data?.error);
+  h = await hq(`sales?${day1}&page_size=100`, GA, null, ALLS);
+  const shopsIn = new Set((h.data?.rows || []).map((r: any) => r.shop_code));
+  check(h.status === 200 && recs(h).has(recA) && recs(h).has(recS2) && shopsIn.has('SHOP1') && shopsIn.has('SHOP2') && h.data.summary.by_shop.length === 2,
+    'H3: All Shops combines both (Shop column + per-shop totals)', h.data?.summary);
+  check(Math.abs(h.data.summary.net_sales - h.data.summary.by_shop.reduce((t: number, x: any) => t + x.net_sales, 0)) < 0.01, 'combined totals = sum of shop contributions');
+  check((await hq(`sales?${day1}`, S1A, shop2)).status === 403, 'H4: Shop 1 Admin cannot see Shop 2 sales (403)');
+  check((await hq(`sales?${day1}`, S1A, null, ALLS)).status === 403, 'H4: Shop 1 Admin cannot use All Shops (403)');
+  h = await hq(`sales?${day1}`, S2A, null);
+  check(h.status === 200 && recs(h).has(recS2) && !recs(h).has(recA), 'H5: Shop 2 Admin sees only Shop 2 (own shop, no header)');
+  check((await hq(`sales?${day1}`, S2A, shop1)).status === 403, 'H5: Shop 2 Admin cannot see Shop 1 sales (403)');
+  check((await hq(`sales?${day1}`, OCASH, null)).status === 403 && (await api('GET', '/api/history/sales', cashierToken)).status === 403,
+    'cashiers get no history administration (online + local 403)');
+  const mgr = await hq(`sales?${day1}`, MGR, null);
+  check(mgr.status === 200 && mgr.data.rows.every((r: any) => r.gross_profit === undefined) && mgr.data.summary.gross_profit === undefined, 'Manager: own shop, no cost / profit');
+
+  // Large local history (giga_chemist_dev holds the real ~135k-sale dataset)
+  const p1 = await api('GET', '/api/history/sales?page_size=25', adminToken);
+  const p2 = await api('GET', '/api/history/sales?page_size=25&page=2', adminToken);
+  const ids1 = new Set((p1.data?.rows || []).map((r: any) => r.id));
+  check(p1.status === 200 && p1.data.total > 25 && p1.data.rows.length === 25 && p2.data.rows.length === 25 && !p2.data.rows.some((r: any) => ids1.has(r.id)),
+    `H6: pagination over ${p1.data?.total} local sales (pages disjoint)`);
+  const big = await api('GET', '/api/history/sales?page_size=100000', adminToken);
+  check(big.status === 200 && big.data.rows.length === 25 && big.data.page_size === 25, 'H21: an oversized page_size is clamped (25/50/100 only); never the whole history');
+  check((await api('GET', '/api/history/sales?from=2099-01-01&to=2099-01-31', adminToken)).data?.total === 0
+    && (await api('GET', `/api/history/sales?${day1}`, adminToken)).data?.rows.some((r: any) => r.receipt_number === recA), 'H7: date filter');
+  h = await hq(`sales?receipt=${encodeURIComponent(recA)}`, GA, shop1);
+  check(h.status === 200 && h.data.total === 1 && h.data.rows[0].receipt_number === recA, 'H8: receipt search finds exactly one sale');
+  h = await api('GET', `/api/history/sales?${day1}&cashier=${cashier.id}&page_size=100`, adminToken);
+  check(h.status === 200 && h.data.total >= 4 && h.data.rows.every((r: any) => r.cashier_id === cashier.id), 'H9: cashier filter', h.data?.total);
+  h = await hq(`sales?${day1}&medicine=${encodeURIComponent('ZZ ITEST FullWrite')}`, GA, shop1);
+  check(h.status === 200 && recs(h).has(recA), 'H10: medicine search');
+  h = await hq(`sales?${day1}&payment_method=Cash&status=voided`, GA, shop1);
+  check(h.status === 200 && h.data.rows.length >= 1 && h.data.rows.every((r: any) => r.status === 'voided' && r.payment_method === 'Cash'), 'payment + status filters (voided sale found)');
+  const det = await hq(`sales/${sA?.id}`, GA, shop1);
+  check(det.status === 200 && det.data.items.length === 1 && det.data.payments.length >= 1 && det.data.returns.length === 1 && det.data.items[0].cost_price_snapshot !== undefined
+    && det.data.audit.length >= 1, 'sale detail: items, payments, its return, audit, cost for the Administrator', { i: det.data?.items?.length, r: det.data?.returns?.length, a: det.data?.audit?.length });
+  check((await hq(`sales/${s2sale}`, GA, shop1)).status === 404, 'a Shop 2 sale id is not found under Shop 1 (no cross-shop detail)');
+
+  // Supply history
+  const orders = (x: any) => new Set((x.data?.rows || []).map((r: any) => r.order_number));
+  h = await hq(`supplies?${day1}&status=received`, GA, shop1);
+  check(h.status === 200 && orders(h).has(lp?.order_number) && !orders(h).has(`S2-PO-${RUN}`), 'H11: Global Admin sees Shop 1 supply history', h.data?.error);
+  h = await hq(`supplies?${day1}`, GA, shop2);
+  check(h.status === 200 && orders(h).has(`S2-PO-${RUN}`) && !orders(h).has(lp?.order_number), 'H12: Global Admin sees Shop 2 synthetic supplies');
+  h = await hq(`supplies?${day1}`, GA, null, ALLS);
+  check(h.status === 200 && orders(h).has(lp?.order_number) && orders(h).has(`S2-PO-${RUN}`) && h.data.summary.by_shop.length === 2, 'All Shops supply history combines both');
+  check((await hq('supplies', S1A, shop2)).status === 403 && !orders(await hq(`supplies?${day1}`, S2A, null)).has(lp?.order_number), 'H13: supply history is shop-isolated');
+  h = await hq(`supplies?supplier=${sup}`, GA, shop1);
+  check(h.status === 200 && h.data.rows.length >= 1 && h.data.rows.every((r: any) => r.supplier_id === sup), 'H14: supplier filter');
+  h = await hq(`supplies?invoice=${encodeURIComponent(`ITEST-INV-${RUN}`)}`, GA, shop1);
+  check(h.status === 200 && h.data.total === 1 && h.data.rows[0].id === pur, 'H15: invoice search');
+  h = await hq(`supplies?medicine=${encodeURIComponent('ZZ ITEST FullWrite')}&status=received&${day1}`, GA, shop1);
+  check(h.status === 200 && orders(h).has(lp?.order_number), 'H16: medicine filter on supplies');
+  const sd = await hq(`supplies/${pur}`, GA, shop1);
+  const line = sd.data?.items?.[0];
+  check(sd.status === 200 && sd.data.items.length === 1 && line.batch_number === `FW-P1-${RUN}` && line.quantity === 7 && line.purchase_price === 33 && line.expiry_date?.startsWith('2033-01-31')
+    && sd.data.movements.length >= 1 && sd.data.purchase.supplier_name === `ZZ ITEST FW Supplier ${RUN}`, 'H17: purchase detail: lines, batch, expiry, buy price, supplier, stock movements', sd.data);
+  const lsd = await api('GET', `/api/history/supplies/${pur}`, adminToken);
+  check(lsd.status === 200 && lsd.data.items.length === 1 && lsd.data.movements.length === 1, 'same purchase detail on the shop server (local history)');
+
+  // Immutability + reprint
+  check((await api('PUT', `/api/sales/${sA?.id}`, adminToken, { total: 1 })).status === 405 && (await on('PUT', `/api/sales/${sA?.id}`, GA, { total: 1 }, shop1)).status === 409
+    && (await api('PATCH', `/api/history/sales/${sA?.id}`, adminToken, { total: 1 })).status === 405, 'H18: a completed sale cannot be raw-edited (local 405, online 409, history 405)');
+  check((await api('DELETE', `/api/purchases/${pur}`, adminToken)).status === 405 && (await on('DELETE', `/api/purchases/${pur}`, GA, undefined, shop1)).status === 409
+    && (await lq('SELECT COUNT(*)::int n FROM purchases WHERE id = $1', [pur]))[0].n === 1, 'H19: a received purchase cannot be raw-deleted');
+  const salesBefore = (await lq('SELECT COUNT(*)::int n FROM sales'))[0].n;
+  const rp = await api('POST', `/api/history/sales/${sA?.id}/reprint`, adminToken, {});
+  const rpo = await on('POST', `/api/history/sales/${sA?.id}/reprint`, GA, {}, shop1);
+  const rpAudit = (await lq(`SELECT COUNT(*)::int n FROM audit_logs WHERE action = 'RECEIPT_REPRINTED' AND entity_id = $1`, [sA?.id]))[0].n;
+  check(rp.status === 200 && rp.data.reprint?.copy === true && rpo.status === 200 && (await lq('SELECT COUNT(*)::int n FROM sales'))[0].n === salesBefore && rpAudit >= 1,
+    'H20: receipt reprint (local + online) marks a COPY, is audited, creates no sale');
+
+  // Concurrency
+  const hcc = await Promise.all(Array.from({ length: 20 }, (_, i) => {
+    const shop = i % 2 ? shop2 : shop1;
+    return hq(`sales?${day1}&page_size=100`, GA, shop).then((x) => ({ shop, r: recs(x), ok: x.status === 200 }));
+  }));
+  check(hcc.every((x) => x.ok && (x.shop === shop1 ? x.r.has(recA) && !x.r.has(recS2) : x.r.has(recS2) && !x.r.has(recA))), 'H22: 20 concurrent Shop 1 / Shop 2 history requests never mix');
+  const csv = await fetch(`http://127.0.0.1:${ONLINE_PORT}/api/history/export/sales?${day1}`, { headers: { Authorization: `Bearer ${GA}`, 'X-GIGA-SHOP-ID': shop1 } });
+  const csvText = await csv.text();
+  check(csv.status === 200 && /text\/csv/.test(csv.headers.get('content-type') || '') && csvText.includes(recA) && !csvText.includes(recS2)
+    && !secrets.some((x) => x && csvText.includes(x)), 'CSV export uses the filters and the shop scope (no secrets)');
 
   // ================================================================== AUDIT
   section('AUDIT (tests 49-50)');

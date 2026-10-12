@@ -159,3 +159,33 @@ synthetic Shop 2 (registered + fed through the real ingestion RPC with its own t
 Covers the 54-item matrix: auth/roles/403, concurrent shop isolation, every module's commands, stale `expected_quantity` rejection,
 no lost cashier movement, idempotency, duplicate delivery, offline PENDING, wrong-shop consumption, audit completeness and secret scans.
 Shop-switch cache isolation in the browser is covered by `npm run test:pos-cache`.
+
+---
+
+## 13. History module (sales + supply), read only
+
+Navigation: **Finance → History** (online) / **History** (shop app), tabs *Sales* and *Supply / Purchases*.
+Global dashboard: *View All Sales*, *View Supply History*; a shop dashboard shows *Recent sales / supplies* with *View full history*.
+
+* **Access**: Admin and Manager (`sales.view_all`, `stock.receive`); cashiers get 403 (their own Sales History is unchanged).
+  Cost / profit only for Administrators. GLOBAL_ADMIN: one shop, or **All Shops** (Shop column + per-shop contribution);
+  shop accounts: own shop only (403 otherwise).
+* **Scope is decided by the server**: the request's authorized shop, or — only for a Global Administrator in All Shops — every
+  active shop. Every relation in `server/db/history.ts` is filtered to that list; ids from another shop answer 404.
+* **One implementation, two sources**: the shop server reads its own PostgreSQL; the online API reads `giga_cloud` for the
+  authorized shops. Same filters, paging and totals (`server/http/historyRoutes.ts` serves both).
+* **Large histories**: filters, counts, summaries and paging run in PostgreSQL; pages of 25 / 50 / 100 (anything else is clamped).
+  Measured on the real dataset (135,819 sales / 226,402 lines): one month 21 ms, receipt 0.3 s, medicine search 0.4–0.6 s,
+  sale detail 17 ms, all-time totals ~1.1 s (the screen defaults to *This month*). CSV export uses the same filters (max 50,000 rows).
+* **Filters**: date presets / range, shop (All Shops), cashier, customer, payment method, status, retail / wholesale, receipt / sale
+  number, medicine name / barcode, free search; supplies: supplier, medicine, batch, invoice, order number, payment status, status.
+* **Details**: sale → items (batch, qty, unit price, mode, discount, total, cost/profit for Admin), payments, totals, returns,
+  void, audit. Purchase → lines (batch, expiry, qty, buy price, line total; current selling prices labelled as *current*), stock movements.
+* **Immutability**: no Edit. `PUT/PATCH/DELETE /api/sales/:id` → 405 (online 409), `DELETE /api/purchases/:id` → 405,
+  any write under `/api/history/*` → 405. Corrections: void (Admin; online as a `SALE_VOID` command), returns workflow, pending-purchase cancel.
+* **Reprint**: `POST /api/history/sales/:id/reprint` re-renders the stored sale stamped *REPRINT — COPY*; audited
+  (`RECEIPT_REPRINTED` at the shop, `online_audit` online); creates nothing.
+* **Indexes** (checked first; additive): local **018** `purchases(received_date)`, `purchases(supplier_id)`, `sale_items(medicine_id)`,
+  `purchase_items(medicine_id)` (sales already indexed); cloud **007** `(shop_id, …)` indexes on sales cashier/status/receipt,
+  sale_items medicine, payments, returns, purchases date/supplier, purchase_items, movements reference, audit entity.
+  Deploy cloud 007 with 006 (indexes only; safe at any time).
