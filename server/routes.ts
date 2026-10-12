@@ -72,6 +72,8 @@ import { getSystemHealth } from './ops/health';
 import { appVersion, currentCommit } from './ops/runtime';
 import { pgPool } from './db/client';
 import { buildHistoryRouter } from './http/historyRoutes';
+import { buildInventoryRouter } from './http/inventoryRoutes';
+import { createDraftPurchaseTx } from './db/purchases';
 import { approveStocktake, cancelStocktake, countLine, createStocktake, getStocktake, listStocktakes, reopenStocktake, startCounting, submitStocktake } from './db/stocktakes';
 import { buildShiftRouter } from './http/shiftRoutes';
 import { openShift, getCurrentShift, closeShift, reviewShift, correctShift, listOpenTills } from './db/shifts';
@@ -642,6 +644,22 @@ apiRouter.post('/inventory/physical-count', requireRole('ADMIN'), async (req: Au
   } catch (err: any) {
     console.error('[API] /inventory/physical-count failed:', err.message);
     res.status(errorStatus(err)).json({ error: err.message || 'Failed to apply physical stock count.' });
+  }
+});
+
+// --- 6a. INVENTORY INTELLIGENCE (read only) + purchase DRAFT from reorder suggestions ---
+apiRouter.use(buildInventoryRouter({
+  canView: requirePermission('inventory.view'),
+  withScope: withLocalScope,
+  send: (res, err: any, label) => sendError(res, err, 'Inventory insight failed.', label),
+}));
+// A PENDING purchase (nothing enters stock until it is received). Administrator only.
+apiRouter.post('/purchases/drafts', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const purchase = await withTransaction((client) => createDraftPurchaseTx(client, crypto.randomUUID(), req.body || {}, saleActor(req), { source: 'REORDER_SUGGESTIONS' }));
+    res.status(201).json({ success: true, purchase });
+  } catch (err: any) {
+    sendError(res, err, 'Could not create the purchase draft.', 'POST /purchases/drafts');
   }
 });
 

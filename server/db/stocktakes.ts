@@ -74,7 +74,7 @@ export async function createStocktake(actor: StocktakeActor, body: Record<string
       `INSERT INTO stocktakes (id, stocktake_number, status, scope_type, scope_value, allow_cashier_count, notes, started_by, started_by_name, business_date)
        VALUES ($1, $2, 'DRAFT', $3, $4, $5, $6, $7, $8, $9)`,
       [id, number, scopeType, scopeValue ? JSON.stringify(scopeValue) : null, body?.allow_cashier_count === true, text(body?.notes), actor.user_id, actor.user_name, date]);
-    const filter = scopeType === 'CATEGORY' ? `AND LOWER(m.category) = LOWER($2)`
+    const filter = scopeType === 'CATEGORY' ? `AND m.category_id IN (SELECT c.id FROM categories c WHERE LOWER(c.name) = LOWER($2))`
       : scopeType === 'MEDICINES' ? `AND m.id = ANY($2::uuid[])` : '';
     const params: unknown[] = [id];
     if (scopeType === 'CATEGORY') params.push(scopeValue.category);

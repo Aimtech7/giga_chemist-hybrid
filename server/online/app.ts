@@ -20,6 +20,7 @@ import { getPharmacySettings, toSettings } from '../db/settings';
 import { buildRemoteAdminRouter, isAllShopsScope } from './remoteAdmin';
 import { buildUserAdminRouter } from './userAdmin';
 import { buildHistoryRouter } from '../http/historyRoutes';
+import { buildInventoryRouter } from '../http/inventoryRoutes';
 import { buildShiftRouter } from '../http/shiftRoutes';
 import type { HistoryScope } from '../db/history';
 import type { UserRole } from '../../src/types';
@@ -563,6 +564,9 @@ export function buildOnlineRouter() {
     withScope: withCloudScope,
     send: (res, err, label) => send(res, err, label),
   }));
+
+  // Inventory intelligence (reorder / movement classes / expiry risk) over the authorized shop(s).
+  r.use(buildInventoryRouter({ canView: requirePermission('inventory.view'), withScope: withCloudScope, send: (res, err, label) => send(res, err, label) }));
 
   r.use(buildHistoryRouter({
     canSales: requirePermission('sales.view_all'),

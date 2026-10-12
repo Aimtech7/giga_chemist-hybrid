@@ -43,6 +43,7 @@ export type AppModule =
   | 'inventory'
   | 'stocktake'
   | 'stocktakes'
+  | 'insights'
   | 'batches'
   | 'expiry'
   | 'purchases'
@@ -123,6 +124,7 @@ export const AppShell: React.FC<AppShellProps> = ({
     { id: 'inventory' as AppModule, label: 'Inventory', icon: PackageSearch },
     { id: 'stocktake' as AppModule, label: 'Physical Stock Count', icon: ClipboardCheck },
     { id: 'stocktakes' as AppModule, label: 'Stocktakes', icon: ClipboardCheck },
+    { id: 'insights' as AppModule, label: 'Stock Insights', icon: BarChart3 },
     { id: 'batches' as AppModule, label: 'Batches', icon: Boxes },
     { id: 'expiry' as AppModule, label: 'Expiry Tracking', icon: AlertTriangle },
     { id: 'purchases' as AppModule, label: 'Purchases', icon: Truck },
@@ -143,7 +145,7 @@ export const AppShell: React.FC<AppShellProps> = ({
   const onlineAdmin = serverMode === 'online' && currentUser?.role === 'ADMIN';
   const ONLINE_SECTIONS: [string, AppModule[]][] = [
     ['', ['dashboard' as AppModule]],
-    ['Operations', ['medicines', 'inventory', 'batches', 'expiry', 'purchases'] as AppModule[]],
+    ['Operations', ['medicines', 'inventory', 'insights', 'batches', 'expiry', 'purchases'] as AppModule[]],
     ['Directory', ['suppliers', 'customers'] as AppModule[]],
     ['Finance', ['history', 'sales', 'returns', 'expenses', 'reports'] as AppModule[]],
     ['Administration', ['users', 'settings', 'audit'] as AppModule[]],

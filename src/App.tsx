@@ -16,6 +16,7 @@ import { MedicineList } from './components/inventory/MedicineList';
 import { InventoryManager } from './components/inventory/InventoryManager';
 import { PhysicalStockCount } from './components/stocktake/PhysicalStockCount';
 import { StocktakeSessions } from './components/stocktake/StocktakeSessions';
+import { InventoryInsights } from './components/inventory/InventoryInsights';
 import { BatchList } from './components/inventory/BatchList';
 import { ExpiryManager } from './components/expiry/ExpiryManager';
 import { PurchaseList } from './components/purchases/PurchaseList';
@@ -37,7 +38,7 @@ import type { PharmacySettings, User } from './types';
 
 // '#app' (or any unknown hash) is not a module and must never become the current one (blank screen).
 const KNOWN_MODULES: AppModule[] = [
-  'dashboard', 'pos', 'medicines', 'inventory', 'stocktake', 'stocktakes', 'batches', 'expiry', 'purchases', 'suppliers',
+  'dashboard', 'pos', 'medicines', 'inventory', 'stocktake', 'stocktakes', 'insights', 'batches', 'expiry', 'purchases', 'suppliers',
   'customers', 'expenses', 'sales', 'returns', 'reports', 'users', 'audit', 'settings', 'remote', 'history',
 ];
 
@@ -347,6 +348,11 @@ export default function App() {
       {/* STOCKTAKE SESSIONS - count first, Administrator approval applies (cashiers: blind counting when allowed) */}
       {currentModule === 'stocktakes' && canAccessModule(currentUser, 'stocktakes') && (
         <StocktakeSessions currentUser={currentUser} settings={settings} />
+      )}
+
+      {/* STOCK INSIGHTS - reorder, fast / slow / dead stock, expiry risk, reconciliation (read only) */}
+      {currentModule === 'insights' && canAccessModule(currentUser, 'insights') && (
+        <InventoryInsights currentUser={currentUser} online={serverMode === 'online'} />
       )}
 
       {/* BATCHES - Restricted to Admin/Manager */}
