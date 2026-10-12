@@ -31,6 +31,7 @@
     "sync:bootstrap": "tsx scripts/sync-bootstrap.ts",
     "env:check:online": "tsx scripts/validate-online-env.ts",
     "backup": "tsx scripts/backup/backup-db.ts",
+    "backup:restore-drill": "tsx scripts/backup/restore-drill.ts",
     "target:rehearse": "tsx scripts/target/rehearse-migration.ts",
     "test:ops": "tsx scripts/integration/run-ops.ts",
     "build:api": "node scripts/build-online-api.mjs",
