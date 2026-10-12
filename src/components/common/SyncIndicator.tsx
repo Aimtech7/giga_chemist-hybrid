@@ -11,6 +11,21 @@ import {
 import { isAdmin } from '../../services/permissions';
 import type { User } from '../../types';
 
+/** The four independent layers, in plain words (every role sees this). */
+export function connectivityLines(snap: CloudSyncSnapshot | null): [string, string][] {
+  const s = snap?.status;
+  const pending = snap?.pending || 0;
+  const browserOnline = typeof navigator === 'undefined' ? true : navigator.onLine;
+  const cloud = !s ? 'CHECKING' : s.mode !== 'hybrid' ? 'NOT USED (local only)' : !s.enabled ? 'OFF' : s.cloud_reachable === false
+    ? `WAITING${pending ? ` (${pending} queued)` : ''}` : (s.counts?.failed || 0) > 0 ? `ERROR (${s.counts!.failed} failed)` : pending > 0 ? `SYNCING (${pending})` : 'SYNCED';
+  return [
+    ['LOCAL SERVER', snap ? (snap.serverReachable ? 'ONLINE' : 'OFFLINE') : 'CHECKING'],
+    ['DATABASE', !snap?.serverReachable ? 'UNKNOWN' : s?.local_database ? (s.local_database.connected ? 'ONLINE' : 'OFFLINE') : snap?.state === 'DATABASE_UNAVAILABLE' ? 'OFFLINE' : 'ONLINE'],
+    ['INTERNET', !browserOnline ? 'OFFLINE' : s?.cloud_reachable === false ? 'NO CLOUD CONNECTION' : 'ONLINE'],
+    ['CLOUD SYNC', cloud],
+  ];
+}
+
 interface SyncIndicatorProps {
   currentUser: User | null;
   /** Re-hydrates this browser's cache from the local server (existing behaviour). */
@@ -26,7 +41,8 @@ const LABELS: Record<SyncIndicatorState, (n: number) => string> = {
   LOCAL_SYNC_OFF: (n) => (n > 0 ? `LOCAL — CLOUD SYNC OFF (${n} queued)` : 'LOCAL — CLOUD SYNC OFF'),
   ONLINE_SYNCED: () => 'ONLINE — SYNCED',
   ONLINE_SYNCING: (n) => `ONLINE — SYNCING (${n})`,
-  OFFLINE_PENDING: (n) => `OFFLINE — ${n} PENDING`,
+  // The till keeps selling on the local server: say LOCAL MODE, never "POS unavailable".
+  OFFLINE_PENDING: (n) => (n > 0 ? `LOCAL MODE · CLOUD OFFLINE (${n} queued)` : 'LOCAL MODE · CLOUD OFFLINE'),
   SYNC_ERROR: (n) => `SYNC ERROR — ${n} PENDING`,
   UNKNOWN: () => 'CHECKING…',
 };
@@ -101,12 +117,12 @@ export const SyncIndicator: React.FC<SyncIndicatorProps> = ({ currentUser, onRef
   // Online Administrators can queue remote changes (applied by the shop computer); the cloud copy itself stays read-only.
   const label = state === 'ONLINE_READONLY' && admin ? 'ONLINE — CLOUD COPY · REMOTE ADMIN ENABLED' : LABELS[state](pending);
   const s = snap?.status;
-  const title =
-    state === 'SERVER_UNREACHABLE'
-      ? 'This screen cannot reach the GIGA CHEMIST POS server. Check that the server PC is on.'
-      : state === 'OFFLINE_PENDING'
-      ? 'No cloud connection. Sales continue normally on the local server; queued records sync automatically when the internet returns.'
-      : 'Local POS server connected';
+  const lines = connectivityLines(snap);
+  const title = [
+    ...lines.map(([k, v]) => `${k}: ${v}`),
+    state === 'SERVER_UNREACHABLE' ? 'This screen cannot reach the GIGA CHEMIST POS server. Check that the server PC is on.'
+      : state === 'OFFLINE_PENDING' ? 'Selling continues on the local server; queued records sync automatically when the internet returns.' : '',
+  ].filter(Boolean).join('\n');
 
   const run = async (fn: () => Promise<string>) => {
     setBusy(true);
@@ -124,8 +140,8 @@ export const SyncIndicator: React.FC<SyncIndicatorProps> = ({ currentUser, onRef
     <div className="relative flex items-center gap-1.5 text-xs" ref={panelRef}>
       <button
         type="button"
-        onClick={() => admin && setOpen((v) => !v)}
-        className={`flex items-center gap-1.5 px-1.5 py-0.5 rounded ${admin ? 'hover:bg-slate-800 cursor-pointer' : 'cursor-default'}`}
+        onClick={() => setOpen((v) => !v)}
+        className="flex items-center gap-1.5 px-1.5 py-0.5 rounded hover:bg-slate-800 cursor-pointer"
         title={title}
         aria-label={`Sync status: ${label}`}
       >
@@ -144,14 +160,24 @@ export const SyncIndicator: React.FC<SyncIndicatorProps> = ({ currentUser, onRef
         <RefreshCw className={`w-3 h-3 ${isRefreshing ? 'animate-spin text-teal-400' : ''}`} />
       </button>
 
-      {open && admin && (
+      {open && (
         <div className="absolute top-8 left-1/2 -translate-x-1/2 w-[22rem] max-w-[90vw] bg-white text-slate-800 rounded border border-slate-300 shadow-lg z-50 p-3 select-text">
           <div className="flex items-center justify-between mb-2">
-            <span className="font-bold text-sm">Cloud Sync Status</span>
+            <span className="font-bold text-sm">Connection status</span>
             <button onClick={() => setOpen(false)} className="p-1 rounded hover:bg-slate-100" aria-label="Close">
               <X className="w-3.5 h-3.5" />
             </button>
           </div>
+          <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[11px] mb-2">
+            {lines.map(([k, v]) => (
+              <React.Fragment key={k}>
+                <dt className="font-semibold text-slate-600">{k}</dt>
+                <dd className={/OFFLINE|ERROR|UNKNOWN/.test(v) && k !== 'INTERNET' && k !== 'CLOUD SYNC' ? 'text-rose-700 font-bold' : /OFFLINE|WAITING|NO CLOUD|ERROR/.test(v) ? 'text-amber-700 font-semibold' : 'text-emerald-700 font-semibold'}>{v}</dd>
+              </React.Fragment>
+            ))}
+          </dl>
+          {state === 'OFFLINE_PENDING' && <p className="text-[11px] text-slate-600 mb-2">LOCAL MODE: selling, stock and shifts continue on this shop's server. Everything queued syncs by itself when the internet returns.</p>}
+          {admin && (<>
           <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[11px]">
             <dt className="text-slate-500">POS server</dt>
             <dd>{snap?.serverReachable ? 'Connected' : 'Unreachable'}</dd>
@@ -218,6 +244,7 @@ export const SyncIndicator: React.FC<SyncIndicatorProps> = ({ currentUser, onRef
             </button>
           </div>
           {message && <p className="mt-2 text-[11px] text-slate-600">{message}</p>}
+          </>)}
         </div>
       )}
     </div>
