@@ -684,6 +684,37 @@ export async function fullWriteTests(env: HybridEnv, admin: Fixture, cashier: Fi
   check(cmp.data?.rows?.some((x: any) => x.per_shop[shop2] && !x.per_shop[shop1]) , 'a Shop 2-only medicine appears only under Shop 2');
   check((await on('GET', '/api/admin/stock-comparison', S1A, undefined, null)).status === 403, 'comparison is Global Administrator only');
 
+  // ================================================================== STOCK HISTORY (online)
+  section('STOCK HISTORY ONLINE (Global Admin, shop scope, online cashier)');
+  const shq = `/api/history/stock?q=${encodeURIComponent('ZZ ITEST FullWrite')}&activity_only=false`;
+  const sh1 = await on('GET', shq, GA, undefined, shop1);
+  const sh2 = await on('GET', shq, GA, undefined, shop2);
+  const shAll = await on('GET', shq, GA, undefined, null, ALLS);
+  check(sh1.status === 200 && sh1.data.rows.length > 0 && sh1.data.rows.every((x: any) => x.shop_id === shop1), 'TEST 41: Global Admin -> Shop 1 stock history (Shop 1 rows only)', sh1.data?.rows?.length);
+  check(sh2.status === 200 && sh2.data.rows.some((x: any) => x.medicine_id === m2) && sh2.data.rows.every((x: any) => x.shop_id === shop2), 'TEST 25: Global Admin -> Shop 2 stock history (Shop 2 rows only)');
+  const twinRows = (shAll.data?.rows || []).filter((x: any) => x.medicine_name?.startsWith('ZZ ITEST FullWrite Medicine'));
+  check(shAll.status === 200 && new Set(twinRows.map((x: any) => x.shop_id)).size === 2 && shAll.data.days[0]?.by_shop?.length === 2,
+    'TEST 26: All Shops: the same medicine listed per shop (separate figures, per-shop day lines)', twinRows.map((x: any) => [x.shop_code, x.closing]));
+  const s2row = sh2.data?.rows?.find((x: any) => x.medicine_id === m2);
+  check(s2row?.closing === 12 && s2row?.gross_sold === 2, 'Shop 2 today: remaining 12 (its baseline; the synthetic sale carried no movement) and sold 2', s2row);
+  const localQty = Number((await lq('SELECT COALESCE(SUM(quantity_available), 0)::int q FROM medicine_batches WHERE medicine_id = $1', [med]))[0].q);
+  // The shop's outbox may still be draining: wait until the online ledger has caught up.
+  const sh1b = await waitFor(() => on('GET', shq, GA, undefined, shop1), (x) => x.data?.rows?.find((y: any) => y.medicine_id === med)?.closing === localQty);
+  const s1row = sh1b.data?.rows?.find((x: any) => x.medicine_id === med);
+  check(s1row?.closing === localQty, 'online remaining for Shop 1 today = the shop own stock now (from the synced ledger)', { online: s1row?.closing, local: localQty });
+  check(s1row?.status === 'INCOMPLETE' && s1row?.opening === null, 'Shop 1 synced today: the online opening is INCOMPLETE (cloud ledger starts at the baseline), never guessed', s1row);
+  const oc = await on('GET', shq, OCASH);
+  check(oc.status === 200 && oc.data.rows.every((x: any) => x.shop_id === shop1), 'online CASHIER: Stock History of their own shop (read only)');
+  check((await on('GET', shq, OCASH, undefined, shop2)).status === 403, 'online CASHIER selecting Shop 2 -> 403');
+  check((await on('GET', shq, OCASH, undefined, null, ALLS)).status === 403, 'online CASHIER All Shops -> 403');
+  check((await on('GET', '/api/history/sales', OCASH)).status === 403 && (await on('GET', '/api/history/supplies', OCASH)).status === 403,
+    'online CASHIER: no Sales / Supply history');
+  check(!/"(purchase_price|cost_price|cost_price_snapshot|cost_total|gross_profit|profit|valuation)"\s*:/i.test(JSON.stringify(oc.data)), 'online cashier response: no cost / profit field');
+  check((await on('GET', shq, S1A, undefined, shop2)).status === 403, 'Shop 1 Admin cannot open Shop 2 stock history');
+  check((await on('GET', shq, MGR)).status === 200, 'Manager: own shop stock history');
+  const shDet = await on('GET', `/api/history/stock/${med}?date=${sh1.data?.today}&shop_id=${shop1}`, GA, undefined, null, ALLS);
+  check(shDet.status === 200 && shDet.data.events.length > 0 && shDet.data.shop_id === shop1, 'All Shops drill-down for one shop row (movement timeline)', shDet.data?.events?.length);
+
   // ================================================================== AUDIT
   section('AUDIT (tests 49-50)');
   const auditRows = await lq(`SELECT entity_id FROM audit_logs WHERE action = 'CLOUD_COMMAND_APPLIED' AND entity_id = ANY($1::text[])`, [applied]);

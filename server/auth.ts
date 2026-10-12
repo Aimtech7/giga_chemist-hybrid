@@ -162,6 +162,7 @@ export const ROLE_PERMISSIONS: Record<UserRole, string[]> = {
     'suppliers.manage',
     'expenses.manage',
     'devices.manage',
+    'history.stock.view',
   ],
   MANAGER: [
     'medicine.view',
@@ -177,13 +178,17 @@ export const ROLE_PERMISSIONS: Record<UserRole, string[]> = {
     'suppliers.manage',
     'expenses.manage',
     'customers.manage',
+    'history.stock.view',
   ],
+  // Cashier: History -> Stock History only (quantities, own shop, read only). No sales.view_all,
+  // stock.receive, inventory.view or reports.view.
   CASHIER: [
     'medicine.view',
     'sales.create',
     'sales.view_own',
     'returns.create',
     'customers.manage',
+    'history.stock.view',
   ],
 };
 

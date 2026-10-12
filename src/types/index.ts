@@ -19,7 +19,9 @@ export type PermissionKey =
   | 'returns.process'
   | 'returns.request'
   | 'customers.manage'
-  | 'expenses.manage';
+  | 'expenses.manage'
+  /** History -> Stock History (quantities only, own shop, read only). Cashiers have it; nothing else follows from it. */
+  | 'history.stock.view';
 
 export interface User {
   id: string;

@@ -1092,6 +1092,9 @@ apiRouter.put('/settings', requireRole('ADMIN'), async (req: AuthenticatedReques
 apiRouter.use(buildHistoryRouter({
   canSales: requirePermission('sales.view_all'),
   canSupplies: requirePermission('stock.receive'),
+  // Stock History: its own narrow permission (cashiers included); the scope is always this shop.
+  canStockHistory: requirePermission('history.stock.view'),
+  canStockExport: requirePermission('reports.view'),
   withScope: async (req, fn) => {
     const identity = await getShopIdentity();
     const client = await pgPool.connect();

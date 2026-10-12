@@ -88,11 +88,11 @@ function verifyCredential(secret, storedHash, salt) {
     return false;
   }
 }
-function base64UrlEncode(str2) {
-  return Buffer.from(str2).toString("base64").replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+function base64UrlEncode(str3) {
+  return Buffer.from(str3).toString("base64").replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
 }
-function base64UrlDecode(str2) {
-  let base64 = str2.replace(/-/g, "+").replace(/_/g, "/");
+function base64UrlDecode(str3) {
+  let base64 = str3.replace(/-/g, "+").replace(/_/g, "/");
   while (base64.length % 4) {
     base64 += "=";
   }
@@ -157,7 +157,8 @@ var ROLE_PERMISSIONS = {
     "settings.manage",
     "suppliers.manage",
     "expenses.manage",
-    "devices.manage"
+    "devices.manage",
+    "history.stock.view"
   ],
   MANAGER: [
     "medicine.view",
@@ -172,14 +173,18 @@ var ROLE_PERMISSIONS = {
     "reports.view",
     "suppliers.manage",
     "expenses.manage",
-    "customers.manage"
+    "customers.manage",
+    "history.stock.view"
   ],
+  // Cashier: History -> Stock History only (quantities, own shop, read only). No sales.view_all,
+  // stock.receive, inventory.view or reports.view.
   CASHIER: [
     "medicine.view",
     "sales.create",
     "sales.view_own",
     "returns.create",
-    "customers.manage"
+    "customers.manage",
+    "history.stock.view"
   ]
 };
 function hasPermission(role2, permissionKey) {
@@ -3036,6 +3041,11 @@ function salesWhere(scope, query) {
   }
   const receipt = str(query.receipt, 60);
   if (receipt) w.add((p) => `(s.receipt_number ILIKE ${p} OR s.sale_number ILIKE ${p})`, like(receipt));
+  const medicineId = str(query.medicine_id, 64);
+  if (medicineId) {
+    if (!isValidUuid(medicineId)) throw new HttpError(400, "medicine_id must be a UUID.");
+    w.add((p) => `(s.shop_id, s.id) IN (SELECT i.shop_id, i.sale_id FROM ${R.items} i WHERE i.medicine_id = ${p}::uuid)`, medicineId);
+  }
   const medicine = str(query.medicine);
   if (medicine) {
     w.add((p) => `(s.shop_id, s.id) IN (SELECT i.shop_id, i.sale_id FROM ${R.items} i WHERE (i.shop_id, i.medicine_id) IN
@@ -3292,6 +3302,11 @@ function suppliesWhere(scope, query) {
   if (status) w.add((x) => `lower(p.status) = ${x}`, status);
   const pay = str(query.payment_status, 20).toLowerCase();
   if (pay) w.add((x) => `lower(p.payment_status) = ${x}`, pay);
+  const medicineId = str(query.medicine_id, 64);
+  if (medicineId) {
+    if (!isValidUuid(medicineId)) throw new HttpError(400, "medicine_id must be a UUID.");
+    w.add((x) => `(p.shop_id, p.id) IN (SELECT i.shop_id, i.purchase_id FROM ${R.purchase_items} i WHERE i.medicine_id = ${x}::uuid)`, medicineId);
+  }
   const medicine = str(query.medicine);
   if (medicine) {
     w.add((x) => `(p.shop_id, p.id) IN (SELECT i.shop_id, i.purchase_id FROM ${R.purchase_items} i WHERE (i.shop_id, i.medicine_id) IN
@@ -3469,6 +3484,536 @@ async function historyCsv(scope, kind, query) {
   return [cols.join(","), ...rows.slice(0, EXPORT_MAX_ROWS).map((r) => cols.map((c) => csvCell(r[c])).join(","))].join("\n");
 }
 
+// server/db/stockHistory.ts
+var TZ = "Africa/Nairobi";
+var MAX_RANGE_DAYS = 62;
+var STOCK_PAGE_SIZES = [50, 100, 250, 500];
+var DATE_RE4 = /^\d{4}-\d{2}-\d{2}$/;
+var str2 = (v, max = 100) => typeof v === "string" ? v.trim().slice(0, max) : "";
+var LOCAL2 = {
+  shops: `(SELECT si.shop_id, si.shop_code, COALESCE(si.shop_name, 'This shop') AS shop_name FROM shop_identity si WHERE si.shop_id = ANY($1::uuid[]))`,
+  medicines: `(SELECT ($1::uuid[])[1] AS shop_id, m.id, m.name, m.generic_name, m.brand_name, m.barcode, m.sku, COALESCE(m.status, 'active') AS status FROM medicines m)`,
+  anchors: `(SELECT ($1::uuid[])[1] AS shop_id, b.id AS batch_id, b.medicine_id, b.batch_number, b.expiry_date,
+                    COALESCE(b.created_at, '-infinity'::timestamptz) AS anchor_at, NULL::bigint AS anchor_seq,
+                    EXISTS (SELECT 1 FROM inventory_movements p WHERE p.batch_id = b.id AND p.created_at < b.created_at) AS pre_unknown,
+                    NULL::int AS baseline_qty, b.quantity_available AS fallback_qty
+               FROM medicine_batches b)`,
+  moves: `(SELECT ($1::uuid[])[1] AS shop_id, mv.id, mv.medicine_id, mv.batch_id, mv.previous_quantity AS before_qty, mv.new_quantity AS after_qty,
+                  mv.adjustment_quantity AS delta, upper(COALESCE(mv.movement_type, '')) AS movement_type, upper(COALESCE(mv.reason, '')) AS reason,
+                  mv.reference_id, mv.notes, mv.user_id, mv.created_at AS occurred_at, mv.timestamp AS seq
+             FROM inventory_movements mv)`,
+  post: `x.occurred_at >= a.anchor_at`,
+  sales: `(SELECT ($1::uuid[])[1] AS shop_id, s.id, s.date, lower(COALESCE(s.status, 'completed')) AS status FROM sales s)`,
+  items: `(SELECT ($1::uuid[])[1] AS shop_id, i.sale_id, i.medicine_id, i.batch_id, i.quantity FROM sale_items i)`,
+  users: `(SELECT ($1::uuid[])[1] AS shop_id, u.id, u.name FROM users u)`,
+  // The cloud rebase never happened in a shop database: no local boundary rows.
+  boundaries: `(SELECT NULL::uuid AS shop_id, NULL::timestamptz AS at, NULL::text AS action, NULL::jsonb AS details WHERE FALSE AND $1::uuid[] IS NOT NULL)`
+};
+var CLOUD2 = {
+  shops: `(SELECT s.shop_id, s.shop_code, s.name AS shop_name FROM giga_cloud.shops s WHERE s.shop_id = ANY($1::uuid[]))`,
+  medicines: `(SELECT m.shop_id, m.medicine_id AS id, m.name, m.generic_name, m.data->>'brand_name' AS brand_name, m.barcode, m.sku, COALESCE(m.status, 'active') AS status
+                 FROM giga_cloud.medicines m WHERE m.shop_id = ANY($1::uuid[]))`,
+  anchors: `(SELECT b.shop_id, b.batch_id, b.medicine_id, b.batch_number, b.expiry_date,
+                    COALESCE(bl.occurred_at, NULLIF(b.data->>'created_at', '')::timestamptz, '-infinity'::timestamptz) AS anchor_at,
+                    COALESCE(bl.seq, 0) AS anchor_seq, (bl.batch_id IS NOT NULL) AS pre_unknown, bl.qty AS baseline_qty,
+                    COALESCE(CASE WHEN sl.has_baseline THEN sl.baseline_quantity + sl.delta_since_baseline ELSE sl.last_reported_quantity END, 0)::int AS fallback_qty
+               FROM giga_cloud.medicine_batches b
+               LEFT JOIN (SELECT DISTINCT ON (p.shop_id, e->>'id') p.shop_id, (e->>'id')::uuid AS batch_id, (e->>'quantity_available')::int AS qty,
+                                 p.occurred_at, p.local_seq AS seq
+                            FROM giga_cloud.processed_events p, jsonb_array_elements(COALESCE(p.payload->'data'->'batches', '[]'::jsonb)) e
+                           WHERE p.event_type = 'MEDICINE_BASELINE' AND p.shop_id = ANY($1::uuid[]) AND (e->>'id') ~* '^[0-9a-f-]{36}$'
+                           ORDER BY p.shop_id, e->>'id', p.local_seq) bl ON bl.shop_id = b.shop_id AND bl.batch_id = b.batch_id
+               LEFT JOIN giga_cloud.stock_levels sl ON sl.shop_id = b.shop_id AND sl.batch_id = b.batch_id
+              WHERE b.shop_id = ANY($1::uuid[]))`,
+  moves: `(SELECT mv.shop_id, mv.movement_id AS id, mv.medicine_id, mv.batch_id, mv.previous_quantity AS before_qty, mv.new_quantity AS after_qty,
+                  mv.delta, upper(COALESCE(mv.movement_type, '')) AS movement_type, upper(COALESCE(mv.reason, '')) AS reason,
+                  mv.reference_id, mv.notes, mv.user_id, mv.occurred_at, mv.local_seq AS seq
+             FROM giga_cloud.inventory_movements mv WHERE mv.shop_id = ANY($1::uuid[]))`,
+  // Movements already contained in the batch's baseline (lower local_seq) are not counted again.
+  post: `x.seq > a.anchor_seq`,
+  sales: `(SELECT s.shop_id, s.sale_id AS id, s.business_date AS date, lower(COALESCE(s.status, 'completed')) AS status FROM giga_cloud.sales s WHERE s.shop_id = ANY($1::uuid[]))`,
+  items: `(SELECT i.shop_id, i.sale_id, i.medicine_id, i.batch_id, i.quantity FROM giga_cloud.sale_items i WHERE i.shop_id = ANY($1::uuid[]))`,
+  users: `(SELECT u.shop_id, u.user_id AS id, u.name FROM giga_cloud.users u WHERE u.shop_id = ANY($1::uuid[]))`,
+  boundaries: `(SELECT o.shop_id, o.at, o.action, o.details FROM giga_cloud.online_audit o WHERE o.shop_id = ANY($1::uuid[]) AND o.action LIKE 'CLOUD_STOCK_REBASE%')`
+};
+var rel2 = (s) => s.mode === "local" ? LOCAL2 : CLOUD2;
+var CATEGORY = `CASE
+    WHEN x.movement_type = 'SALE' THEN 'SALE'
+    WHEN x.movement_type = 'PURCHASE' AND x.reason = 'ADD_STOCK' THEN 'STOCK_ADDED'
+    WHEN x.movement_type = 'PURCHASE' THEN 'PURCHASE_RECEIPT'
+    WHEN x.movement_type = 'RETURN_APPROVED' THEN 'RETURN_RESTOCKED'
+    WHEN x.movement_type LIKE 'RETURN_APPROVED_NOT%' THEN 'RETURN_NOT_RESTOCKED'
+    WHEN x.movement_type = 'VOID_REVERSAL' THEN 'VOID_REVERSAL'
+    WHEN x.movement_type = 'PHYSICAL_STOCK_COUNT' OR x.reason = 'PHYSICAL_STOCK_COUNT' THEN 'PHYSICAL_COUNT'
+    WHEN x.movement_type LIKE '%SUPPLIER%' OR x.reason LIKE '%SUPPLIER%' THEN 'SUPPLIER_RETURN'
+    WHEN x.movement_type LIKE '%DAMAG%' OR x.reason LIKE '%DAMAG%' THEN 'DAMAGE'
+    WHEN x.movement_type LIKE '%EXPIR%' OR x.reason LIKE '%EXPIR%' THEN 'EXPIRY'
+    WHEN x.movement_type ~ '(LOSS|LOST|THEFT|MISSING)' OR x.reason ~ '(LOSS|LOST|THEFT|MISSING)' THEN 'LOSS'
+    WHEN x.movement_type = 'CORRECTION' THEN 'CORRECTION'
+    WHEN x.movement_type = 'ADJUSTMENT' THEN 'ADJUSTMENT'
+    ELSE 'OTHER' END`;
+var NOT_ADJUSTMENT = `('SALE', 'PURCHASE_RECEIPT', 'STOCK_ADDED', 'RETURN_RESTOCKED')`;
+var CATEGORY_LABELS = {
+  SALE: "Sale",
+  PURCHASE_RECEIPT: "Purchase receipt",
+  STOCK_ADDED: "Stock added",
+  RETURN_RESTOCKED: "Customer return (restocked)",
+  RETURN_NOT_RESTOCKED: "Customer return (not restocked)",
+  VOID_REVERSAL: "Void reversal",
+  PHYSICAL_COUNT: "Physical count",
+  SUPPLIER_RETURN: "Supplier return",
+  DAMAGE: "Damaged",
+  EXPIRY: "Expired",
+  LOSS: "Lost",
+  CORRECTION: "Correction",
+  ADJUSTMENT: "Adjustment",
+  OTHER: "Other",
+  SALE_LATER_VOIDED: "Sold, sale later voided",
+  SALE_LEDGER_DIFFERENCE: "Sale movements without a matching valid sale"
+};
+function parseStockQuery(scope, query, today, opts = {}) {
+  const date2 = str2(query.date, 10), fromRaw = str2(query.from, 10), toRaw = str2(query.to, 10);
+  for (const [k, v] of [["date", date2], ["from", fromRaw], ["to", toRaw]]) {
+    if (v && (!DATE_RE4.test(v) || isNaN(Date.parse(`${v}T00:00:00Z`)))) throw new HttpError(400, `${k} must be YYYY-MM-DD.`);
+  }
+  let from = date2 || fromRaw || toRaw || today;
+  let to = date2 || toRaw || fromRaw || today;
+  if (from > to) [from, to] = [to, from];
+  const days = Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 864e5) + 1;
+  if (days > MAX_RANGE_DAYS) throw new HttpError(400, `Choose at most ${MAX_RANGE_DAYS} days at a time.`);
+  const shopRaw = str2(query.shop_id ?? query.shop, 64).toLowerCase();
+  let shop = null;
+  if (shopRaw && shopRaw !== "all") {
+    if (!isValidUuid(shopRaw) || !scope.shopIds.includes(shopRaw)) throw new HttpError(403, "Forbidden: that shop is not in your history scope.");
+    shop = shopRaw;
+  }
+  const medicineRaw = str2(query.medicine_id, 64);
+  if (medicineRaw && !isValidUuid(medicineRaw)) throw new HttpError(400, "medicine_id must be a UUID.");
+  const text2 = str2(query.q ?? query.medicine, 120).toLowerCase();
+  const tokens = text2.split(/\s+/).filter(Boolean).slice(0, 8).map((t) => `%${t.replace(/[\\%_]/g, (c) => `\\${c}`)}%`);
+  const sizes = STOCK_PAGE_SIZES;
+  const wanted = Number(query.page_size);
+  const size = opts.maxSize ? Math.min(opts.maxSize, Math.max(1, wanted || opts.maxSize)) : sizes.includes(wanted) ? wanted : 100;
+  const all = String(query.activity_only ?? "").toLowerCase();
+  return {
+    from,
+    to,
+    shop,
+    medicineId: medicineRaw ? medicineRaw.toLowerCase() : null,
+    tokens,
+    activityOnly: !(all === "false" || all === "0" || String(query.show_all ?? "") === "1" || String(query.show_all ?? "").toLowerCase() === "true"),
+    newestFirst: String(query.order ?? "").toLowerCase() !== "asc",
+    page: Math.max(1, Math.min(1e5, Math.floor(Number(query.page) || 1))),
+    size
+  };
+}
+async function businessToday(scope) {
+  return (await scope.q.query(`SELECT to_char((now() AT TIME ZONE '${TZ}')::date, 'YYYY-MM-DD') AS d`)).rows[0].d;
+}
+function gridSql(scope) {
+  const R = rel2(scope);
+  return `
+  WITH days AS (
+         SELECT g::date AS d, (g::date::timestamp AT TIME ZONE '${TZ}') AS s, ((g::date + 1)::timestamp AT TIME ZONE '${TZ}') AS e
+           FROM generate_series($2::date, $3::date, interval '1 day') g),
+       rng AS (SELECT MIN(s) AS s0, MAX(e) AS e1 FROM days),
+       meds AS (
+         SELECT m.* FROM ${R.medicines} m
+          WHERE ($4::uuid IS NULL OR m.shop_id = $4::uuid) AND ($5::uuid IS NULL OR m.id = $5::uuid)
+            AND lower(concat_ws(' ', m.name, m.generic_name, m.brand_name, m.barcode, m.sku)) LIKE ALL ($6::text[])),
+       a0 AS (SELECT a.* FROM ${R.anchors} a JOIN meds m ON m.shop_id = a.shop_id AND m.id = a.medicine_id),
+       -- Quantity at the start of the range and when the batch entered the ledger (indexed LIMIT 1 lookups).
+       a AS (
+         SELECT a0.*,
+                (SELECT x.after_qty FROM ${R.moves} x WHERE x.shop_id = a0.shop_id AND x.batch_id = a0.batch_id
+                    AND ${R.post.replace(/a\./g, "a0.")} AND x.occurred_at < (SELECT s0 FROM rng)
+                  ORDER BY x.occurred_at DESC, x.seq DESC, x.id DESC LIMIT 1) AS qty_before_range,
+                (SELECT x.before_qty FROM ${R.moves} x WHERE x.shop_id = a0.shop_id AND x.batch_id = a0.batch_id
+                    AND ${R.post.replace(/a\./g, "a0.")}
+                  ORDER BY x.occurred_at, x.seq, x.id LIMIT 1) AS first_before_qty
+           FROM a0),
+       ab AS (
+         SELECT a.*, COALESCE(a.baseline_qty, a.first_before_qty, a.fallback_qty) AS anchor_qty,
+                COALESCE(a.qty_before_range, a.baseline_qty, a.first_before_qty, a.fallback_qty) AS base_qty
+           FROM a),
+       mv AS (
+         SELECT x.*, (x.occurred_at AT TIME ZONE '${TZ}')::date AS d, ${CATEGORY} AS cat
+           FROM ${R.moves} x JOIN ab a ON a.shop_id = x.shop_id AND a.batch_id = x.batch_id
+          WHERE ${R.post} AND x.occurred_at >= (SELECT s0 FROM rng) AND x.occurred_at < (SELECT e1 FROM rng)),
+       dm AS (
+         SELECT mv.shop_id, mv.batch_id, mv.d,
+                (array_agg(mv.after_qty ORDER BY mv.occurred_at DESC, mv.seq DESC, mv.id DESC))[1] AS last_after,
+                COUNT(*)::int AS moves,
+                COALESCE(-SUM(mv.delta) FILTER (WHERE mv.cat = 'SALE'), 0)::int AS ledger_sold,
+                COALESCE(SUM(mv.delta) FILTER (WHERE mv.cat IN ('PURCHASE_RECEIPT', 'STOCK_ADDED')), 0)::int AS received,
+                COALESCE(SUM(mv.delta) FILTER (WHERE mv.cat = 'RETURN_RESTOCKED'), 0)::int AS returned,
+                COALESCE(SUM(mv.delta) FILTER (WHERE mv.cat NOT IN ${NOT_ADJUSTMENT}), 0)::int AS ledger_adjust,
+                COALESCE(SUM(mv.delta), 0)::int AS net_delta
+           FROM mv GROUP BY 1, 2, 3),
+       sold_b AS (
+         SELECT i.shop_id, i.batch_id, s.date AS d,
+                COALESCE(SUM(i.quantity) FILTER (WHERE s.status <> 'voided'), 0)::int AS gross_sold,
+                COALESCE(SUM(i.quantity) FILTER (WHERE s.status = 'voided'), 0)::int AS voided_units
+           FROM ${R.sales} s JOIN ${R.items} i ON i.shop_id = s.shop_id AND i.sale_id = s.id
+           JOIN meds m ON m.shop_id = i.shop_id AND m.id = i.medicine_id
+          WHERE s.date BETWEEN $2::date AND $3::date GROUP BY 1, 2, 3),
+       g AS (
+         SELECT ab.shop_id, ab.medicine_id, ab.batch_id, ab.batch_number, ab.expiry_date, ab.anchor_at, ab.pre_unknown, ab.base_qty,
+                days.d, days.s, days.e, dm.last_after, COALESCE(dm.moves, 0) AS moves, COALESCE(dm.ledger_sold, 0) AS ledger_sold,
+                COALESCE(dm.received, 0) AS received, COALESCE(dm.returned, 0) AS returned, COALESCE(dm.ledger_adjust, 0) AS ledger_adjust,
+                COALESCE(dm.net_delta, 0) AS net_delta, COALESCE(sb.gross_sold, 0) AS gross_sold, COALESCE(sb.voided_units, 0) AS voided_units
+           FROM ab CROSS JOIN days
+           LEFT JOIN dm ON dm.shop_id = ab.shop_id AND dm.batch_id = ab.batch_id AND dm.d = days.d
+           LEFT JOIN sold_b sb ON sb.shop_id = ab.shop_id AND sb.batch_id = ab.batch_id AND sb.d = days.d),
+       g1 AS (SELECT g.*, COUNT(g.last_after) OVER (PARTITION BY g.shop_id, g.batch_id ORDER BY g.d) AS grp FROM g),
+       g2 AS (SELECT g1.*, FIRST_VALUE(g1.last_after) OVER (PARTITION BY g1.shop_id, g1.batch_id, g1.grp ORDER BY g1.d) AS carried FROM g1),
+       g3 AS (SELECT g2.*, LAG(g2.carried) OVER (PARTITION BY g2.shop_id, g2.batch_id ORDER BY g2.d) AS carried_prev FROM g2),
+       bd AS (
+         SELECT g3.*,
+                CASE WHEN g3.s < g3.anchor_at THEN CASE WHEN g3.pre_unknown THEN NULL ELSE 0 END
+                     ELSE COALESCE(g3.carried_prev, g3.base_qty) END AS opening,
+                CASE WHEN g3.e <= g3.anchor_at THEN CASE WHEN g3.pre_unknown THEN NULL ELSE 0 END
+                     ELSE COALESCE(g3.carried, g3.base_qty) END AS closing
+           FROM g3),
+       sold_m AS (
+         SELECT i.shop_id, i.medicine_id, s.date AS d,
+                COALESCE(SUM(i.quantity) FILTER (WHERE s.status <> 'voided'), 0)::int AS gross_sold,
+                COALESCE(SUM(i.quantity) FILTER (WHERE s.status = 'voided'), 0)::int AS voided_units,
+                COUNT(DISTINCT s.id) FILTER (WHERE s.status <> 'voided')::int AS receipts
+           FROM ${R.sales} s JOIN ${R.items} i ON i.shop_id = s.shop_id AND i.sale_id = s.id
+           JOIN meds m ON m.shop_id = i.shop_id AND m.id = i.medicine_id
+          WHERE s.date BETWEEN $2::date AND $3::date GROUP BY 1, 2, 3),
+       cat_m AS (
+         SELECT c.shop_id, c.medicine_id, c.d, jsonb_object_agg(c.cat, jsonb_build_object('qty', c.qty, 'n', c.n)) AS cats
+           FROM (SELECT mv.shop_id, mv.medicine_id, mv.d, mv.cat, SUM(mv.delta)::int AS qty, COUNT(*)::int AS n
+                   FROM mv WHERE mv.cat NOT IN ${NOT_ADJUSTMENT} GROUP BY 1, 2, 3, 4) c
+          GROUP BY 1, 2, 3),
+       bm AS (
+         SELECT bd.shop_id, bd.medicine_id, bd.d,
+                CASE WHEN bool_or(bd.opening IS NULL) THEN NULL ELSE SUM(bd.opening) END::int AS opening,
+                CASE WHEN bool_or(bd.closing IS NULL) THEN NULL ELSE SUM(bd.closing) END::int AS closing,
+                SUM(bd.moves)::int AS moves, SUM(bd.ledger_sold)::int AS ledger_sold, SUM(bd.received)::int AS received,
+                SUM(bd.returned)::int AS returned, SUM(bd.ledger_adjust)::int AS ledger_adjust, SUM(bd.net_delta)::int AS net_delta,
+                COUNT(*)::int AS batches
+           FROM bd GROUP BY 1, 2, 3),
+       md AS (
+         SELECT m.shop_id, m.id AS medicine_id, m.name, m.generic_name, m.brand_name, m.barcode, m.sku, m.status AS medicine_status, days.d,
+                CASE WHEN bm.batches IS NULL THEN 0 ELSE bm.opening END AS opening,
+                CASE WHEN bm.batches IS NULL THEN 0 ELSE bm.closing END AS closing,
+                COALESCE(bm.moves, 0) AS moves, COALESCE(bm.ledger_sold, 0) AS ledger_sold, COALESCE(bm.received, 0) AS received,
+                COALESCE(bm.returned, 0) AS returned, COALESCE(bm.ledger_adjust, 0) AS ledger_adjust, COALESCE(bm.net_delta, 0) AS net_delta,
+                COALESCE(sm.gross_sold, 0) AS gross_sold, COALESCE(sm.voided_units, 0) AS voided_units, COALESCE(sm.receipts, 0) AS receipts,
+                cm.cats
+           FROM meds m CROSS JOIN days
+           LEFT JOIN bm ON bm.shop_id = m.shop_id AND bm.medicine_id = m.id AND bm.d = days.d
+           LEFT JOIN sold_m sm ON sm.shop_id = m.shop_id AND sm.medicine_id = m.id AND sm.d = days.d
+           LEFT JOIN cat_m cm ON cm.shop_id = m.shop_id AND cm.medicine_id = m.id AND cm.d = days.d)`;
+}
+var WEEKDAYS = ["SUNDAY", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY"];
+var MONTHS = ["JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY", "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER"];
+var heading = (d) => {
+  const x = /* @__PURE__ */ new Date(`${d}T00:00:00Z`);
+  return `${WEEKDAYS[x.getUTCDay()]}, ${x.getUTCDate()} ${MONTHS[x.getUTCMonth()]} ${x.getUTCFullYear()}`;
+};
+var isoDay = (v) => v instanceof Date ? `${v.getFullYear()}-${String(v.getMonth() + 1).padStart(2, "0")}-${String(v.getDate()).padStart(2, "0")}` : String(v).slice(0, 10);
+function toRow(r, shops) {
+  const date2 = isoDay(r.d);
+  const known = r.opening !== null && r.closing !== null;
+  const gross = Number(r.gross_sold) || 0;
+  const base = {
+    date: date2,
+    heading: heading(date2),
+    shop_id: r.shop_id,
+    shop_code: shops.get(r.shop_id)?.shop_code ?? null,
+    shop_name: shops.get(r.shop_id)?.shop_name ?? null,
+    medicine_id: r.medicine_id,
+    medicine_name: r.name,
+    generic_name: r.generic_name ?? null,
+    brand_name: r.brand_name ?? null,
+    barcode: r.barcode ?? null,
+    sku: r.sku ?? null,
+    gross_sold: gross,
+    voided_sale_units: Number(r.voided_units) || 0,
+    receipts: Number(r.receipts) || 0,
+    movements: Number(r.moves) || 0
+  };
+  if (!known) {
+    return { ...base, status: "INCOMPLETE", opening: r.opening ?? null, closing: r.closing ?? null, returned: null, net_sold: null, received: null, adjustments: null, adjustment_breakdown: [], difference: null };
+  }
+  const breakdown = Object.entries(r.cats || {}).map(([key, v]) => ({ key, label: CATEGORY_LABELS[key] || key, quantity: Number(v.qty) || 0, movements: Number(v.n) || 0 }));
+  const ledgerSold = Number(r.ledger_sold) || 0;
+  const voidedOut = Math.min(Math.max(0, ledgerSold - gross), Number(r.voided_units) || 0);
+  const unexplained = ledgerSold - gross - voidedOut;
+  if (voidedOut) breakdown.push({ key: "SALE_LATER_VOIDED", label: CATEGORY_LABELS.SALE_LATER_VOIDED, quantity: -voidedOut, movements: 0 });
+  if (unexplained) {
+    breakdown.push({ key: "SALE_LEDGER_DIFFERENCE", label: unexplained > 0 ? CATEGORY_LABELS.SALE_LEDGER_DIFFERENCE : "Sales recorded without a stock movement", quantity: -unexplained, movements: 0 });
+  }
+  breakdown.sort((x, y) => Math.abs(y.quantity) - Math.abs(x.quantity) || x.label.localeCompare(y.label));
+  const adjustments = (Number(r.ledger_adjust) || 0) - voidedOut - unexplained;
+  const opening = Number(r.opening), closing = Number(r.closing), received = Number(r.received) || 0, returned = Number(r.returned) || 0;
+  const difference = closing - (opening - gross + returned + received + adjustments);
+  return {
+    ...base,
+    status: difference === 0 ? "OK" : "MISMATCH",
+    opening,
+    closing,
+    received,
+    returned,
+    net_sold: gross - returned,
+    adjustments,
+    adjustment_breakdown: breakdown,
+    difference: difference === 0 ? null : difference
+  };
+}
+var ACTIVE = `(md.moves > 0 OR md.gross_sold > 0 OR md.voided_units > 0)`;
+async function stockHistory(scope, query, opts = {}) {
+  const R = rel2(scope);
+  const today = await businessToday(scope);
+  const p = parseStockQuery(scope, query, today, opts);
+  const params = [scope.shopIds, p.from, p.to, p.shop, p.medicineId, p.tokens.length ? p.tokens : ["%"]];
+  const order = `md.d ${p.newestFirst ? "DESC" : "ASC"}, lower(md.name), md.medicine_id, md.shop_id`;
+  const res = (await scope.q.query(
+    `${gridSql(scope)},
+       f AS (SELECT md.* FROM md ${p.activityOnly ? `WHERE ${ACTIVE}` : ""})
+     SELECT (SELECT COUNT(*)::int FROM f) AS total,
+            (SELECT COALESCE(json_agg(x), '[]'::json) FROM (SELECT md.* FROM f md ORDER BY ${order} LIMIT $7 OFFSET $8) x) AS rows,
+            (SELECT COALESCE(json_agg(y ORDER BY y.d ${p.newestFirst ? "DESC" : "ASC"}, y.shop_id), '[]'::json) FROM (
+               SELECT md.d, md.shop_id,
+                      COUNT(*) FILTER (WHERE md.gross_sold > 0)::int AS medicines_sold,
+                      COALESCE(SUM(md.gross_sold), 0)::int AS units_sold,
+                      COUNT(*) FILTER (WHERE ${ACTIVE})::int AS medicines_with_activity,
+                      COUNT(*) FILTER (WHERE md.opening IS NULL OR md.closing IS NULL)::int AS incomplete,
+                      COALESCE(SUM(md.received) FILTER (WHERE md.opening IS NOT NULL AND md.closing IS NOT NULL), 0)::int AS units_received,
+                      COALESCE(SUM(md.returned) FILTER (WHERE md.opening IS NOT NULL AND md.closing IS NOT NULL), 0)::int AS units_returned,
+                      CASE WHEN bool_or(md.opening IS NULL) THEN NULL ELSE SUM(md.opening) END::int AS opening_units,
+                      CASE WHEN bool_or(md.closing IS NULL) THEN NULL ELSE SUM(md.closing) END::int AS closing_units,
+                      COALESCE(SUM(md.ledger_sold) FILTER (WHERE md.opening IS NOT NULL AND md.closing IS NOT NULL), 0)::int AS ledger_sold,
+                      COALESCE(SUM(md.gross_sold) FILTER (WHERE md.opening IS NOT NULL AND md.closing IS NOT NULL), 0)::int AS known_sold,
+                      COALESCE(SUM(md.ledger_adjust) FILTER (WHERE md.opening IS NOT NULL AND md.closing IS NOT NULL), 0)::int AS ledger_adjust
+                 FROM md GROUP BY md.d, md.shop_id) y) AS days`,
+    [...params, p.size, (p.page - 1) * p.size]
+  )).rows[0];
+  const shops = new Map((await scope.q.query(`SELECT * FROM ${R.shops} sh`, [scope.shopIds])).rows.map((x) => [x.shop_id, x]));
+  const rows = res.rows.map((r) => toRow(r, shops));
+  const ledger = await ledgerInfo(scope, p.from, p.to);
+  const byDay = /* @__PURE__ */ new Map();
+  for (const y of res.days) {
+    const date2 = isoDay(y.d);
+    const adjustments = y.ledger_adjust - (y.ledger_sold - y.known_sold);
+    const entry = {
+      shop_id: y.shop_id,
+      shop_code: shops.get(y.shop_id)?.shop_code ?? null,
+      shop_name: shops.get(y.shop_id)?.shop_name ?? null,
+      medicines_sold: y.medicines_sold,
+      units_sold: y.units_sold,
+      units_received: y.units_received,
+      units_returned: y.units_returned,
+      adjustments,
+      opening_units: y.opening_units,
+      closing_units: y.closing_units,
+      medicines_with_activity: y.medicines_with_activity,
+      incomplete_medicines: y.incomplete
+    };
+    if (!byDay.has(date2)) byDay.set(date2, []);
+    byDay.get(date2).push(entry);
+  }
+  const days = [...byDay.entries()].map(([date2, perShop]) => {
+    const sum = (k) => perShop.reduce((t, x) => t + (Number(x[k]) || 0), 0);
+    const anyNull = (k) => perShop.some((x) => x[k] === null);
+    return {
+      date: date2,
+      heading: heading(date2),
+      status: perShop.some((x) => x.incomplete_medicines > 0) ? "INCOMPLETE" : "OK",
+      summary: {
+        medicines_sold: sum("medicines_sold"),
+        units_sold: sum("units_sold"),
+        units_received: sum("units_received"),
+        units_returned: sum("units_returned"),
+        adjustments: sum("adjustments"),
+        medicines_with_activity: sum("medicines_with_activity"),
+        incomplete_medicines: sum("incomplete_medicines"),
+        // A combined stock figure across shops is labelled as such in the UI; per-shop figures stay in by_shop.
+        opening_units: anyNull("opening_units") ? null : sum("opening_units"),
+        closing_units: anyNull("closing_units") ? null : sum("closing_units")
+      },
+      by_shop: perShop,
+      boundaries: ledger.boundaries.filter((b) => b.date === date2)
+    };
+  });
+  return {
+    from: p.from,
+    to: p.to,
+    today,
+    timezone: TZ,
+    activity_only: p.activityOnly,
+    order: p.newestFirst ? "desc" : "asc",
+    page: p.page,
+    page_size: p.size,
+    total: res.total,
+    pages: Math.max(1, Math.ceil(res.total / p.size)),
+    days,
+    rows,
+    ledger: ledger.shops,
+    boundaries: ledger.boundaries
+  };
+}
+async function ledgerInfo(scope, from, to) {
+  const R = rel2(scope);
+  const shops = (await scope.q.query(
+    `SELECT a.shop_id, MAX(a.anchor_at) FILTER (WHERE a.pre_unknown AND a.anchor_at > '-infinity'::timestamptz) AS unknown_before,
+            to_char((MAX(a.anchor_at) FILTER (WHERE a.pre_unknown AND a.anchor_at > '-infinity'::timestamptz) AT TIME ZONE '${TZ}'), 'YYYY-MM-DD HH24:MI') AS unknown_before_local,
+            COUNT(*)::int AS batches, COUNT(*) FILTER (WHERE a.pre_unknown)::int AS imported_batches
+       FROM ${R.anchors} a GROUP BY a.shop_id`,
+    [scope.shopIds]
+  )).rows;
+  const ledger = shops.map((x) => {
+    const at = x.unknown_before ? new Date(x.unknown_before) : null;
+    let exactFrom = null;
+    if (at) {
+      const local = String(x.unknown_before_local);
+      const d = local.slice(0, 10);
+      exactFrom = local.slice(11) === "00:00" ? d : isoDay(new Date(Date.parse(`${d}T00:00:00Z`) + 864e5).toISOString());
+    }
+    return {
+      shop_id: x.shop_id,
+      batches: x.batches,
+      anchored_batches: x.imported_batches,
+      exact_from_date: exactFrom,
+      ledger_starts_at: at ? at.toISOString() : null,
+      note: at ? scope.mode === "local" ? `Stock balances are exact from ${exactFrom}. Earlier records were imported from the previous system without running balances: days before show sales only (INCOMPLETE STOCK HISTORY).` : `The online copy holds this shop's stock ledger from ${exactFrom} (sync start). Earlier days show sales only; the shop's own History has the full local ledger.` : "Every batch is covered by the movement ledger since it was created."
+    };
+  });
+  const boundaries = (await scope.q.query(
+    `SELECT b.shop_id, b.at, b.action, to_char((b.at AT TIME ZONE '${TZ}'), 'YYYY-MM-DD') AS d, to_char((b.at AT TIME ZONE '${TZ}'), 'HH24:MI') AS t, b.details->>'source' AS source
+       FROM ${R.boundaries} b WHERE (b.at AT TIME ZONE '${TZ}')::date BETWEEN $2::date AND $3::date ORDER BY b.at`,
+    [scope.shopIds, from, to]
+  )).rows.map((b) => ({
+    shop_id: b.shop_id,
+    date: b.d,
+    time: b.t,
+    at: b.at,
+    kind: b.action,
+    note: `Cloud stock rebase at ${b.t} (${b.action}${b.source ? `, source ${b.source}` : ""}): the online catalogue stock was reset. It is not a stock movement; the figures here follow the shop's own movement ledger and are not changed by it.`
+  }));
+  return { shops: ledger, boundaries };
+}
+async function stockHistoryDetail(scope, medicineId, query) {
+  if (!isValidUuid(medicineId)) throw new HttpError(400, "Medicine id must be a UUID.");
+  const R = rel2(scope);
+  const today = await businessToday(scope);
+  const date2 = str2(query.date, 10) || str2(query.from, 10) || today;
+  const p = parseStockQuery(scope, { date: date2, shop_id: query.shop_id }, today);
+  const shopIds = p.shop ? [p.shop] : scope.shopIds;
+  if (!p.shop && scope.shopIds.length > 1) throw new HttpError(400, "Choose the shop (shop_id) for the medicine detail.");
+  const params = [shopIds, p.from, p.to, shopIds[0], medicineId.toLowerCase(), ["%"]];
+  const grid = (await scope.q.query(
+    `${gridSql(scope)}
+     SELECT (SELECT row_to_json(x) FROM (SELECT md.* FROM md LIMIT 1) x) AS medicine,
+            (SELECT COALESCE(json_agg(b ORDER BY b.expiry_date NULLS LAST, b.batch_number), '[]'::json) FROM (
+               SELECT bd.batch_id, bd.batch_number, bd.expiry_date, bd.opening, bd.closing, bd.gross_sold, bd.voided_units, bd.ledger_sold,
+                      bd.received, bd.returned, bd.ledger_adjust, bd.moves FROM bd) b) AS batches`,
+    params
+  )).rows[0];
+  if (!grid.medicine) throw new HttpError(404, "Medicine not found in your history scope.");
+  const shops = new Map((await scope.q.query(`SELECT * FROM ${R.shops} sh`, [shopIds])).rows.map((x) => [x.shop_id, x]));
+  const summary = toRow(grid.medicine, shops);
+  const batches = grid.batches.map((b) => {
+    const known = b.opening !== null && b.closing !== null;
+    const voidedOut = Math.min(Math.max(0, b.ledger_sold - b.gross_sold), b.voided_units);
+    const adj = b.ledger_adjust - (b.ledger_sold - b.gross_sold);
+    return {
+      batch_id: b.batch_id,
+      batch_number: b.batch_number,
+      expiry_date: b.expiry_date ? isoDay(b.expiry_date) : null,
+      status: known ? "OK" : "INCOMPLETE",
+      opening: b.opening ?? null,
+      sold: b.gross_sold,
+      returned: known ? b.returned : null,
+      received: known ? b.received : null,
+      adjustments: known ? adj : null,
+      closing: b.closing ?? null,
+      voided_sale_units: voidedOut,
+      movements: b.moves
+    };
+  }).filter((b) => b.movements > 0 || b.sold > 0 || (b.opening ?? 0) !== 0 || (b.closing ?? 0) !== 0 || b.status === "INCOMPLETE");
+  const events = (await scope.q.query(
+    `SELECT x.id, x.occurred_at, to_char((x.occurred_at AT TIME ZONE '${TZ}'), 'HH24:MI:SS') AS t, x.movement_type, x.reason, ${CATEGORY} AS cat,
+            x.delta, x.before_qty, x.after_qty, x.reference_id, x.notes, u.name AS user_name, a.batch_number, (${R.post}) AS in_ledger
+       FROM ${R.moves} x
+       JOIN ${R.anchors} a ON a.shop_id = x.shop_id AND a.batch_id = x.batch_id
+       LEFT JOIN ${R.users} u ON u.shop_id = x.shop_id AND u.id = x.user_id
+      WHERE x.shop_id = $2::uuid AND x.medicine_id = $3::uuid
+        AND x.occurred_at >= ($4::date::timestamp AT TIME ZONE '${TZ}') AND x.occurred_at < (($4::date + 1)::timestamp AT TIME ZONE '${TZ}')
+      ORDER BY x.occurred_at, x.seq, x.id LIMIT 2000`,
+    [shopIds, shopIds[0], medicineId.toLowerCase(), p.from]
+  )).rows;
+  const voidedSales = (await scope.q.query(
+    `SELECT COUNT(DISTINCT s.id)::int AS n FROM ${R.sales} s JOIN ${R.items} i ON i.shop_id = s.shop_id AND i.sale_id = s.id
+      WHERE s.shop_id = $2::uuid AND i.medicine_id = $3::uuid AND s.date = $4::date AND s.status = 'voided'`,
+    [shopIds, shopIds[0], medicineId.toLowerCase(), p.from]
+  )).rows[0].n;
+  const ledger = await ledgerInfo(scope, p.from, p.to);
+  return {
+    date: p.from,
+    heading: heading(p.from),
+    shop_id: shopIds[0],
+    shop_code: shops.get(shopIds[0])?.shop_code ?? null,
+    shop_name: shops.get(shopIds[0])?.shop_name ?? null,
+    medicine: { id: summary.medicine_id, name: summary.medicine_name, generic_name: summary.generic_name, brand_name: summary.brand_name, barcode: summary.barcode, sku: summary.sku },
+    summary,
+    batches,
+    voided_sales: voidedSales,
+    events: events.map((e) => ({
+      time: e.t,
+      at: e.occurred_at,
+      type: e.cat,
+      label: CATEGORY_LABELS[e.cat] || e.movement_type,
+      movement_type: e.movement_type,
+      reason: e.reason || null,
+      change: Number(e.delta),
+      before: e.in_ledger ? e.before_qty : null,
+      after: e.in_ledger ? e.after_qty : null,
+      reference: e.reference_id ?? null,
+      user: e.user_name ?? null,
+      batch_number: e.batch_number,
+      notes: e.notes ?? null,
+      legacy_import: !e.in_ledger
+    })),
+    ledger: ledger.shops.filter((x) => x.shop_id === shopIds[0]),
+    boundaries: ledger.boundaries.filter((b) => b.shop_id === shopIds[0])
+  };
+}
+var csvCell2 = (v) => {
+  const t = v === null || v === void 0 ? "" : String(v);
+  return /[",\n\r]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t;
+};
+async function stockHistoryCsv(scope, query) {
+  const out = [];
+  for (let page = 1; ; page++) {
+    const r = await stockHistory(scope, { ...query, page, page_size: 5e3 }, { maxSize: 5e3 });
+    out.push(...r.rows);
+    if (page >= r.pages || out.length >= 2e5) break;
+  }
+  const multi = new Set(out.map((r) => r.shop_id)).size > 1 || scope.shopIds.length > 1;
+  const head = ["Date", "Day", ...multi ? ["Shop"] : [], "Medicine", "Barcode", "Opening", "Sold", "Returned", "Net sold", "Received", "Adjustments", "Remaining", "Status"];
+  const lines = out.map((r) => [
+    r.date,
+    r.heading.split(",")[0],
+    ...multi ? [r.shop_code] : [],
+    r.medicine_name,
+    r.barcode,
+    r.opening,
+    r.gross_sold,
+    r.returned,
+    r.net_sold,
+    r.received,
+    r.adjustments,
+    r.closing,
+    r.status === "INCOMPLETE" ? "INCOMPLETE STOCK HISTORY" : r.status
+  ].map(csvCell2).join(","));
+  return ["GIGA CHEMIST", "DAILY STOCK HISTORY", head.join(","), ...lines].join("\n");
+}
+
 // server/http/historyRoutes.ts
 var shopParam = (req) => typeof req.query.shop_id === "string" && req.query.shop_id ? req.query.shop_id.toLowerCase() : null;
 function buildHistoryRouter(deps) {
@@ -3490,6 +4035,11 @@ function buildHistoryRouter(deps) {
   }));
   r.get("/history/supplies", deps.canSupplies, handle("GET /history/supplies", (req) => deps.withScope(req, (s) => supplyHistory(s, req.query))));
   r.get("/history/supplies/:id", deps.canSupplies, handle("GET /history/supplies/:id", (req) => deps.withScope(req, (s) => supplyDetail(s, req.params.id))));
+  r.get("/history/stock", deps.canStockHistory, handle("GET /history/stock", (req) => deps.withScope(req, (s) => stockHistory(s, req.query))));
+  r.get("/history/stock/:medicineId", deps.canStockHistory, handle(
+    "GET /history/stock/:medicineId",
+    (req) => deps.withScope(req, (s) => stockHistoryDetail(s, req.params.medicineId, req.query))
+  ));
   const exportCsv = (kind) => handle(`GET /history/export/${kind}`, async (req, res) => {
     const csv = await deps.withScope(req, (s) => historyCsv(s, kind, req.query));
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
@@ -3498,6 +4048,12 @@ function buildHistoryRouter(deps) {
   });
   r.get("/history/export/sales", deps.canSales, exportCsv("sales"));
   r.get("/history/export/supplies", deps.canSupplies, exportCsv("supplies"));
+  r.get("/history/export/stock", deps.canStockHistory, deps.canStockExport, handle("GET /history/export/stock", async (req, res) => {
+    const csv = await deps.withScope(req, (s) => stockHistoryCsv(s, req.query));
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", 'attachment; filename="giga-daily-stock-history.csv"');
+    res.send(csv);
+  }));
   r.all("/history/*", (_req, res) => res.status(405).json({ error: "History is read only. Use void / return / refund (sales) or cancel (pending purchases).", code: "HISTORY_READ_ONLY" }));
   return r;
 }
@@ -3905,6 +4461,9 @@ function buildOnlineRouter() {
   r.use(buildHistoryRouter({
     canSales: requirePermission("sales.view_all"),
     canSupplies: requirePermission("stock.receive"),
+    // Cashier / Manager / Shop Admin: their own shop only (resolveShop already refused any other shop).
+    canStockHistory: requirePermission("history.stock.view"),
+    canStockExport: requirePermission("reports.view"),
     withScope: async (req, fn) => {
       const u = req.onlineUser;
       let shopIds;

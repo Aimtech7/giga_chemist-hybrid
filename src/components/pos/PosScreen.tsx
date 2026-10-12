@@ -16,6 +16,7 @@ import {
   ArrowRight,
   Filter,
   CheckCircle2,
+  History as HistoryIcon,
 } from 'lucide-react';
 import { db } from '../../db/dexie';
 import { allocateFefo } from '../../services/inventoryEngine';
@@ -29,6 +30,7 @@ import { apiFetch, ApiError } from '../../services/http';
 import { applyServerStockResult, refreshCacheAfterCommit } from '../../services/stockCache';
 import { CATALOG_REFRESHED_EVENT, isCatalogForCurrentShop } from '../../services/syncEngine';
 import { CatalogStatusBanner } from '../common/CatalogStatusBanner';
+import { navigateTo } from '../../services/navigation';
 import type {
   Medicine,
   MedicineBatch,
@@ -792,6 +794,15 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
           </div>
 
           <div className="flex items-center gap-2">
+            {/* Today's stock history (History -> Stock History, read only; every role incl. cashier). */}
+            <button
+              onClick={() => navigateTo('history', 'stock')}
+              className="px-2 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-white text-[11px] font-semibold flex items-center gap-1 cursor-pointer"
+              title="Today's stock history: sold, received, adjustments and remaining stock per medicine"
+            >
+              <HistoryIcon className="w-3 h-3" />
+              <span>Stock History</span>
+            </button>
             {heldSales.length > 0 && (
               <button
                 onClick={() => setIsHeldOpen(true)}

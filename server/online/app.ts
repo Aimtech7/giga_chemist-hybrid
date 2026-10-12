@@ -525,6 +525,9 @@ export function buildOnlineRouter() {
   r.use(buildHistoryRouter({
     canSales: requirePermission('sales.view_all'),
     canSupplies: requirePermission('stock.receive'),
+    // Cashier / Manager / Shop Admin: their own shop only (resolveShop already refused any other shop).
+    canStockHistory: requirePermission('history.stock.view'),
+    canStockExport: requirePermission('reports.view'),
     withScope: async (req, fn) => {
       const u = (req as OnlineRequest).onlineUser!;
       let shopIds: string[];

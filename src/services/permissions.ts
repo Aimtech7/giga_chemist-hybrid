@@ -24,6 +24,7 @@ const ROLE_PERMISSIONS: Record<UserRole, PermissionKey[]> = {
     'returns.request',
     'customers.manage',
     'expenses.manage',
+    'history.stock.view',
   ],
   MANAGER: [
     'medicine.view',
@@ -37,6 +38,7 @@ const ROLE_PERMISSIONS: Record<UserRole, PermissionKey[]> = {
     'returns.request',
     'customers.manage',
     'expenses.manage',
+    'history.stock.view',
   ],
   CASHIER: [
     'sales.create',
@@ -44,6 +46,7 @@ const ROLE_PERMISSIONS: Record<UserRole, PermissionKey[]> = {
     'medicine.view',
     'customers.manage',
     'returns.request',
+    'history.stock.view',
   ],
 };
 
@@ -95,11 +98,20 @@ export function canAccessModule(user: User | null | undefined, module: string): 
   }
 
   if (user.role === 'CASHIER') {
-    const allowedForCashier = ['dashboard', 'pos', 'medicines', 'customers', 'sales', 'returns'];
+    // 'history' = Stock History ONLY for a cashier (the Sales / Supply tabs stay Administrator / Manager).
+    const allowedForCashier = ['dashboard', 'pos', 'medicines', 'customers', 'sales', 'returns', 'history'];
     return allowedForCashier.includes(module);
   }
 
   return false;
+}
+
+/** History tabs: Sales / Supply history are Administrator / Manager; Stock History is every role. */
+export function canViewTransactionHistory(user: User | null | undefined): boolean {
+  return user?.role === 'ADMIN' || user?.role === 'MANAGER';
+}
+export function canViewStockHistory(user: User | null | undefined): boolean {
+  return hasPermission(user, 'history.stock.view');
 }
 
 /**

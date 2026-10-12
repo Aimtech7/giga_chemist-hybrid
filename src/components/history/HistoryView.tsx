@@ -4,19 +4,27 @@ import { apiDownload, apiFetch, ApiError } from '../../services/http';
 import { createRequestId, getShops, getServerMode, queueRemoteCommand, type OnlineShop } from '../../services/remoteAdmin';
 import { isAllShopsScope } from '../../services/shopContext';
 import { printThermalReceipt } from '../../services/receiptPrinter';
+import { canViewStockHistory, canViewTransactionHistory } from '../../services/permissions';
+import { StockHistoryView } from './StockHistoryView';
 import type { PharmacySettings, Sale, User } from '../../types';
 
 /**
- * HISTORY (Admin / Manager): every past sale and every supply / purchase, READ ONLY.
+ * HISTORY: Sales + Supply / Purchases (Admin / Manager) and Stock History (every role, incl. Cashier:
+ * quantities only, own shop). Every past sale and every supply / purchase, READ ONLY.
  * Filtering, totals and paging run on the server (large histories are never downloaded); one page of
  * lightweight rows reaches the browser and a sale's COMPLETE detail is loaded only when it is opened.
  * Every figure shown for a sale is the value stored AT THE TIME OF SALE (sale_items unit price,
  * discount, total, price mode, batch; the sale's own totals and payments) — never today's prices.
  * Completed sales have no Edit: corrections are Void, Return (approved under Returns) or refund.
  */
-export type HistoryTab = 'sales' | 'supplies';
-/** Filters a caller may open the list with (e.g. Daily Sold Medicines -> "View transactions"). */
-export interface HistoryFilters { medicine?: string; from?: string; to?: string; receipt?: string; cashier?: string; status?: string }
+export type HistoryTab = 'sales' | 'supplies' | 'stock';
+/**
+ * Filters a caller may open the list with, e.g. Stock History -> "View sales":
+ * { medicine_id, medicine_label, from, to, shop_id } = the receipts behind one day's Sold figure.
+ */
+export interface HistoryFilters {
+  medicine?: string; medicine_id?: string; medicine_label?: string; from?: string; to?: string; receipt?: string; cashier?: string; status?: string; shop_id?: string;
+}
 type Preset = 'today' | 'yesterday' | 'week' | 'month' | 'all' | 'custom';
 
 const day = (d: Date) => new Date(d.getTime() - d.getTimezoneOffset() * 60_000).toISOString().slice(0, 10);
@@ -45,8 +53,15 @@ const input = 'px-2.5 py-2 border border-slate-300 rounded-lg text-xs bg-white f
 export const HistoryView: React.FC<{ settings: PharmacySettings; currentUser: User; initialTab?: HistoryTab; initialFilters?: HistoryFilters | null }> = ({
   settings, currentUser, initialTab, initialFilters,
 }) => {
-  const [tab, setTab] = useState<HistoryTab>(initialTab || 'sales');
-  useEffect(() => setTab(initialTab || 'sales'), [initialTab]);
+  // Tabs this user may open: a cashier gets Stock History only (the server enforces the same).
+  const tabs = useMemo(() => ([
+    ...(canViewTransactionHistory(currentUser) ? [['sales', 'Sales'], ['supplies', 'Supply / Purchases']] : []),
+    ...(canViewStockHistory(currentUser) ? [['stock', 'Stock History']] : []),
+  ] as [HistoryTab, string][]), [currentUser]);
+  const allowed = (t?: HistoryTab) => (t && tabs.some(([id]) => id === t) ? t : tabs[0]?.[0] || 'stock');
+  const [tab, setTab] = useState<HistoryTab>(allowed(initialTab));
+  // Re-applied on every navigation request (new filters object), even when the requested tab is unchanged.
+  useEffect(() => setTab(allowed(initialTab)), [initialTab, initialFilters, tabs]); // eslint-disable-line react-hooks/exhaustive-deps
   const [online, setOnline] = useState(false);
   const [shops, setShops] = useState<OnlineShop[]>([]);
   const allShops = online && isAllShopsScope();
@@ -60,33 +75,41 @@ export const HistoryView: React.FC<{ settings: PharmacySettings; currentUser: Us
   return (
     <div className="flex-1 flex flex-col overflow-hidden bg-slate-50">
       <div className="px-3 pt-3 pb-2 bg-white border-b border-slate-200 shrink-0">
-        <h1 className="text-base font-bold text-slate-900">{tab === 'sales' ? 'Sales History' : 'Supply History'}</h1>
+        <h1 className="text-base font-bold text-slate-900">{tab === 'sales' ? 'Sales History' : tab === 'supplies' ? 'Supply History' : 'Stock History'}</h1>
         <p className="text-[11px] text-slate-500">
-          Every past transaction{allShops ? ' across ALL SHOPS' : ''}, exactly as recorded at the time — read only. Corrections use void / return (sales) or cancel (pending purchases), always audited.
+          {tab === 'stock'
+            ? `Daily stock per medicine${allShops ? ' for each shop' : ''}: opening, sold, returned, received, adjustments and the stock remaining at the end of each day — from the stock movement ledger, read only.`
+            : `Every past transaction${allShops ? ' across ALL SHOPS' : ''}, exactly as recorded at the time — read only. Corrections use void / return (sales) or cancel (pending purchases), always audited.`}
         </p>
         <div className="flex gap-1 mt-2 bg-slate-100 p-1 rounded-lg w-fit">
-          {([['sales', 'Sales'], ['supplies', 'Supply / Purchases']] as [HistoryTab, string][]).map(([id, label]) => (
+          {tabs.map(([id, label]) => (
             <button key={id} onClick={() => setTab(id)} className={`px-3 py-1.5 rounded-md text-xs font-semibold ${tab === id ? 'bg-white text-teal-800 shadow-xs' : 'text-slate-600'}`}>{label}</button>
           ))}
         </div>
       </div>
-      <HistoryList key={`${tab}-${JSON.stringify(initialFilters || {})}`} kind={tab} settings={settings} currentUser={currentUser} online={online} allShops={allShops} shops={shops}
-        initialFilters={tab === 'sales' ? initialFilters || null : null} />
+      {tab === 'stock' ? (
+        <StockHistoryView key={`stock-${JSON.stringify(initialFilters || {})}`} settings={settings} currentUser={currentUser} online={online} allShops={allShops} shops={shops}
+          initialFilters={initialTab === 'stock' ? initialFilters || null : null} />
+      ) : (
+        <HistoryList key={`${tab}-${JSON.stringify(initialFilters || {})}`} kind={tab} settings={settings} currentUser={currentUser} online={online} allShops={allShops} shops={shops}
+          initialFilters={initialTab === tab ? initialFilters || null : null} />
+      )}
     </div>
   );
 };
 
-const HistoryList: React.FC<{ kind: HistoryTab; settings: PharmacySettings; currentUser: User; online: boolean; allShops: boolean; shops: OnlineShop[]; initialFilters: HistoryFilters | null }> = ({
+const HistoryList: React.FC<{ kind: 'sales' | 'supplies'; settings: PharmacySettings; currentUser: User; online: boolean; allShops: boolean; shops: OnlineShop[]; initialFilters: HistoryFilters | null }> = ({
   kind, settings, currentUser, online, allShops, shops, initialFilters,
 }) => {
   const cur = settings.currency || 'KES';
   const money = (n: number | null | undefined) => (n === null || n === undefined ? '—' : `${cur} ${Number(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
   const startFilters = (): Record<string, string> => {
-    if (kind === 'supplies') return { status: 'received' };
-    const f: Record<string, string> = {};
-    for (const k of ['medicine', 'receipt', 'cashier', 'status'] as const) if (initialFilters?.[k]) f[k] = String(initialFilters[k]);
+    const f: Record<string, string> = kind === 'supplies' ? { status: 'received' } : {};
+    const keys = kind === 'sales' ? (['medicine', 'medicine_id', 'receipt', 'cashier', 'status', 'shop_id'] as const) : (['medicine', 'medicine_id', 'shop_id'] as const);
+    for (const k of keys) if (initialFilters?.[k]) f[k] = String(initialFilters[k]);
     return f;
   };
+  const medicineLabel = initialFilters?.medicine_label || null;
   const startRange = initialFilters && (initialFilters.from || initialFilters.to) ? { from: initialFilters.from || '', to: initialFilters.to || '' } : presetRange('month');
   const [preset, setPreset] = useState<Preset>(initialFilters && (initialFilters.from || initialFilters.to) ? 'custom' : 'month');
   const [range, setRange] = useState(startRange);
@@ -230,6 +253,12 @@ const HistoryList: React.FC<{ kind: HistoryTab; settings: PharmacySettings; curr
           </div>
         </div>
 
+        {applied.medicine_id && (
+          <div className="flex items-center gap-2 text-xs bg-teal-50 border border-teal-200 text-teal-900 rounded-lg px-3 py-2">
+            <span>Showing only {kind === 'sales' ? 'sales' : 'supplies'} of <b>{medicineLabel || 'the selected medicine'}</b> (opened from Stock History).</span>
+            <button onClick={() => { const { medicine_id: _m, ...rest } = applied; setApplied(rest); setF(rest); setPage(1); }} className="ml-auto underline font-semibold">Show all</button>
+          </div>
+        )}
         {error && <div className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded p-2">{error}</div>}
 
         {s && (
