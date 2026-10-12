@@ -49,6 +49,7 @@ const LOCAL = {
   movements: `(SELECT ($1::uuid[])[1] AS shop_id, mv.id, mv.medicine_id, mv.batch_id, mv.previous_quantity, mv.adjustment_quantity AS delta,
              mv.new_quantity, mv.movement_type, mv.reason, mv.reference_id, mv.notes, mv.created_at AS occurred_at FROM inventory_movements mv)`,
   audit: `(SELECT ($1::uuid[])[1] AS shop_id, a.action, a.entity, a.entity_id, a.user_name, a.created_at AS occurred_at, a.new_value FROM audit_logs a)`,
+  stock: `(SELECT ($1::uuid[])[1] AS shop_id, m.id AS medicine_id, COALESCE(m.current_stock, 0)::int AS quantity FROM medicines m)`,
 };
 
 const CLOUD = {
@@ -88,6 +89,8 @@ const CLOUD = {
   movements: `(SELECT mv.shop_id, mv.movement_id AS id, mv.medicine_id, mv.batch_id, mv.previous_quantity, mv.delta, mv.new_quantity, mv.movement_type,
              mv.reason, mv.reference_id, mv.notes, mv.occurred_at FROM giga_cloud.inventory_movements mv WHERE mv.shop_id = ANY($1::uuid[]))`,
   audit: `(SELECT a.shop_id, a.action, a.entity, a.entity_id, a.user_name, a.occurred_at, a.new_value FROM giga_cloud.audit_events a WHERE a.shop_id = ANY($1::uuid[]))`,
+  stock: `(SELECT s.shop_id, s.medicine_id, SUM(CASE WHEN s.has_baseline THEN s.baseline_quantity + s.delta_since_baseline ELSE COALESCE(s.last_reported_quantity, 0) END)::int AS quantity
+             FROM giga_cloud.stock_levels s WHERE s.shop_id = ANY($1::uuid[]) GROUP BY s.shop_id, s.medicine_id)`,
 };
 
 type Rel = typeof LOCAL;
@@ -518,4 +521,82 @@ export async function historyCsv(scope: HistoryScope, kind: 'sales' | 'supplies'
   if (!rows.length) return '';
   const cols = Object.keys(rows[0]).filter((k) => !k.endsWith('_id') || k === 'shop_id');
   return [cols.join(','), ...rows.slice(0, EXPORT_MAX_ROWS).map((r) => cols.map((c) => csvCell(r[c])).join(','))].join('\n');
+}
+
+// =============================================================================
+// SOLD MEDICINES (POS "Today's Sold Medicines"; any business date for Administrators / Managers)
+// =============================================================================
+// Per medicine for ONE business date (Africa/Nairobi): retail / wholesale units, gross sold, units
+// returned from that day's sales (APPROVED returns), net sold, current stock and transaction count.
+// Voided sales are excluded. Revenue / cost / profit only when the scope includes costs (Administrator).
+// Quantities only for everyone else (a cashier sees operational numbers, never money).
+export async function soldMedicines(scope: HistoryScope, query: Record<string, unknown>, opts: { allowDate: boolean }) {
+  const R = rel(scope);
+  const requested = str(query.date, 10);
+  if (requested && (!DATE_RE.test(requested) || new Date(`${requested}T00:00:00Z`).toISOString().slice(0, 10) !== requested)) {
+    throw new HttpError(400, 'date must be a valid YYYY-MM-DD date.');
+  }
+  const today = (await scope.q.query(`SELECT to_char(now() AT TIME ZONE 'Africa/Nairobi', 'YYYY-MM-DD') AS d`)).rows[0].d as string;
+  const date = opts.allowDate && requested ? requested : today;
+  const w = new Where(scope.shopIds);
+  w.add((p) => `s.date = ${p}::date`, date);
+  w.raw(`s.status <> 'voided'`);
+  shopFilter(w, scope, 's', query);
+  const search = str(query.search);
+  const searchCond = search ? `WHERE m.name ILIKE $${w.params.length + 1} OR m.generic_name ILIKE $${w.params.length + 1} OR m.barcode ILIKE $${w.params.length + 1}` : '';
+  const params = search ? [...w.params, like(search)] : w.params;
+  const mode = `UPPER(COALESCE(i.price_mode, s.price_mode, 'RETAIL'))`;
+  const rows = (await scope.q.query(
+    `WITH day_sales AS (SELECT s.shop_id, s.id FROM ${R.sales} s ${w.sql}),
+          sold AS (
+            SELECT i.shop_id, i.medicine_id,
+                   COALESCE(SUM(i.quantity) FILTER (WHERE ${mode} <> 'WHOLESALE'), 0)::int AS retail_qty,
+                   COALESCE(SUM(i.quantity) FILTER (WHERE ${mode} = 'WHOLESALE'), 0)::int AS wholesale_qty,
+                   COALESCE(SUM(i.quantity), 0)::int AS gross_sold,
+                   COUNT(DISTINCT i.sale_id)::int AS transactions,
+                   COALESCE(SUM(i.total), 0) AS revenue,
+                   COALESCE(SUM(i.cost_price_snapshot * i.quantity), 0) AS cost
+              FROM ${R.items} i
+              JOIN ${R.sales} s ON s.shop_id = i.shop_id AND s.id = i.sale_id
+              JOIN day_sales d ON d.shop_id = i.shop_id AND d.id = i.sale_id
+             GROUP BY i.shop_id, i.medicine_id),
+          ret AS (
+            SELECT r.shop_id, r.medicine_id, COALESCE(SUM(COALESCE(r.approved_quantity, r.quantity)), 0)::int AS qty, COALESCE(SUM(r.refund_amount), 0) AS refunds
+              FROM ${R.returns} r JOIN day_sales d ON d.shop_id = r.shop_id AND d.id = r.sale_id
+             WHERE r.status = 'APPROVED'
+             GROUP BY r.shop_id, r.medicine_id)
+     SELECT sold.shop_id, sh.shop_code, sold.medicine_id, m.name, m.generic_name, m.barcode,
+            sold.retail_qty, sold.wholesale_qty, sold.gross_sold, COALESCE(ret.qty, 0) AS returned,
+            sold.gross_sold - COALESCE(ret.qty, 0) AS net_sold, COALESCE(st.quantity, 0) AS current_stock, sold.transactions,
+            sold.revenue, COALESCE(ret.refunds, 0) AS refunds, sold.cost
+       FROM sold
+       LEFT JOIN ${R.medicines} m ON m.shop_id = sold.shop_id AND m.id = sold.medicine_id
+       LEFT JOIN ret ON ret.shop_id = sold.shop_id AND ret.medicine_id = sold.medicine_id
+       LEFT JOIN ${R.stock} st ON st.shop_id = sold.shop_id AND st.medicine_id = sold.medicine_id
+       LEFT JOIN ${R.shops} sh ON sh.shop_id = sold.shop_id
+       ${searchCond}
+      ORDER BY sold.gross_sold DESC, m.name
+      LIMIT 3000`, params)).rows;
+  const items = rows.map((r: any) => ({
+    shop_id: r.shop_id, shop_code: r.shop_code, medicine_id: r.medicine_id, name: r.name || '(unknown medicine)', generic_name: r.generic_name, barcode: r.barcode,
+    retail_qty: r.retail_qty, wholesale_qty: r.wholesale_qty, gross_sold: r.gross_sold, returned: r.returned, net_sold: r.net_sold,
+    current_stock: r.current_stock, transactions: r.transactions,
+    ...(scope.includeCost ? { revenue: num(r.revenue), refunds: num(r.refunds), cost: num(r.cost), gross_profit: num(Number(r.revenue) - Number(r.refunds) - Number(r.cost)) } : {}),
+  }));
+  const sum = (k: string) => items.reduce((t: number, x: any) => t + Number(x[k] || 0), 0);
+  // Sales that contain at least one of the listed medicines (the search narrows it too).
+  const tx = (await scope.q.query(
+    `WITH day_sales AS (SELECT s.shop_id, s.id FROM ${R.sales} s ${w.sql})
+     SELECT COUNT(DISTINCT (i.shop_id, i.sale_id))::int AS n
+       FROM ${R.items} i JOIN day_sales d ON d.shop_id = i.shop_id AND d.id = i.sale_id
+       LEFT JOIN ${R.medicines} m ON m.shop_id = i.shop_id AND m.id = i.medicine_id
+       ${searchCond}`, params)).rows[0].n;
+  return {
+    date, is_today: date === today, items,
+    totals: {
+      medicines: items.length, retail_qty: sum('retail_qty'), wholesale_qty: sum('wholesale_qty'), gross_sold: sum('gross_sold'),
+      returned: sum('returned'), net_sold: sum('net_sold'), transactions: tx,
+      ...(scope.includeCost ? { revenue: num(sum('revenue')), refunds: num(sum('refunds')), cost: num(sum('cost')), gross_profit: num(sum('gross_profit')) } : {}),
+    },
+  };
 }

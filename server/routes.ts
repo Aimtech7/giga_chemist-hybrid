@@ -1173,6 +1173,7 @@ apiRouter.use(buildHistoryRouter({
   // Stock History: its own narrow permission (cashiers included); the scope is always this shop.
   canStockHistory: requirePermission('history.stock.view'),
   canStockExport: requirePermission('reports.view'),
+  mayPickSoldDate: (req) => hasPermission((req as AuthenticatedRequest).userRole as any, 'sales.view_all'),
   withScope: withLocalScope,
   auditReprint: async (req, sale) => {
     const a = saleActor(req as AuthenticatedRequest);

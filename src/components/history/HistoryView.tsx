@@ -7,6 +7,7 @@ import { printThermalReceipt } from '../../services/receiptPrinter';
 import { canViewAllShifts, canViewShifts, canViewStockHistory, canViewTransactionHistory } from '../../services/permissions';
 import { StockHistoryView } from './StockHistoryView';
 import { ShiftHistoryView } from './ShiftHistoryView';
+import { SoldMedicinesView } from './SoldMedicinesView';
 import type { PharmacySettings, Sale, User } from '../../types';
 
 /**
@@ -18,7 +19,7 @@ import type { PharmacySettings, Sale, User } from '../../types';
  * discount, total, price mode, batch; the sale's own totals and payments) — never today's prices.
  * Completed sales have no Edit: corrections are Void, Return (approved under Returns) or refund.
  */
-export type HistoryTab = 'sales' | 'supplies' | 'stock' | 'shifts';
+export type HistoryTab = 'sales' | 'supplies' | 'stock' | 'sold' | 'shifts';
 /**
  * Filters a caller may open the list with, e.g. Stock History -> "View sales":
  * { medicine_id, medicine_label, from, to, shop_id } = the receipts behind one day's Sold figure.
@@ -59,7 +60,7 @@ export const HistoryView: React.FC<{ settings: PharmacySettings; currentUser: Us
   // Tabs this user may open: a cashier gets Stock History only (the server enforces the same).
   const tabs = useMemo(() => ([
     ...(canViewTransactionHistory(currentUser) ? [['sales', 'Sales'], ['supplies', 'Supply / Purchases']] : []),
-    ...(canViewStockHistory(currentUser) ? [['stock', 'Stock History']] : []),
+    ...(canViewStockHistory(currentUser) ? [['stock', 'Stock History'], ['sold', 'Sold Medicines']] : []),
     // Cashier: "My Shifts" (own shifts only, read only); Administrator / Manager: every shift.
     ...(canViewShifts(currentUser) ? [['shifts', canViewAllShifts(currentUser) ? 'Shifts' : 'My Shifts']] : []),
   ] as [HistoryTab, string][]), [currentUser]);
@@ -80,10 +81,12 @@ export const HistoryView: React.FC<{ settings: PharmacySettings; currentUser: Us
   return (
     <div className="flex-1 flex flex-col overflow-hidden bg-slate-50">
       <div className="px-3 pt-3 pb-2 bg-white border-b border-slate-200 shrink-0">
-        <h1 className="text-base font-bold text-slate-900">{tab === 'sales' ? 'Sales History' : tab === 'supplies' ? 'Supply History' : tab === 'shifts' ? (canViewAllShifts(currentUser) ? 'Shift History' : 'My Shifts') : 'Stock History'}</h1>
+        <h1 className="text-base font-bold text-slate-900">{tab === 'sales' ? 'Sales History' : tab === 'supplies' ? 'Supply History' : tab === 'shifts' ? (canViewAllShifts(currentUser) ? 'Shift History' : 'My Shifts') : tab === 'sold' ? 'Sold Medicines' : 'Stock History'}</h1>
         <p className="text-[11px] text-slate-500">
           {tab === 'shifts'
             ? `Cashier shifts${allShops ? ' of every shop (each shift stays in its own shop)' : ''}: opening float, sales by payment method, refunds, till expenses, expected vs counted cash and the variance — read only.`
+            : tab === 'sold'
+            ? `Medicines sold on one business day${allShops ? ' per shop' : ''}: retail and wholesale units, returns, net sold, current stock and number of sales — voided sales excluded, read only.`
             : tab === 'stock'
             ? `Daily stock per medicine${allShops ? ' for each shop' : ''}: opening, sold, returned, received, adjustments and the stock remaining at the end of each day — from the stock movement ledger, read only.`
             : `Every past transaction${allShops ? ' across ALL SHOPS' : ''}, exactly as recorded at the time — read only. Corrections use void / return (sales) or cancel (pending purchases), always audited.`}
@@ -97,6 +100,8 @@ export const HistoryView: React.FC<{ settings: PharmacySettings; currentUser: Us
       {tab === 'shifts' ? (
         <ShiftHistoryView key={`shifts-${JSON.stringify(initialFilters || {})}`} settings={settings} currentUser={currentUser} online={online} allShops={allShops} shops={shops}
           initialShiftId={initialTab === 'shifts' ? initialFilters?.shift_id || null : null} />
+      ) : tab === 'sold' ? (
+        <SoldMedicinesView settings={settings} currentUser={currentUser} allShops={allShops} shops={shops} />
       ) : tab === 'stock' ? (
         <StockHistoryView key={`stock-${JSON.stringify(initialFilters || {})}`} settings={settings} currentUser={currentUser} online={online} allShops={allShops} shops={shops}
           initialFilters={initialTab === 'stock' ? initialFilters || null : null} />

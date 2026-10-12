@@ -570,6 +570,7 @@ export function buildOnlineRouter() {
     // Cashier / Manager / Shop Admin: their own shop only (resolveShop already refused any other shop).
     canStockHistory: requirePermission('history.stock.view'),
     canStockExport: requirePermission('reports.view'),
+    mayPickSoldDate: (req) => hasPermission((req as OnlineRequest).onlineUser?.role as any, 'sales.view_all'),
     withScope: withCloudScope,
     auditReprint: (req, sale) => securityEvent(req, 'RECEIPT_REPRINTED', (req as OnlineRequest).onlineUser?.email ?? null, (req as OnlineRequest).onlineUser?.id ?? null,
       { sale_id: sale.id, receipt_number: sale.receipt_number, sale_shop_id: sale.shop_id }),

@@ -825,6 +825,15 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
               <HistoryIcon className="w-3 h-3" />
               <span>Stock History</span>
             </button>
+            {/* Today's sold medicines (History -> Sold Medicines; quantities only for a cashier). */}
+            <button
+              onClick={() => navigateTo('history', 'sold')}
+              className="px-2 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-white text-[11px] font-semibold flex items-center gap-1 cursor-pointer"
+              title="Today's sold medicines: retail / wholesale units, returns, net sold and current stock"
+            >
+              <HistoryIcon className="w-3 h-3" />
+              <span>Today's Sold</span>
+            </button>
             {heldSales.length > 0 && (
               <button
                 onClick={() => setIsHeldOpen(true)}

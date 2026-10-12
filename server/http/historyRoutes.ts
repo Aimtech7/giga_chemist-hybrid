@@ -1,6 +1,6 @@
 import express, { type Request, type Response, type NextFunction } from 'express';
 import { HttpError } from '../db/client';
-import { historyCsv, saleDetail, salesHistory, supplyDetail, supplyHistory, type HistoryScope } from '../db/history';
+import { historyCsv, saleDetail, salesHistory, soldMedicines, supplyDetail, supplyHistory, type HistoryScope } from '../db/history';
 import { stockHistory, stockHistoryCsv, stockHistoryDetail } from '../db/stockHistory';
 
 /**
@@ -16,6 +16,8 @@ import { stockHistory, stockHistoryCsv, stockHistoryDetail } from '../db/stockHi
  *                                     received / adjustments / closing from the movement ledger
  *   GET  /history/stock/:medicineId   one medicine on one day: batches + movement timeline
  *   GET  /history/export/stock        CSV of the stock history filters
+ *   GET  /history/sold                SOLD MEDICINES of one business date (POS "Today's Sold Medicines"):
+ *                                     every stock-history role; other dates + money for Administrators only
  *
  * Stock History has its OWN permission (history.stock.view): a cashier may read it (quantities only,
  * own shop) without gaining sales history, supply history, costs or any write.
@@ -34,6 +36,8 @@ export interface HistoryDeps {
   canStockHistory: (req: Request, res: Response, next: NextFunction) => unknown;
   /** Permission check for the stock history CSV export (Administrator / Manager). */
   canStockExport: (req: Request, res: Response, next: NextFunction) => unknown;
+  /** True when the caller may look at another business date than today (sales.view_all). */
+  mayPickSoldDate: (req: Request) => boolean;
   /** Runs fn with the request's AUTHORIZED history scope (read-only connection). */
   withScope: <T>(req: Request, fn: (scope: HistoryScope) => Promise<T>) => Promise<T>;
   /** Records a receipt reprint in the audit trail (best effort). */
@@ -68,6 +72,9 @@ export function buildHistoryRouter(deps: HistoryDeps) {
   r.get('/history/stock', deps.canStockHistory, handle('GET /history/stock', (req) => deps.withScope(req, (s) => stockHistory(s, req.query as any))));
   r.get('/history/stock/:medicineId', deps.canStockHistory, handle('GET /history/stock/:medicineId',
     (req) => deps.withScope(req, (s) => stockHistoryDetail(s, req.params.medicineId, req.query as any))));
+
+  r.get('/history/sold', deps.canStockHistory, handle('GET /history/sold',
+    (req) => deps.withScope(req, (s) => soldMedicines(s, req.query as any, { allowDate: deps.mayPickSoldDate(req) }))));
 
   const exportCsv = (kind: 'sales' | 'supplies') => handle(`GET /history/export/${kind}`, async (req, res) => {
     const csv = await deps.withScope(req, (s) => historyCsv(s, kind, req.query as any));
