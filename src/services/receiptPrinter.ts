@@ -195,8 +195,17 @@ export function generateThermalReceiptHtml(sale: Sale, settings: PharmacySetting
   `;
 }
 
-export function printThermalReceipt(sale: Sale, settings: PharmacySettings): void {
-  const receiptHtml = generateThermalReceiptHtml(sale, settings);
+/**
+ * Prints a receipt. `copyLabel` (history reprint) stamps the receipt as a COPY: the same stored sale is
+ * re-rendered, nothing is created or changed.
+ */
+export function printThermalReceipt(sale: Sale, settings: PharmacySettings, opts: { copyLabel?: string } = {}): void {
+  let receiptHtml = generateThermalReceiptHtml(sale, settings);
+  if (opts.copyLabel) {
+    const label = opts.copyLabel.replace(/[<>&]/g, '');
+    receiptHtml = receiptHtml.replace(/<body([^>]*)>/i,
+      `<body$1><div style="text-align:center;font-weight:800;font-size:13px;border:2px dashed #000;padding:4px;margin-bottom:6px;">*** ${label} ***<br/><span style="font-weight:400;font-size:10px;">Printed ${new Date().toLocaleString()}</span></div>`);
+  }
   const iframe = document.createElement('iframe');
   iframe.style.position = 'fixed';
   iframe.style.bottom = '0';

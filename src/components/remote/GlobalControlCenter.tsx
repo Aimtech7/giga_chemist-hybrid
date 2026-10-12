@@ -4,6 +4,8 @@ import { getOverview, type Overview, type ShopOverview } from '../../services/re
 import { setCurrentShopLabel, setSelectedShop } from '../../services/shopContext';
 import { purgeShopScopedCache } from '../../services/syncEngine';
 import { ago, Pill } from './remoteUi';
+import { apiFetch } from '../../services/http';
+import { navigateTo } from '../../services/navigation';
 import type { PharmacySettings } from '../../types';
 
 /**
@@ -64,9 +66,13 @@ export const GlobalControlCenter: React.FC<{ settings: PharmacySettings; focusSh
               {data ? ` Updated ${ago(data.generated_at)}.` : ''}
             </p>
           </div>
-          <button onClick={() => void load()} className="p-2 rounded-lg hover:bg-white" aria-label="Refresh">
-            <RefreshCw className={`w-4 h-4 text-slate-500 ${loading ? 'animate-spin' : ''}`} />
-          </button>
+          <div className="flex items-center gap-1.5">
+            <button onClick={() => navigateTo('history', 'sales')} className="px-3 py-2 rounded-lg border border-slate-300 bg-white text-xs font-semibold">View All Sales</button>
+            <button onClick={() => navigateTo('history', 'supplies')} className="px-3 py-2 rounded-lg border border-slate-300 bg-white text-xs font-semibold">View Supply History</button>
+            <button onClick={() => void load()} className="p-2 rounded-lg hover:bg-white" aria-label="Refresh">
+              <RefreshCw className={`w-4 h-4 text-slate-500 ${loading ? 'animate-spin' : ''}`} />
+            </button>
+          </div>
         </div>
         {error && <div className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded p-2">{error}</div>}
         {!data && !error && <div className="text-xs text-slate-500 flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin" /> Loading shops…</div>}
@@ -140,7 +146,36 @@ export const GlobalControlCenter: React.FC<{ settings: PharmacySettings; focusSh
             </div>
           ))}
         </div>
+        {focusShopId !== undefined && <RecentActivity money={money} />}
       </div>
+    </div>
+  );
+};
+
+/** Shop dashboard: the latest sales and supplies of the selected shop, with a link to the full history. */
+const RecentActivity: React.FC<{ money: (n: number) => string }> = ({ money }) => {
+  const [sales, setSales] = useState<any[] | null>(null);
+  const [supplies, setSupplies] = useState<any[] | null>(null);
+  useEffect(() => {
+    // Last 30 days only: the summary over a whole multi-year history is not needed for "recent".
+    const from = new Date(Date.now() - 30 * 86_400_000).toISOString().slice(0, 10);
+    apiFetch<any>(`/api/history/sales?page_size=25&from=${from}`).then((d) => setSales(d.rows.slice(0, 6))).catch(() => setSales([]));
+    apiFetch<any>(`/api/history/supplies?page_size=25&from=${from}`).then((d) => setSupplies(d.rows.slice(0, 6))).catch(() => setSupplies([]));
+  }, []);
+  const box = (title: string, tab: string, rows: any[] | null, line: (r: any) => React.ReactNode) => (
+    <div className="bg-white rounded-xl border border-slate-200 p-3">
+      <div className="flex items-center justify-between mb-1">
+        <div className="text-sm font-bold text-slate-900">{title}</div>
+        <button onClick={() => navigateTo('history', tab)} className="text-xs font-semibold text-teal-800">View full history →</button>
+      </div>
+      {rows === null ? <div className="text-xs text-slate-500">Loading…</div> : rows.length === 0 ? <div className="text-xs text-slate-500">Nothing in the last 30 days.</div>
+        : rows.map((r) => <div key={r.id} className="text-xs py-1 border-t border-slate-100 first:border-0 flex justify-between gap-2">{line(r)}</div>)}
+    </div>
+  );
+  return (
+    <div className="grid gap-3 md:grid-cols-2">
+      {box('Recent sales', 'sales', sales, (r) => (<><span className="truncate">{r.date} {r.time?.slice(0, 5)} · {r.receipt_number} · {r.cashier_name || ''}</span><span className="font-semibold">{money(r.total)}</span></>))}
+      {box('Recent supplies', 'supplies', supplies, (r) => (<><span className="truncate">{r.received_date || r.order_date} · {r.order_number} · {r.supplier_name || ''}</span><span className="font-semibold">{money(r.total_amount)}</span></>))}
     </div>
   );
 };

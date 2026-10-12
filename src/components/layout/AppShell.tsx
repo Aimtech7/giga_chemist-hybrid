@@ -22,6 +22,7 @@ import {
   Smartphone,
   Menu,
   X,
+  History,
 } from 'lucide-react';
 import { PWAInstallButton } from '../common/PWAInstallButton';
 import { ChangePasswordModal } from '../users/ChangePasswordModal';
@@ -53,7 +54,8 @@ export type AppModule =
   | 'users'
   | 'audit'
   | 'settings'
-  | 'remote';
+  | 'remote'
+  | 'history';
 
 interface AppShellProps {
   currentModule: AppModule;
@@ -127,6 +129,7 @@ export const AppShell: React.FC<AppShellProps> = ({
     { id: 'expenses' as AppModule, label: 'Expenses', icon: Receipt },
     { id: 'sales' as AppModule, label: 'Sales History', icon: RotateCcw },
     { id: 'returns' as AppModule, label: 'Returns', icon: RotateCcw },
+    { id: 'history' as AppModule, label: 'History', icon: History },
     { id: 'reports' as AppModule, label: 'Reports', icon: BarChart3 },
     { id: 'users' as AppModule, label: 'Users', icon: ShieldCheck },
     { id: 'audit' as AppModule, label: 'Audit Logs', icon: FileText },
@@ -140,7 +143,7 @@ export const AppShell: React.FC<AppShellProps> = ({
     ['', ['dashboard' as AppModule]],
     ['Operations', ['medicines', 'inventory', 'batches', 'expiry', 'purchases'] as AppModule[]],
     ['Directory', ['suppliers', 'customers'] as AppModule[]],
-    ['Finance', ['sales', 'returns', 'expenses', 'reports'] as AppModule[]],
+    ['Finance', ['history', 'sales', 'returns', 'expenses', 'reports'] as AppModule[]],
     ['Administration', ['users', 'settings', 'audit'] as AppModule[]],
     ['System', ['remote'] as AppModule[]],
   ];

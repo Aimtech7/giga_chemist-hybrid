@@ -4,6 +4,7 @@ import { RemoteAdminPanel } from './RemoteAdminPanel';
 import { RemoteRecords } from './RemoteRecords';
 import { UsersTab } from './UserManagement';
 import { ReportsDashboard } from '../reports/ReportsDashboard';
+import { HistoryView, type HistoryTab } from '../history/HistoryView';
 import { isAllShopsScope, isGlobalAdminAccount, selectedShopId } from '../../services/shopContext';
 import type { PharmacySettings, User } from '../../types';
 
@@ -15,12 +16,14 @@ import type { PharmacySettings, User } from '../../types';
 const LABELS: Record<string, string> = {
   medicines: 'Medicines', inventory: 'Inventory', batches: 'Batches', expiry: 'Expiry', purchases: 'Purchases', suppliers: 'Suppliers',
   customers: 'Customers', sales: 'Sales', returns: 'Returns', expenses: 'Expenses', reports: 'Reports', users: 'Users', settings: 'Settings',
-  audit: 'Audit', remote: 'Remote Operations', stocktake: 'Physical count', pos: 'POS',
+  audit: 'Audit', remote: 'Remote Operations', stocktake: 'Physical count', pos: 'POS', history: 'History',
 };
 
-export const OnlineAdminModule: React.FC<{ module: string; currentUser: User; settings: PharmacySettings }> = ({ module, currentUser, settings }) => {
+export const OnlineAdminModule: React.FC<{ module: string; currentUser: User; settings: PharmacySettings; historyTab?: HistoryTab }> = ({ module, currentUser, settings, historyTab }) => {
   if (isAllShopsScope()) {
     if (module === 'dashboard') return <GlobalControlCenter settings={settings} />;
+    // History is read only: All Shops combines every shop (with a Shop column).
+    if (module === 'history') return <HistoryView settings={settings} currentUser={currentUser} initialTab={historyTab} />;
     return <SelectShopPrompt settings={settings} module={LABELS[module] || module} />;
   }
   const panel = (tab?: React.ComponentProps<typeof RemoteAdminPanel>['initialTab'], filter?: React.ComponentProps<typeof RemoteAdminPanel>['initialStockFilter']) => (
@@ -44,6 +47,8 @@ export const OnlineAdminModule: React.FC<{ module: string; currentUser: User; se
       return <RemoteRecords key={module} kind={module} settings={settings} />;
     case 'reports':
       return <ReportsDashboard currentUser={currentUser} settings={settings} />;
+    case 'history':
+      return <HistoryView settings={settings} currentUser={currentUser} initialTab={historyTab} />;
     case 'users':
       return isGlobalAdminAccount() ? (
         <div className="flex-1 overflow-y-auto bg-slate-50"><div className="max-w-2xl mx-auto p-3"><UsersTab currentUser={currentUser} /></div></div>

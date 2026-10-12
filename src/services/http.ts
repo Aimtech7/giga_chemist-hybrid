@@ -92,3 +92,31 @@ export async function apiFetch<T = any>(endpoint: string, options: ApiFetchOptio
   }
   return data as T;
 }
+
+/**
+ * Downloads a file from an authenticated endpoint (history CSV exports), with the same shop context
+ * headers as apiFetch. The browser saves it; nothing is cached.
+ */
+export async function apiDownload(endpoint: string, filename: string): Promise<void> {
+  if (!hasUsableToken()) {
+    expireSession('missing_or_expired_token');
+    throw new ApiError(401, 'Your session has expired. Please log in again.');
+  }
+  const headers: Record<string, string> = { Authorization: `Bearer ${getAuthToken()}` };
+  if (isAllShopsScope()) headers['X-GIGA-SCOPE'] = 'ALL';
+  else {
+    const shopId = selectedShopId();
+    if (shopId) headers['X-GIGA-SHOP-ID'] = shopId;
+  }
+  const res = await fetch(apiUrl(endpoint), { headers });
+  if (!res.ok) {
+    const data = await res.json().catch(() => null);
+    throw new ApiError(res.status, data?.error || `Download failed (HTTP ${res.status})`, data);
+  }
+  const blob = await res.blob();
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
