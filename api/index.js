@@ -532,7 +532,7 @@ function varianceLabel(variance) {
 }
 var LOCAL = {
   shops: `(SELECT si.shop_id, si.shop_code, COALESCE(si.shop_name, 'This shop') AS shop_name FROM shop_identity si WHERE si.shop_id = ANY($1::uuid[]))`,
-  shifts: `(SELECT ($1::uuid[])[1] AS shop_id, x.id, x.shift_number, x.cashier_id, u.name AS cashier_name, x.device_id, x.status,
+  shifts: `(SELECT ($1::uuid[])[1] AS shop_id, x.id, x.shift_number, x.cashier_id, COALESCE(user_name_at(x.cashier_id, x.opened_at), u.name) AS cashier_name, x.device_id, x.status,
              x.opened_at, x.opened_business_date, x.opening_float, x.opened_by_name, x.closed_at, x.closed_business_date, x.closed_by_name,
              x.close_method, x.admin_close_reason, x.total_transactions, x.total_sales, x.cash_sales, x.mpesa_sales, x.card_sales, x.bank_sales,
              x.other_sales, x.units_sold, x.voided_count, x.voided_total, x.returns_count, x.refund_total, x.cash_refunds, x.cash_expenses,
@@ -552,7 +552,7 @@ var LOCAL = {
 };
 var CLOUD = {
   shops: `(SELECT s.shop_id, s.shop_code, s.name AS shop_name FROM giga_cloud.shops s WHERE s.shop_id = ANY($1::uuid[]))`,
-  shifts: `(SELECT c.shop_id, c.shift_id AS id, c.shift_number, c.cashier_id, COALESCE(u.name, c.cashier_name) AS cashier_name, c.device_id, c.status,
+  shifts: `(SELECT c.shop_id, c.shift_id AS id, c.shift_number, c.cashier_id, COALESCE(c.cashier_name, u.name) AS cashier_name, c.device_id, c.status,
              c.opened_at, c.opened_business_date, c.opening_float, c.data->>'opened_by_name' AS opened_by_name, c.closed_at, c.closed_business_date,
              c.data->>'closed_by_name' AS closed_by_name, c.data->>'close_method' AS close_method, c.data->>'admin_close_reason' AS admin_close_reason,
              (c.data->>'total_transactions')::int AS total_transactions, (c.data->>'total_sales')::numeric AS total_sales,
@@ -1063,7 +1063,7 @@ function requirePriceMode(value, field) {
 }
 var SALE_COLUMNS = `
   s.id, s.branch_id, s.sale_number, s.receipt_number,
-  s.cashier_id, u.name AS cashier_name,
+  s.cashier_id, COALESCE(sale_cashier_name(s.id, s.cashier_id, s.created_at), u.name) AS cashier_name,
   s.customer_id, c.name AS customer_name, c.phone AS customer_phone,
   s.device_id, s.date, s.time,
   COALESCE(s.subtotal, 0)::float AS subtotal,
@@ -1414,8 +1414,8 @@ var RETURN_SELECT = `
          r.batch_id, b.batch_number, r.quantity::int AS quantity, r.unit_price::float AS unit_price,
          r.refund_amount::float AS refund_amount, r.requested_refund::float AS requested_refund,
          r.approved_quantity, r.restocked, r.reason, r.action, r.status,
-         r.user_id, u.name AS user_name, r.device_id, r.created_at,
-         r.reviewed_by, COALESCE(rv.name, r.reviewed_by_name) AS reviewed_by_name, r.reviewed_at, r.review_notes,
+         r.user_id, COALESCE(user_name_at(r.user_id, r.created_at), u.name) AS user_name, r.device_id, r.created_at,
+         r.reviewed_by, COALESCE(r.reviewed_by_name, rv.name) AS reviewed_by_name, r.reviewed_at, r.review_notes,
          r.refund_method, r.refund_shift_id,
          s.date AS sale_date, s.time AS sale_time, s.status AS sale_status, s.price_mode AS sale_price_mode,
          COALESCE(s.discount_percent, 0)::float AS sale_discount_percent,
@@ -1627,7 +1627,7 @@ function toExpense(r) {
 }
 async function getAllExpenses(q = pgPool) {
   const res = await q.query(
-    `SELECT e.*, e.amount::float AS amount, u.name AS user_name
+    `SELECT e.*, e.amount::float AS amount, COALESCE(user_name_at(e.user_id, e.created_at), u.name) AS user_name
      FROM expenses e LEFT JOIN users u ON e.user_id = u.id
      ORDER BY e.date DESC, e.created_at DESC LIMIT 2000`
   );
@@ -1691,7 +1691,26 @@ var HIGH_CONFLICT_TYPES = [
 var ALL_SHOPS_TYPES = ["PRICE_UPDATE", "MEDICINE_METADATA_UPDATE", "CATEGORY_UPSERT", "SETTINGS_UPDATE"];
 var STOCK_REMOVE_REASONS = ["Damaged", "Expired", "Lost", "Physical stock correction", "Other"];
 var MAX_STOCK_QUANTITY = 1e6;
-var ASSIGNABLE_ROLES = ["ADMIN", "CASHIER"];
+var ASSIGNABLE_ROLES = ["ADMIN", "MANAGER", "CASHIER"];
+var USER_PROFILE_FIELDS = ["name", "username", "email"];
+var STAFF_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+var STAFF_USERNAME_RE = /^[a-z0-9][a-z0-9._-]{2,49}$/;
+function staffProfileValue(field, v) {
+  if (field === "name") {
+    const n = typeof v === "string" ? v.trim() : "";
+    if (!n || n.length > 255) throw new HttpError(400, "name is required (max 255 characters).");
+    return n;
+  }
+  if (field === "email") {
+    const e = typeof v === "string" ? v.trim().toLowerCase() : "";
+    if (!STAFF_EMAIL_RE.test(e) || e.length > 255) throw new HttpError(400, "A valid email address is required.");
+    return e;
+  }
+  if (v === void 0 || v === null || typeof v === "string" && !v.trim()) return null;
+  const u = typeof v === "string" ? v.trim().toLowerCase() : "";
+  if (!STAFF_USERNAME_RE.test(u)) throw new HttpError(400, "username must be 3-50 characters: letters, digits, dot, underscore or hyphen.");
+  return u;
+}
 var PRICE_FIELDS = ["selling_price", "wholesale_price", "min_selling_price", "purchase_price"];
 var METADATA_FIELDS = [
   "name",
@@ -2198,6 +2217,27 @@ function validateCommandPayload(type, payload) {
       onlyKeys(p, ["user_id", "role", "reason"], "USER_ROLE_UPDATE");
       if (!ASSIGNABLE_ROLES.includes(p.role)) throw new HttpError(400, `role must be one of: ${ASSIGNABLE_ROLES.join(", ")}.`);
       return { user_id: uuid(p.user_id, "user_id"), role: p.role, reason: reasonText(p.reason, true) };
+    }
+    // Profile edit with optimistic concurrency: `expected` = what the Administrator SAW for every
+    // field being changed; the shop REJECTS the command when its row differs (no silent overwrite).
+    case "USER_PROFILE_UPDATE": {
+      onlyKeys(p, ["user_id", "name", "username", "email", "expected", "reason"], "USER_PROFILE_UPDATE");
+      const out = { user_id: uuid(p.user_id, "user_id") };
+      if (p.expected === void 0) throw new HttpError(400, "expected (the values the Administrator saw) is required.");
+      const exp = obj(p.expected);
+      onlyKeys(exp, USER_PROFILE_FIELDS, "USER_PROFILE_UPDATE expected");
+      const expected = {};
+      for (const f of USER_PROFILE_FIELDS) {
+        if (p[f] === void 0) continue;
+        out[f] = staffProfileValue(f, p[f]);
+        if (!(f in exp)) throw new HttpError(400, `expected.${f} is required when ${f} is changed.`);
+        expected[f] = staffProfileValue(f, exp[f]);
+      }
+      if (Object.keys(out).length === 1) throw new HttpError(400, "Nothing to change: give name, username or email.");
+      out.expected = expected;
+      const reason = reasonText(p.reason, false);
+      if (reason) out.reason = reason;
+      return out;
     }
     case "USER_SESSION_REVOKE": {
       onlyKeys(p, ["user_id", "reason"], "USER_SESSION_REVOKE");
@@ -3212,7 +3252,7 @@ function buildUserAdminRouter(deps) {
       `SELECT ${ACCOUNT_COLUMNS} FROM giga_cloud.online_users WHERE local_user_id = $1 AND account_type = 'SHOP_USER' AND shop_id = $2 FOR UPDATE`,
       [localUserId, shopId]
     )).rows[0] || null;
-    const profile = (await c.query(`SELECT name, email, role, active FROM giga_cloud.users WHERE shop_id = $1 AND user_id = $2`, [shopId, localUserId])).rows[0] || null;
+    const profile = (await c.query(`SELECT name, email, username, role, active FROM giga_cloud.users WHERE shop_id = $1 AND user_id = $2`, [shopId, localUserId])).rows[0] || null;
     if (!identity && !profile) {
       const elsewhere = (await c.query(`SELECT 1 FROM giga_cloud.online_users WHERE local_user_id = $1 UNION ALL SELECT 1 FROM giga_cloud.users WHERE user_id = $1 LIMIT 1`, [localUserId])).rows[0];
       throw new HttpError(elsewhere ? 409 : 404, elsewhere ? "That staff account belongs to another shop. Select its shop first." : "Staff account not found in the selected shop.");
@@ -3229,18 +3269,18 @@ function buildUserAdminRouter(deps) {
             WHERE account_type = 'GLOBAL_ADMIN' ORDER BY active DESC, email`
         )).rows;
         const staff = (await c.query(
-          `SELECT COALESCE(o.shop_id, p.shop_id) AS shop_id, s.shop_code, s.name AS shop_name,
+          `SELECT COALESCE(o.shop_id, p.shop_id) AS shop_id, s.shop_code, s.name AS shop_name, s.credential_sync_enabled,
                   COALESCE(o.local_user_id, p.user_id) AS local_user_id, o.id AS online_account_id,
                   COALESCE(p.name, o.name) AS name, COALESCE(p.email, o.email) AS email, COALESCE(o.username, p.username) AS username,
                   COALESCE(p.role, o.role) AS role, p.active AS shop_active, o.active AS online_active,
-                  (o.id IS NOT NULL AND o.active) AS online_login_enabled, o.credential_version, o.last_login_at,
+                  (o.id IS NOT NULL AND o.active) AS online_login_enabled, o.credential_version, o.credential_source, o.credential_updated_at, o.last_login_at, o.deactivated_at,
                   (SELECT COUNT(*)::int FROM giga_cloud.commands cm WHERE cm.shop_id = COALESCE(o.shop_id, p.shop_id)
                       AND cm.status IN ('PENDING', 'DELIVERED') AND cm.payload ->> 'user_id' = COALESCE(o.local_user_id, p.user_id)::text) AS open_commands
              FROM (SELECT * FROM giga_cloud.online_users WHERE account_type = 'SHOP_USER' AND local_user_id IS NOT NULL) o
              FULL JOIN giga_cloud.users p ON p.shop_id = o.shop_id AND p.user_id = o.local_user_id
              LEFT JOIN giga_cloud.shops s ON s.shop_id = COALESCE(o.shop_id, p.shop_id)
             WHERE $1::uuid IS NULL OR COALESCE(o.shop_id, p.shop_id) = $1::uuid
-            ORDER BY s.shop_code, 6`,
+            ORDER BY s.shop_code, 7`,
           [shopFilter2]
         )).rows;
         return { shop_filter: shopFilter2 ?? "all", global_admins: globals, shop_users: staff };
@@ -3248,6 +3288,78 @@ function buildUserAdminRouter(deps) {
         mapDbError(err);
       }
     });
+  }));
+  async function publishPreview(c, shopId) {
+    const shop = (await c.query("SELECT shop_id, shop_code, name, credential_sync_enabled FROM giga_cloud.shops WHERE shop_id = $1", [shopId])).rows[0];
+    if (!shop) throw new HttpError(404, "Shop not found.");
+    const hb = (await c.query(`SELECT reported_at, status -> 'staff' AS staff FROM giga_cloud.shop_runtime_status WHERE shop_id = $1`, [shopId])).rows[0];
+    const staff = Array.isArray(hb?.staff) ? hb.staff : null;
+    const base = {
+      shop: { shop_id: shop.shop_id, shop_code: shop.shop_code, name: shop.name },
+      credential_sync_enabled: shop.credential_sync_enabled,
+      heartbeat_at: hb?.reported_at ?? null
+    };
+    if (!staff) return { ...base, ready: false, note: "The shop has not reported its staff yet (it needs this release and local migration 016).", accounts: [], summary: null };
+    const online = (await c.query(
+      `SELECT id, account_type, shop_id, local_user_id, lower(email) AS email, lower(username) AS username, active FROM giga_cloud.online_users`
+    )).rows;
+    const accounts = staff.map((u) => {
+      const match = online.find((o) => o.shop_id === shopId && o.local_user_id === u.local_user_id) || null;
+      const emailOwner = online.find((o) => o.email === u.email && o.id !== match?.id) || null;
+      const usernameInShop = u.username ? online.find((o) => o.shop_id === shopId && o.username === u.username && o.id !== match?.id) || null : null;
+      const usernameElsewhere = u.username ? online.some((o) => o.username === u.username && o.shop_id !== shopId) : false;
+      const status = !u.publishable ? "NO_PASSWORD_HASH" : match ? "MATCHED" : emailOwner ? "EMAIL_CONFLICT" : "TO_CREATE";
+      return {
+        local_user_id: u.local_user_id,
+        name: u.name,
+        email: u.email,
+        username: u.username,
+        role: u.role,
+        active: u.active,
+        status,
+        online_account_id: match?.id ?? null,
+        email_conflict_with: emailOwner ? { account_type: emailOwner.account_type, same_shop: emailOwner.shop_id === shopId } : null,
+        username_conflict: Boolean(usernameInShop),
+        username_ambiguous_online: usernameElsewhere,
+        pending_publish: Boolean(u.pending)
+      };
+    });
+    const count = (f) => accounts.filter(f).length;
+    return {
+      ...base,
+      ready: true,
+      accounts,
+      summary: {
+        local_users: accounts.length,
+        cloud_matches: count((a) => a.status === "MATCHED"),
+        cloud_identities_to_create: count((a) => a.status === "TO_CREATE"),
+        username_conflicts: count((a) => a.username_conflict),
+        usernames_also_used_by_another_shop: count((a) => a.username_ambiguous_online),
+        email_conflicts: count((a) => a.status === "EMAIL_CONFLICT"),
+        inactive_users: count((a) => !a.active),
+        accounts_without_usable_password: count((a) => a.status === "NO_PASSWORD_HASH")
+      }
+    };
+  }
+  r.get("/admin/accounts/publish-preview", requireGlobalAdmin, route2("GET publish-preview", async (req) => deps.withCloud((c) => publishPreview(c, deps.shopId(req)))));
+  r.post("/admin/accounts/publish-existing", requireGlobalAdmin, route2("POST publish-existing", async (req) => {
+    const shopId = deps.shopId(req);
+    const out = await tx(deps, async (c) => {
+      const preview = await publishPreview(c, shopId);
+      if (String(req.body?.confirm_shop_code || "").trim().toUpperCase() !== String(preview.shop.shop_code || "").toUpperCase()) {
+        throw new HttpError(400, `Type the shop code (${preview.shop.shop_code}) to confirm.`);
+      }
+      if (!preview.ready) throw new HttpError(409, "The shop has not reported its staff yet (it needs this release and local migration 016).");
+      await c.query("UPDATE giga_cloud.shops SET credential_sync_enabled = TRUE WHERE shop_id = $1", [shopId]);
+      return preview;
+    });
+    await deps.securityEvent(req, "SHOP_USERS_PUBLISH_ENABLED", req.onlineUser.email, req.onlineUser.id, { shop_id: shopId, summary: out.summary });
+    return {
+      enabled: true,
+      already_enabled: out.credential_sync_enabled,
+      summary: out.summary,
+      note: "The shop publishes its staff within about 10 minutes while online (it re-checks the switch every 10 minutes)."
+    };
   }));
   r.post("/admin/accounts/shop-users", requireGlobalAdmin, route2("POST /admin/accounts/shop-users", async (req, res) => {
     const b = req.body || {};
@@ -3382,6 +3494,90 @@ function buildUserAdminRouter(deps) {
     const { shopId: _s, email: _e, ...body } = out;
     return body;
   }));
+  r.post("/admin/accounts/shop-users/:localUserId/profile", requireGlobalAdmin, route2("POST shop-user profile", async (req) => {
+    const b = req.body || {};
+    const exp = b.expected && typeof b.expected === "object" && !Array.isArray(b.expected) ? b.expected : null;
+    if (!exp) throw new HttpError(400, "expected (the values you saw) is required.");
+    const reason = typeof b.reason === "string" && b.reason.trim() ? b.reason : "Profile edited by Global Administrator";
+    const out = await tx(deps, async (c) => {
+      const { shopId, identity, profile } = await shopUser(c, req, req.params.localUserId);
+      const localUserId = req.params.localUserId.toLowerCase();
+      const current = {
+        name: profile?.name ?? identity?.name ?? null,
+        username: (identity?.username ?? profile?.username ?? null)?.toLowerCase() ?? null,
+        email: (profile?.email ?? identity?.email ?? null)?.toLowerCase() ?? null
+      };
+      const changes = {};
+      const expected = {};
+      for (const f of USER_PROFILE_FIELDS) {
+        if (b[f] === void 0) continue;
+        const next = staffProfileValue(f, b[f]);
+        const saw = staffProfileValue(f, exp[f]);
+        if (saw !== current[f]) throw new HttpError(409, `This account changed meanwhile (${f}). Reload and edit again.`);
+        if (next !== current[f]) {
+          changes[f] = next;
+          expected[f] = saw;
+        }
+      }
+      if (!Object.keys(changes).length) throw new HttpError(400, "Nothing changed.");
+      if (changes.email && (await c.query(
+        `SELECT 1 FROM giga_cloud.online_users WHERE lower(email) = $1 AND ($2::uuid IS NULL OR id <> $2)
+         UNION ALL SELECT 1 FROM giga_cloud.users WHERE shop_id = $3 AND lower(email) = $1 AND user_id <> $4 LIMIT 1`,
+        [changes.email, identity?.id ?? null, shopId, localUserId]
+      )).rows[0]) {
+        throw new HttpError(409, "That email is already used by another account.");
+      }
+      if (changes.username && (await c.query(
+        `SELECT 1 FROM giga_cloud.online_users WHERE shop_id = $1 AND lower(username) = $2 AND ($3::uuid IS NULL OR id <> $3)
+         UNION ALL SELECT 1 FROM giga_cloud.users WHERE shop_id = $1 AND lower(username) = $2 AND user_id <> $4 LIMIT 1`,
+        [shopId, changes.username, identity?.id ?? null, localUserId]
+      )).rows[0]) {
+        throw new HttpError(409, "That username is already used in this shop.");
+      }
+      const loginChanged = "email" in changes || "username" in changes;
+      if (identity) {
+        await c.query(
+          `UPDATE giga_cloud.online_users SET
+              name = CASE WHEN $2 THEN $3 ELSE name END,
+              username = CASE WHEN $4 THEN $5 ELSE username END,
+              email = CASE WHEN $6 THEN $7 ELSE email END,
+              token_version = token_version + CASE WHEN $8 THEN 1 ELSE 0 END, updated_at = now()
+            WHERE id = $1`,
+          [
+            identity.id,
+            "name" in changes,
+            changes.name ?? null,
+            "username" in changes,
+            changes.username ?? null,
+            "email" in changes,
+            changes.email ?? null,
+            loginChanged
+          ]
+        );
+      }
+      const command = await queue(
+        c,
+        req,
+        shopId,
+        "USER_PROFILE_UPDATE",
+        { user_id: localUserId, ...changes, expected, reason },
+        { user_name: current.name, profile_before: expected, profile_after: changes }
+      );
+      return { local_user_id: localUserId, before: expected, after: changes, online_sessions_revoked: Boolean(identity) && loginChanged, command, shopId };
+    });
+    await deps.securityEvent(
+      req,
+      "USER_PROFILE_UPDATED",
+      req.onlineUser.email,
+      req.onlineUser.id,
+      { target_local_user_id: out.local_user_id, shop_id: out.shopId, before: out.before, after: out.after, command_id: out.command.command_id }
+    );
+    if (out.online_sessions_revoked) {
+      await deps.securityEvent(req, "SESSIONS_REVOKED", req.onlineUser.email, req.onlineUser.id, { target_local_user_id: out.local_user_id, shop_id: out.shopId, reason: "login identifier changed" });
+    }
+    const { shopId: _s, ...body } = out;
+    return body;
+  }));
   r.post("/admin/accounts/shop-users/:localUserId/revoke-sessions", requireGlobalAdmin, route2("POST shop-user revoke", async (req) => {
     const reason = typeof req.body?.reason === "string" && req.body.reason.trim() ? req.body.reason : "Sessions revoked by Global Administrator";
     const out = await tx(deps, async (c) => {
@@ -3441,6 +3637,38 @@ function buildUserAdminRouter(deps) {
     if (!active) await deps.securityEvent(req, "SESSIONS_REVOKED", req.onlineUser.email, req.onlineUser.id, { target_id: row.id, reason: "deactivated" });
     return row;
   }));
+  r.post("/admin/accounts/global-admins/:id/profile", requireGlobalAdmin, route2("POST global-admin profile", async (req) => {
+    const b = req.body || {};
+    if (b.account_type !== void 0 || b.shop_id !== void 0 || b.local_user_id !== void 0 || b.role !== void 0) {
+      throw new HttpError(400, "Only name and email of a Global Administrator can be edited.");
+    }
+    const out = await tx(deps, async (c) => {
+      const target = await globalAdmin(c, req.params.id);
+      const next = { name: b.name === void 0 ? target.name : name(b.name), email: b.email === void 0 ? String(target.email).toLowerCase() : email2(b.email) };
+      const before = { name: target.name, email: String(target.email).toLowerCase() };
+      if (next.name === before.name && next.email === before.email) throw new HttpError(400, "Nothing changed.");
+      if (b.expected && typeof b.expected === "object") {
+        for (const f of ["name", "email"]) {
+          if (b.expected[f] !== void 0 && String(b.expected[f]).trim().toLowerCase() !== String(before[f]).toLowerCase()) {
+            throw new HttpError(409, `This account changed meanwhile (${f}). Reload and edit again.`);
+          }
+        }
+      }
+      if (next.email !== before.email && (await c.query("SELECT 1 FROM giga_cloud.online_users WHERE lower(email) = $1 AND id <> $2", [next.email, target.id])).rows[0]) {
+        throw new HttpError(409, "That email is already used by another account.");
+      }
+      const emailChanged = next.email !== before.email;
+      await c.query(
+        `UPDATE giga_cloud.online_users SET name = $2, email = $3, token_version = token_version + CASE WHEN $4 THEN 1 ELSE 0 END, updated_at = now()
+          WHERE id = $1 AND account_type = 'GLOBAL_ADMIN'`,
+        [target.id, next.name, next.email, emailChanged]
+      );
+      return { id: target.id, before, after: next, sessions_revoked: emailChanged };
+    });
+    await deps.securityEvent(req, "GLOBAL_ADMIN_UPDATED", req.onlineUser.email, req.onlineUser.id, { target_id: out.id, before: out.before, after: out.after });
+    if (out.sessions_revoked) await deps.securityEvent(req, "SESSIONS_REVOKED", req.onlineUser.email, req.onlineUser.id, { target_id: out.id, reason: "login email changed" });
+    return { ...out, note: out.sessions_revoked && out.id === req.onlineUser.id ? "Your login email changed: sign in again with the new email." : void 0 };
+  }));
   r.post("/admin/accounts/global-admins/:id/password", requireGlobalAdmin, route2("POST global-admin password", async (req) => {
     const hash = hashCredential(password(req.body?.password)).combined;
     const row = await tx(deps, async (c) => {
@@ -3488,7 +3716,7 @@ import express4 from "express";
 // server/db/history.ts
 var LOCAL2 = {
   shops: `(SELECT si.shop_id, si.shop_code, COALESCE(si.shop_name, 'This shop') AS shop_name FROM shop_identity si WHERE si.shop_id = ANY($1::uuid[]))`,
-  sales: `(SELECT ($1::uuid[])[1] AS shop_id, s.id, s.sale_number, s.receipt_number, s.cashier_id, u.name AS cashier_name, s.customer_id, s.device_id,
+  sales: `(SELECT ($1::uuid[])[1] AS shop_id, s.id, s.sale_number, s.receipt_number, s.cashier_id, COALESCE(user_name_at(s.cashier_id, s.created_at), u.name) AS cashier_name, s.customer_id, s.device_id,
              s.date, s.time::text AS time, s.subtotal, s.discount_total, s.tax_total, s.total, s.cost_total, s.gross_profit, s.payment_method,
              s.payment_reference, s.amount_received, s.change_given, s.status, s.void_reason, s.price_mode, s.created_at,
              s.discount_percent, s.voided_by, vb.name AS voided_by_name, s.shift_id
@@ -3515,7 +3743,7 @@ var LOCAL2 = {
 };
 var CLOUD2 = {
   shops: `(SELECT s.shop_id, s.shop_code, s.name AS shop_name FROM giga_cloud.shops s WHERE s.shop_id = ANY($1::uuid[]))`,
-  sales: `(SELECT s.shop_id, s.sale_id AS id, s.sale_number, s.receipt_number, s.cashier_id, COALESCE(u.name, s.cashier_name) AS cashier_name,
+  sales: `(SELECT s.shop_id, s.sale_id AS id, s.sale_number, s.receipt_number, s.cashier_id, COALESCE(s.cashier_name, u.name) AS cashier_name,
              s.customer_id, s.device_id, s.business_date AS date, s.business_time AS time, s.subtotal, s.discount_total, s.tax_total, s.total,
              s.cost_total, s.gross_profit, s.payment_method, s.data->>'payment_reference' AS payment_reference,
              NULLIF(s.data->>'amount_received', '')::numeric AS amount_received, NULLIF(s.data->>'change_given', '')::numeric AS change_given,

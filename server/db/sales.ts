@@ -43,7 +43,7 @@ export interface SaleActor extends StockActor {
 // =============================================================================
 const SALE_COLUMNS = `
   s.id, s.branch_id, s.sale_number, s.receipt_number,
-  s.cashier_id, u.name AS cashier_name,
+  s.cashier_id, COALESCE(sale_cashier_name(s.id, s.cashier_id, s.created_at), u.name) AS cashier_name,
   s.customer_id, c.name AS customer_name, c.phone AS customer_phone,
   s.device_id, s.date, s.time,
   COALESCE(s.subtotal, 0)::float AS subtotal,

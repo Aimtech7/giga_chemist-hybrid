@@ -54,6 +54,8 @@ export const COMMAND_TYPES = [
   'USER_SESSION_REVOKE',
   // Cashier shifts (cloud migration 009): an online Administrator reviews a CLOSED shift.
   'SHIFT_REVIEW',
+  // Unified accounts (cloud migration 010): name / username / email of a shop staff account.
+  'USER_PROFILE_UPDATE',
 ] as const;
 export type CommandType = (typeof COMMAND_TYPES)[number];
 
@@ -78,8 +80,32 @@ export const STOCK_REMOVE_REASONS = ['Damaged', 'Expired', 'Lost', 'Physical sto
 
 export const MAX_STOCK_QUANTITY = 1_000_000;
 
-/** Roles a remote Administrator may assign to shop staff (same as the shop's user screen). */
-export const ASSIGNABLE_ROLES = ['ADMIN', 'CASHIER'] as const;
+/** Roles a remote Administrator may assign to shop staff: the shop's RBAC roles (server/auth.ts). */
+export const ASSIGNABLE_ROLES = ['ADMIN', 'MANAGER', 'CASHIER'] as const;
+
+/** Staff profile fields USER_PROFILE_UPDATE may change (never a password, hash, PIN or role). */
+export const USER_PROFILE_FIELDS = ['name', 'username', 'email'] as const;
+export type UserProfileField = (typeof USER_PROFILE_FIELDS)[number];
+const STAFF_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const STAFF_USERNAME_RE = /^[a-z0-9][a-z0-9._-]{2,49}$/;
+
+/** One staff profile value, normalised exactly as the shop stores it (username null = none). */
+export function staffProfileValue(field: UserProfileField, v: unknown): string | null {
+  if (field === 'name') {
+    const n = typeof v === 'string' ? v.trim() : '';
+    if (!n || n.length > 255) throw new HttpError(400, 'name is required (max 255 characters).');
+    return n;
+  }
+  if (field === 'email') {
+    const e = typeof v === 'string' ? v.trim().toLowerCase() : '';
+    if (!STAFF_EMAIL_RE.test(e) || e.length > 255) throw new HttpError(400, 'A valid email address is required.');
+    return e;
+  }
+  if (v === undefined || v === null || (typeof v === 'string' && !v.trim())) return null;
+  const u = typeof v === 'string' ? v.trim().toLowerCase() : '';
+  if (!STAFF_USERNAME_RE.test(u)) throw new HttpError(400, 'username must be 3-50 characters: letters, digits, dot, underscore or hyphen.');
+  return u;
+}
 
 export const PRICE_FIELDS = ['selling_price', 'wholesale_price', 'min_selling_price', 'purchase_price'] as const;
 export const METADATA_FIELDS = [
@@ -575,6 +601,27 @@ export function validateCommandPayload(type: string, payload: unknown): Record<s
       onlyKeys(p, ['user_id', 'role', 'reason'], 'USER_ROLE_UPDATE');
       if (!ASSIGNABLE_ROLES.includes(p.role)) throw new HttpError(400, `role must be one of: ${ASSIGNABLE_ROLES.join(', ')}.`);
       return { user_id: uuid(p.user_id, 'user_id'), role: p.role, reason: reasonText(p.reason, true) };
+    }
+    // Profile edit with optimistic concurrency: `expected` = what the Administrator SAW for every
+    // field being changed; the shop REJECTS the command when its row differs (no silent overwrite).
+    case 'USER_PROFILE_UPDATE': {
+      onlyKeys(p, ['user_id', 'name', 'username', 'email', 'expected', 'reason'], 'USER_PROFILE_UPDATE');
+      const out: Record<string, any> = { user_id: uuid(p.user_id, 'user_id') };
+      if (p.expected === undefined) throw new HttpError(400, 'expected (the values the Administrator saw) is required.');
+      const exp = obj(p.expected);
+      onlyKeys(exp, USER_PROFILE_FIELDS, 'USER_PROFILE_UPDATE expected');
+      const expected: Record<string, string | null> = {};
+      for (const f of USER_PROFILE_FIELDS) {
+        if (p[f] === undefined) continue;
+        out[f] = staffProfileValue(f, p[f]);
+        if (!(f in exp)) throw new HttpError(400, `expected.${f} is required when ${f} is changed.`);
+        expected[f] = staffProfileValue(f, exp[f]);
+      }
+      if (Object.keys(out).length === 1) throw new HttpError(400, 'Nothing to change: give name, username or email.');
+      out.expected = expected;
+      const reason = reasonText(p.reason, false);
+      if (reason) out.reason = reason;
+      return out;
     }
     case 'USER_SESSION_REVOKE': {
       onlyKeys(p, ['user_id', 'reason'], 'USER_SESSION_REVOKE');

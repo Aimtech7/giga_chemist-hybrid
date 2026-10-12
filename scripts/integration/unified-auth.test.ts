@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { spawn, spawnSync, type ChildProcess } from 'child_process';
-import { api, check, login, pool, section, upsertFixtureMedicine, upsertFixtureUser, type Fixture } from './harness';
+import { api, check, login, loginNoShift, pool, section, upsertFixtureMedicine, upsertFixtureUser, type Fixture } from './harness';
 import { CLOUD_TEST_DB, type HybridEnv } from './hybrid.test';
 import { hashCredential } from '../../server/auth';
 
@@ -181,7 +181,7 @@ export async function unifiedAuthTests(env: HybridEnv, admin: Fixture, cashier: 
   r = await on('GET', '/api/medicines', GA, undefined, shop2);
   check(r.status === 200 && idsOf(r.data).has(m2) && !idsOf(r.data).has(med1), 'TEST 4/7: Global Admin selects Shop 2 -> Shop 2 medicines only');
   r = await on('GET', '/api/sales?limit=500', GA, undefined, shop2);
-  check(r.status === 200 && idsOf(r.data).has(s2) && !idsOf(r.data).has(sale1.data?.sale?.id), 'TEST 8: Shop 1 sales never appear under Shop 2');
+  check(r.status === 200 && idsOf(r.data).has(s2) && !idsOf(r.data).has(sale1.data?.sale?.id), 'TEST 8: Shop 1 sales never appear under Shop 2', { status: r.status, has_s2: idsOf(r.data).has(s2), has_s1: idsOf(r.data).has(sale1.data?.sale?.id), n: (r.data?.sales || r.data || []).length, err: r.data?.error });
   r = await on('GET', '/api/users', GA, undefined, shop2);
   check(r.status === 200 && r.data.some((u: any) => u.id === u2) && !r.data.some((u: any) => u.id === cashier.id || u.id === admin.id), 'TEST 9: Shop 1 staff never appear under Shop 2');
   const rep1 = await on('GET', '/api/reports/summary?range=today', GA, undefined, shop1);
@@ -411,6 +411,126 @@ export async function unifiedAuthTests(env: HybridEnv, admin: Fixture, cashier: 
   check(conv.status === 200 && localKeeps.status === 200 && (await onLogin(`${CONFLICT_EMAIL}`, cloudResetPw)).status === 401 && superseded?.result?.applied === false,
     'TEST 16: offline conflict -> the NEWER (local) password wins on both sides; the older cloud reset is superseded, not applied');
 
+  // ================================================================== USER PROFILE EDITING (USER_PROFILE_UPDATE)
+  section('USER PROFILE: name / username / email / role, both directions');
+  const remoteUser = `itest-ua-remote-${RUN}`;
+  const onLoginUser = (username: string, password: string) => on('POST', '/api/auth/login', null, { username, password });
+  check((await onLoginUser(remoteUser, resetPw)).status === 200, 'P1: username online login works (unique username)');
+  const profileNow = async () => (await pool.query('SELECT name, username, email, role, active FROM users WHERE id = $1', [remoteId])).rows[0];
+  const cloudNow = async () => (await cq('SELECT id, name, username, email, role, token_version FROM giga_cloud.online_users WHERE local_user_id = $1', [remoteId]))[0];
+
+  // a sale by this account BEFORE the rename (receipt must keep the old name)
+  const sellerTok = await login(`${REMOTE_EMAIL}`, resetPw);
+  const med1Price = Number((await pool.query('SELECT selling_price FROM medicines WHERE id = $1', [med1])).rows[0].selling_price);
+  const oldSale = await api('POST', '/api/sales/checkout', sellerTok, {
+    idempotency_key: `itest-${crypto.randomUUID()}`, items: [{ medicine_id: med1, quantity: 1, unit_price: med1Price }], payment: { method: 'Cash', amount_received: Math.ceil(med1Price) + 100 } });
+  const oldSaleId = oldSale.data?.sale?.id;
+  const beforeName = (await profileNow()).name;
+  const idBefore = (await cloudNow()).id;
+
+  // P2 name
+  r = await on('POST', `/api/admin/accounts/shop-users/${remoteId}/profile`, GA, { name: 'ZZ ITest Renamed', expected: { name: beforeName } }, shop1);
+  const named = await waitFor(profileNow, (x) => x.name === 'ZZ ITest Renamed');
+  check(r.status === 200 && r.data.command.command_type === 'USER_PROFILE_UPDATE' && named.name === 'ZZ ITest Renamed' && (await cloudNow()).name === 'ZZ ITest Renamed',
+    'P2: Global Admin edits NAME -> cloud + Shop 1 local updated', r.data);
+  const saleAfter = await api('GET', `/api/sales?limit=50`, adminToken);
+  const oldRow = (saleAfter.data?.sales || saleAfter.data || []).find((s: any) => s.id === oldSaleId);
+  check(Boolean(oldSaleId) && oldRow?.cashier_name === beforeName, 'P3: old receipt keeps the cashier name it was recorded with (not rewritten)', { oldSale: oldSale.status, oldSaleErr: oldSale.data?.error, found: Boolean(oldRow), name: oldRow?.cashier_name, beforeName });
+  const newSale = await api('POST', '/api/sales/checkout', sellerTok, {
+    idempotency_key: `itest-${crypto.randomUUID()}`, items: [{ medicine_id: med1, quantity: 1, unit_price: med1Price }], payment: { method: 'Cash', amount_received: Math.ceil(med1Price) + 100 } });
+  const newRow = ((await api('GET', `/api/sales?limit=50`, adminToken)).data?.sales || []).find((s: any) => s.id === newSale.data?.sale?.id);
+  check(newRow?.cashier_name === 'ZZ ITest Renamed', 'P3: new sales use the new name', { newSale: newSale.status, err: newSale.data?.error, name: newRow?.cashier_name });
+
+  // P4 username
+  const newUser = `itest-ua-renamed-${RUN}`;
+  const tokBeforeLogin = (await onLogin(`${REMOTE_EMAIL}`, resetPw)).data.token;
+  r = await on('POST', `/api/admin/accounts/shop-users/${remoteId}/profile`, GA, { username: newUser, expected: { username: remoteUser } }, shop1);
+  check(r.status === 200 && r.data.online_sessions_revoked === true && (await on('GET', '/api/auth/me', tokBeforeLogin)).status === 401, 'P4: username change ends online sessions', r.data);
+  await waitFor(profileNow, (x) => x.username === newUser);
+  check((await onLoginUser(newUser, resetPw)).status === 200 && (await onLoginUser(remoteUser, resetPw)).status === 401, 'P4: new username logs in ONLINE, old fails');
+  check((await api('POST', '/api/auth/login', null, { email: newUser, password: resetPw })).status === 200
+    && (await api('POST', '/api/auth/login', null, { email: remoteUser, password: resetPw })).status === 401, 'P4: new username logs in LOCALLY, old fails');
+
+  // P5 email
+  const NEW_EMAIL = `itest-ua-newmail-${RUN}@gigachemist.local`;
+  r = await on('POST', `/api/admin/accounts/shop-users/${remoteId}/profile`, GA, { email: NEW_EMAIL, expected: { email: REMOTE_EMAIL } }, shop1);
+  await waitFor(profileNow, (x) => x.email === NEW_EMAIL);
+  check(r.status === 200 && (await onLogin(NEW_EMAIL, resetPw)).status === 200 && (await onLogin(REMOTE_EMAIL, resetPw)).status === 401, 'P5: new email logs in online, old fails');
+  check((await api('POST', '/api/auth/login', null, { email: NEW_EMAIL, password: resetPw })).status === 200
+    && (await api('POST', '/api/auth/login', null, { email: REMOTE_EMAIL, password: resetPw })).status === 401, 'P5: new email logs in locally, old fails');
+  check((await cloudNow()).id === idBefore && (await pool.query('SELECT 1 FROM users WHERE id = $1', [remoteId])).rows.length === 1, 'P6: online account id and local user id unchanged');
+
+  // P7 MANAGER role (now assignable everywhere)
+  r = await on('POST', `/api/admin/accounts/shop-users/${remoteId}/role`, GA, { role: 'MANAGER' }, shop1);
+  const mgr = await waitFor(profileNow, (x) => x.role === 'MANAGER');
+  check(r.status === 200 && mgr.role === 'MANAGER' && (await cloudNow()).role === 'MANAGER', 'P7: role MANAGER applied online and at Shop 1');
+  await on('POST', `/api/admin/accounts/shop-users/${remoteId}/role`, GA, { role: 'CASHIER' }, shop1);
+  await waitFor(profileNow, (x) => x.role === 'CASHIER');
+  const localMgr = await api('POST', '/api/users', adminToken, { name: 'ZZ ITest Manager', email: `itest-ua-mgr-${RUN}@gigachemist.local`, role: 'MANAGER', password: pw() });
+  check(localMgr.status === 201 && localMgr.data.user.role === 'MANAGER', 'P7: a local Admin can create a MANAGER (role was refused before)', localMgr.data);
+
+  // P8 duplicates + stale + validation (online API)
+  r = await on('POST', `/api/admin/accounts/shop-users/${remoteId}/profile`, GA, { email: cashier.email, expected: { email: NEW_EMAIL } }, shop1);
+  check(r.status === 409, 'P8: duplicate email refused', r.data);
+  const cashierUsername = (await pool.query('SELECT username FROM users WHERE id = $1', [cashier.id])).rows[0]?.username;
+  if (cashierUsername) {
+    r = await on('POST', `/api/admin/accounts/shop-users/${remoteId}/profile`, GA, { username: cashierUsername, expected: { username: newUser } }, shop1);
+    check(r.status === 409, 'P8: duplicate username refused', r.data);
+  }
+  r = await on('POST', `/api/admin/accounts/shop-users/${remoteId}/profile`, GA, { name: 'X', expected: { name: 'Not What It Is' } }, shop1);
+  check(r.status === 409, 'P8: stale edit refused online (expected differs from cloud)', r.data);
+  r = await on('POST', `/api/admin/accounts/shop-users/${remoteId}/profile`, GA, { name: 'X', password: 'abc', expected: { name: 'ZZ ITest Renamed' } }, shop1);
+  const cmdNoPw = (await cq(`SELECT payload::text p FROM giga_cloud.commands WHERE command_type = 'USER_PROFILE_UPDATE'`)).map((x: any) => x.p).join();
+  check(!/password|pin/i.test(cmdNoPw), 'P8: USER_PROFILE_UPDATE payloads never carry a password or PIN');
+  await waitFor(profileNow, (x) => x.name === 'X');
+
+  // P9 stale at the SHOP: local edit while offline, then an online edit based on the old value -> REJECTED, cloud converges back
+  await emu.stop();
+  try {
+    await api('PUT', `/api/users/${remoteId}`, adminToken, { name: 'ZZ Local Offline Name' });
+  } finally {
+    await emu.restart();
+  }
+  r = await on('POST', `/api/admin/accounts/shop-users/${remoteId}/profile`, GA, { name: 'ZZ Online Stale Edit', expected: { name: 'X' } }, shop1);
+  const staleCmd = r.data?.command?.command_id;
+  const staleRow = await waitFor(async () => (await cq('SELECT status, error FROM giga_cloud.commands WHERE command_id = $1', [staleCmd]))[0], (x) => x && !['PENDING', 'DELIVERED'].includes(x.status), 40_000);
+  const conv2 = await waitFor(cloudNow, (x) => x.name === 'ZZ Local Offline Name', 40_000);
+  check(staleRow?.status === 'REJECTED' && (await profileNow()).name === 'ZZ Local Offline Name' && conv2.name === 'ZZ Local Offline Name',
+    'P9: stale USER_PROFILE_UPDATE REJECTED at the shop; the newer local name wins on both sides', staleRow);
+
+  // P10 local -> online (offline edit syncs after reconnect)
+  await emu.stop();
+  try {
+    await api('PUT', `/api/users/${remoteId}`, adminToken, { username: `itest-ua-local-${RUN}-u` });
+  } finally {
+    await emu.restart();
+  }
+  const conv3 = await waitFor(cloudNow, (x) => x.username === `itest-ua-local-${RUN}-u`, 40_000);
+  check(conv3.username === `itest-ua-local-${RUN}-u` && (await onLoginUser(`itest-ua-local-${RUN}-u`, resetPw)).status === 200,
+    'P10: local profile edit made OFFLINE reaches the cloud after reconnect (new username logs in online)');
+
+  // P11 RBAC
+  const cashierTok2 = await loginNoShift(cashier.email, cashier.password);
+  check((await api('PUT', `/api/users/${remoteId}`, cashierTok2, { name: 'hack' })).status === 403, 'P11: a cashier cannot edit user accounts locally');
+  const cashierOnline = await onLogin(cashier.email, cashier.password);
+  check((await on('POST', `/api/admin/accounts/shop-users/${remoteId}/profile`, cashierOnline.data?.token, { name: 'hack', expected: { name: 'x' } })).status === 403,
+    'P11: a cashier cannot edit user accounts online');
+  check((await on('POST', `/api/admin/accounts/shop-users/${remoteId}/profile`, S1A, { name: 'hack', expected: { name: 'x' } }, shop1)).status === 403,
+    'P12: a shop ADMIN (not Global) cannot use Global user management');
+  check((await on('POST', `/api/admin/accounts/shop-users/${u2}/profile`, GA, { name: 'hack', expected: { name: 'ZZ Shop2 Cashier' } }, shop1)).status === 409,
+    'P13: a Shop 2 account cannot be edited while Shop 1 is selected');
+  r = await on('POST', `/api/admin/accounts/shop-users/${u2}/profile`, GA, { name: 'ZZ Shop2 Cashier Edited', expected: { name: 'ZZ Shop2 Cashier' } }, shop2);
+  check(r.status === 200 && r.data.command.shop_id === shop2, 'P13: Global Admin edits a Shop 2 account with Shop 2 selected (Shop 2 command)', r.data);
+
+  // P14 publish existing shop users (dry run from the heartbeat; no credential data)
+  const prev = await waitFor(() => on('GET', '/api/admin/accounts/publish-preview', GA, undefined, shop1), (x) => x.data?.ready === true, 40_000);
+  check(prev.status === 200 && prev.data.ready && prev.data.summary.local_users > 0 && !/password_hash|pin_hash|\$[0-9a-f]{64}/.test(prev.text) && noSecret(prev.text),
+    'P14: publish dry run lists local users / matches / to-create / conflicts / missing hashes, without credentials', { ok: prev.status, word: /password_hash|pin_hash/.test(prev.text), hex: /$[0-9a-f]{64}/.test(prev.text), secret_index: secrets.findIndex((x) => x && prev.text.includes(x)) });
+  check((await on('POST', '/api/admin/accounts/publish-existing', GA, { confirm_shop_code: 'WRONG' }, shop1)).status === 400, 'P14: publish requires the shop code typed back');
+  r = await on('POST', '/api/admin/accounts/publish-existing', GA, { confirm_shop_code: 'SHOP1' }, shop1);
+  check(r.status === 200 && r.data.enabled === true, 'P14: publish enables credential publishing for the selected shop', r.data);
+  check((await on('GET', '/api/admin/accounts/publish-preview', S1A, undefined, shop1)).status === 403, 'P14: only a Global Admin can run the publish dry run');
+
   // ================================================================== GLOBAL ADMIN: global admins
   section('GLOBAL ADMIN: global administrators');
   const ga2Pw = pw(), ga3Pw = pw();
@@ -448,15 +568,23 @@ export async function unifiedAuthTests(env: HybridEnv, admin: Fixture, cashier: 
   secrets.push(ga2New);
   r = await on('POST', `/api/admin/accounts/global-admins/${ga2}/password`, GA, { password: ga2New });
   check(r.status === 200 && (await onLogin('itest-ua-global2@itest.local', ga2New)).status === 200, 'Global Admin password reset works');
+  const ga2Tok = (await onLogin('itest-ua-global2@itest.local', ga2New)).data.token;
+  r = await on('POST', `/api/admin/accounts/global-admins/${ga2}/profile`, GA, { name: 'ITest Global Two Renamed', email: 'itest-ua-global2b@itest.local', expected: { name: 'ITest Global Two', email: 'itest-ua-global2@itest.local' } });
+  check(r.status === 200 && r.data.sessions_revoked && (await on('GET', '/api/auth/me', ga2Tok)).status === 401
+    && (await onLogin('itest-ua-global2b@itest.local', ga2New)).status === 200 && (await onLogin('itest-ua-global2@itest.local', ga2New)).status === 401,
+    'G1: Global Admin edits another Global Admin name + email (new email logs in, old fails, sessions end)', r.data);
+  check((await on('POST', `/api/admin/accounts/global-admins/${ga2}/profile`, GA, { account_type: 'SHOP_USER', expected: {} })).status === 400,
+    'G2: a Global Admin cannot be converted into shop staff by profile editing');
+  check((await cq(`SELECT account_type, shop_id FROM giga_cloud.online_users WHERE id = $1`, [ga2]))[0]?.account_type === 'GLOBAL_ADMIN', 'G2: account type unchanged');
   check((await on('POST', '/api/admin/accounts/global-admins', S1A, { name: 'x', email: 'itest-ua-x@itest.local', password: pw() })).status === 403, 'a shop ADMIN cannot create Global Admins');
 
   // ================================================================== AUDIT + SECRET HYGIENE
   section('AUDIT + SECRET HYGIENE');
   const audit = await cq(`SELECT action, details::text AS d FROM giga_cloud.online_audit`);
   const actions = new Set(audit.map((a: any) => a.action));
-  const need = ['USER_CREATED', 'USER_ACTIVATED', 'USER_DEACTIVATED', 'USER_ROLE_CHANGED', 'USER_PASSWORD_RESET', 'GLOBAL_ADMIN_CREATED', 'GLOBAL_ADMIN_DEACTIVATED', 'SESSIONS_REVOKED'];
+  const need = ['USER_CREATED', 'USER_ACTIVATED', 'USER_DEACTIVATED', 'USER_ROLE_CHANGED', 'USER_PASSWORD_RESET', 'GLOBAL_ADMIN_CREATED', 'GLOBAL_ADMIN_DEACTIVATED', 'SESSIONS_REVOKED', 'USER_PROFILE_UPDATED', 'GLOBAL_ADMIN_UPDATED', 'SHOP_USERS_PUBLISH_ENABLED'];
   check(need.every((a) => actions.has(a)), 'TEST 26: every user-management action is audited', need.filter((a) => !actions.has(a)));
-  check(noSecret(JSON.stringify(audit)) && !/password_hash|pin_hash/.test(JSON.stringify(audit)), 'TEST 9: cloud audit holds no password, hash or PIN');
+  check(noSecret(JSON.stringify(audit)) && !/password_hash|pin_hash/.test(JSON.stringify(audit)), 'TEST 9: cloud audit holds no password, hash or PIN', audit.filter((a: any) => !noSecret(a.d) || /password_hash|pin_hash/.test(a.d)).map((a: any) => ({ action: a.action, secret_index: secrets.findIndex((x) => x && a.d.includes(x)), hash_word: /password_hash|pin_hash/.test(a.d) })));
   const cmds = await cq(`SELECT payload::text p, COALESCE(display::text, '') d, COALESCE(result::text, '') r FROM giga_cloud.commands`);
   check(noSecret(JSON.stringify(cmds)) && !/password/.test(cmds.map((c: any) => c.p).join()), 'TEST 8: no password / hash in any command payload, display or result');
   const events = await cq(`SELECT payload::text p FROM giga_cloud.processed_events UNION ALL SELECT payload::text FROM giga_cloud.rejected_events`);

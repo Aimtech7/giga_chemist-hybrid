@@ -15,7 +15,7 @@ export async function getAllMovements(): Promise<InventoryMovement[]> {
       COALESCE(im.adjustment_quantity, 0)::int as adjustment_quantity,
       COALESCE(im.new_quantity, 0)::int as new_quantity,
       im.reason, im.movement_type, im.reference_id, im.notes,
-      im.user_id, u.name as user_name,
+      im.user_id, COALESCE(user_name_at(im.user_id, im.created_at), u.name) as user_name,
       im.device_id, im.date, im.created_at
     FROM inventory_movements im
     LEFT JOIN medicines m ON im.medicine_id = m.id

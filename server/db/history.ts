@@ -25,7 +25,7 @@ export interface HistoryScope {
 
 const LOCAL = {
   shops: `(SELECT si.shop_id, si.shop_code, COALESCE(si.shop_name, 'This shop') AS shop_name FROM shop_identity si WHERE si.shop_id = ANY($1::uuid[]))`,
-  sales: `(SELECT ($1::uuid[])[1] AS shop_id, s.id, s.sale_number, s.receipt_number, s.cashier_id, u.name AS cashier_name, s.customer_id, s.device_id,
+  sales: `(SELECT ($1::uuid[])[1] AS shop_id, s.id, s.sale_number, s.receipt_number, s.cashier_id, COALESCE(user_name_at(s.cashier_id, s.created_at), u.name) AS cashier_name, s.customer_id, s.device_id,
              s.date, s.time::text AS time, s.subtotal, s.discount_total, s.tax_total, s.total, s.cost_total, s.gross_profit, s.payment_method,
              s.payment_reference, s.amount_received, s.change_given, s.status, s.void_reason, s.price_mode, s.created_at,
              s.discount_percent, s.voided_by, vb.name AS voided_by_name, s.shift_id
@@ -53,7 +53,7 @@ const LOCAL = {
 
 const CLOUD = {
   shops: `(SELECT s.shop_id, s.shop_code, s.name AS shop_name FROM giga_cloud.shops s WHERE s.shop_id = ANY($1::uuid[]))`,
-  sales: `(SELECT s.shop_id, s.sale_id AS id, s.sale_number, s.receipt_number, s.cashier_id, COALESCE(u.name, s.cashier_name) AS cashier_name,
+  sales: `(SELECT s.shop_id, s.sale_id AS id, s.sale_number, s.receipt_number, s.cashier_id, COALESCE(s.cashier_name, u.name) AS cashier_name,
              s.customer_id, s.device_id, s.business_date AS date, s.business_time AS time, s.subtotal, s.discount_total, s.tax_total, s.total,
              s.cost_total, s.gross_profit, s.payment_method, s.data->>'payment_reference' AS payment_reference,
              NULLIF(s.data->>'amount_received', '')::numeric AS amount_received, NULLIF(s.data->>'change_given', '')::numeric AS change_given,

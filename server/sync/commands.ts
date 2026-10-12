@@ -17,7 +17,7 @@ import { voidSaleTx, type SaleActor } from '../db/sales';
 import { reviewShiftTx } from '../db/shifts';
 import { enqueueSyncEvent, medicineJson, userJson } from './outbox';
 import { getShopIdentity } from './identity';
-import { COMMAND_TYPES, validateCommandPayload } from './commandSchema';
+import { COMMAND_TYPES, USER_PROFILE_FIELDS, validateCommandPayload } from './commandSchema';
 import { revokeUserSessionsTx, updateUserTx, unusablePinHash } from '../db/users';
 import type { FetchedCredential } from './credentials';
 import { readUpdateState } from '../ops/runtime';
@@ -56,7 +56,7 @@ export interface CloudCommand {
 }
 
 /** Commands about one staff account (payload.user_id). */
-const USER_COMMANDS = ['USER_SET_ACTIVE', 'USER_ROLE_UPDATE', 'USER_CREATE', 'USER_CREDENTIAL_REFRESH', 'USER_SESSION_REVOKE'];
+const USER_COMMANDS = ['USER_SET_ACTIVE', 'USER_ROLE_UPDATE', 'USER_CREATE', 'USER_CREDENTIAL_REFRESH', 'USER_SESSION_REVOKE', 'USER_PROFILE_UPDATE'];
 export const CREDENTIAL_COMMANDS = ['USER_CREATE', 'USER_CREDENTIAL_REFRESH'];
 
 /** (version, timestamp) ordering shared with the cloud: true when a is strictly newer than b. */
@@ -468,6 +468,29 @@ const HANDLERS: Record<string, Handler> = {
       previous_value: { role: before.role }, new_value: { role: saved.role, reason: p.reason, command_id: cmd.command_id },
     } as any, client);
     return { user_id: p.user_id, name: saved.name, previous_role: before.role, role: saved.role };
+  },
+
+  // Name / username / email edited by an online Global Administrator. REJECTED when the shop's row no
+  // longer holds what the Administrator saw (a newer local edit is never overwritten). Uniqueness is
+  // enforced by updateUserTx (409). Ids, historical sales and receipts keep their recorded values.
+  async USER_PROFILE_UPDATE(client, cmd) {
+    const p = validateCommandPayload('USER_PROFILE_UPDATE', cmd.payload);
+    await lockUser(client, p.user_id);
+    const row = (await client.query('SELECT name, LOWER(username) AS username, LOWER(email) AS email FROM users WHERE id = $1', [p.user_id])).rows[0];
+    const fields = USER_PROFILE_FIELDS.filter((f) => p[f] !== undefined);
+    const stale = fields.filter((f) => (row[f] ?? null) !== (p.expected[f] ?? null));
+    if (stale.length) {
+      throw new HttpError(409, `This account was changed at the shop meanwhile (${stale.join(', ')}). Reload and edit again.`);
+    }
+    const before = Object.fromEntries(fields.map((f) => [f, row[f] ?? null]));
+    const changes = Object.fromEntries(fields.map((f) => [f, p[f]]));
+    const saved = await updateUserTx(client, p.user_id, changes);
+    const after = Object.fromEntries(fields.map((f) => [f, (saved as any)[f] ?? null]));
+    await recordAuditLog({
+      ...cloudActor(cmd), action: 'REMOTE_USER_PROFILE_UPDATED', entity: 'user', entity_id: p.user_id,
+      previous_value: before, new_value: { ...after, reason: p.reason ?? null, command_id: cmd.command_id },
+    } as any, client);
+    return { user_id: p.user_id, before, after };
   },
 
   // Signs the account out of every shop terminal (its tokens issued before now are refused).

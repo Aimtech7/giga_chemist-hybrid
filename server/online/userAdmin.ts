@@ -3,7 +3,7 @@ import express, { type Request, type Response, type NextFunction } from 'express
 import type pg from 'pg';
 import { hashCredential } from '../auth';
 import { HttpError, isValidUuid } from '../db/client';
-import { ASSIGNABLE_ROLES, validateCommandPayload, type CommandType } from '../sync/commandSchema';
+import { ASSIGNABLE_ROLES, USER_PROFILE_FIELDS, staffProfileValue, validateCommandPayload, type CommandType, type UserProfileField } from '../sync/commandSchema';
 
 /**
  * USER MANAGEMENT for GLOBAL Administrators (online). Two kinds of account (giga_cloud.online_users):
@@ -126,7 +126,7 @@ export function buildUserAdminRouter(deps: UserAdminDeps) {
     const identity = (await c.query(
       `SELECT ${ACCOUNT_COLUMNS} FROM giga_cloud.online_users WHERE local_user_id = $1 AND account_type = 'SHOP_USER' AND shop_id = $2 FOR UPDATE`,
       [localUserId, shopId])).rows[0] || null;
-    const profile = (await c.query(`SELECT name, email, role, active FROM giga_cloud.users WHERE shop_id = $1 AND user_id = $2`, [shopId, localUserId])).rows[0] || null;
+    const profile = (await c.query(`SELECT name, email, username, role, active FROM giga_cloud.users WHERE shop_id = $1 AND user_id = $2`, [shopId, localUserId])).rows[0] || null;
     if (!identity && !profile) {
       const elsewhere = (await c.query(`SELECT 1 FROM giga_cloud.online_users WHERE local_user_id = $1 UNION ALL SELECT 1 FROM giga_cloud.users WHERE user_id = $1 LIMIT 1`, [localUserId])).rows[0];
       throw new HttpError(elsewhere ? 409 : 404, elsewhere
@@ -146,23 +146,90 @@ export function buildUserAdminRouter(deps: UserAdminDeps) {
           `SELECT id, name, email, active, last_login_at, created_at, deactivated_at FROM giga_cloud.online_users
             WHERE account_type = 'GLOBAL_ADMIN' ORDER BY active DESC, email`)).rows;
         const staff = (await c.query(
-          `SELECT COALESCE(o.shop_id, p.shop_id) AS shop_id, s.shop_code, s.name AS shop_name,
+          `SELECT COALESCE(o.shop_id, p.shop_id) AS shop_id, s.shop_code, s.name AS shop_name, s.credential_sync_enabled,
                   COALESCE(o.local_user_id, p.user_id) AS local_user_id, o.id AS online_account_id,
                   COALESCE(p.name, o.name) AS name, COALESCE(p.email, o.email) AS email, COALESCE(o.username, p.username) AS username,
                   COALESCE(p.role, o.role) AS role, p.active AS shop_active, o.active AS online_active,
-                  (o.id IS NOT NULL AND o.active) AS online_login_enabled, o.credential_version, o.last_login_at,
+                  (o.id IS NOT NULL AND o.active) AS online_login_enabled, o.credential_version, o.credential_source, o.credential_updated_at, o.last_login_at, o.deactivated_at,
                   (SELECT COUNT(*)::int FROM giga_cloud.commands cm WHERE cm.shop_id = COALESCE(o.shop_id, p.shop_id)
                       AND cm.status IN ('PENDING', 'DELIVERED') AND cm.payload ->> 'user_id' = COALESCE(o.local_user_id, p.user_id)::text) AS open_commands
              FROM (SELECT * FROM giga_cloud.online_users WHERE account_type = 'SHOP_USER' AND local_user_id IS NOT NULL) o
              FULL JOIN giga_cloud.users p ON p.shop_id = o.shop_id AND p.user_id = o.local_user_id
              LEFT JOIN giga_cloud.shops s ON s.shop_id = COALESCE(o.shop_id, p.shop_id)
             WHERE $1::uuid IS NULL OR COALESCE(o.shop_id, p.shop_id) = $1::uuid
-            ORDER BY s.shop_code, 6`, [shopFilter])).rows;
+            ORDER BY s.shop_code, 7`, [shopFilter])).rows;
         return { shop_filter: shopFilter ?? 'all', global_admins: globals, shop_users: staff };
       } catch (err) {
         mapDbError(err);
       }
     });
+  }));
+
+  // ------------------------------------------------------------------ publish existing shop staff
+  // DRY RUN (read only) of publishing the selected shop's existing staff to the cloud login mirror:
+  // computed from the shop's last heartbeat (identity, role, active, "password publishable" yes/no —
+  // never a hash) against giga_cloud.online_users. Mapping = shop_id + local_user_id.
+  async function publishPreview(c: pg.PoolClient, shopId: string) {
+    const shop = (await c.query('SELECT shop_id, shop_code, name, credential_sync_enabled FROM giga_cloud.shops WHERE shop_id = $1', [shopId])).rows[0];
+    if (!shop) throw new HttpError(404, 'Shop not found.');
+    const hb = (await c.query(`SELECT reported_at, status -> 'staff' AS staff FROM giga_cloud.shop_runtime_status WHERE shop_id = $1`, [shopId])).rows[0];
+    const staff: any[] | null = Array.isArray(hb?.staff) ? hb.staff : null;
+    const base = { shop: { shop_id: shop.shop_id, shop_code: shop.shop_code, name: shop.name }, credential_sync_enabled: shop.credential_sync_enabled,
+      heartbeat_at: hb?.reported_at ?? null };
+    if (!staff) return { ...base, ready: false, note: 'The shop has not reported its staff yet (it needs this release and local migration 016).', accounts: [], summary: null };
+    const online = (await c.query(
+      `SELECT id, account_type, shop_id, local_user_id, lower(email) AS email, lower(username) AS username, active FROM giga_cloud.online_users`)).rows;
+    const accounts = staff.map((u: any) => {
+      const match = online.find((o) => o.shop_id === shopId && o.local_user_id === u.local_user_id) || null;
+      const emailOwner = online.find((o) => o.email === u.email && o.id !== match?.id) || null;
+      const usernameInShop = u.username ? online.find((o) => o.shop_id === shopId && o.username === u.username && o.id !== match?.id) || null : null;
+      const usernameElsewhere = u.username ? online.some((o) => o.username === u.username && o.shop_id !== shopId) : false;
+      const status = !u.publishable ? 'NO_PASSWORD_HASH' : match ? 'MATCHED' : emailOwner ? 'EMAIL_CONFLICT' : 'TO_CREATE';
+      return {
+        local_user_id: u.local_user_id, name: u.name, email: u.email, username: u.username, role: u.role, active: u.active,
+        status, online_account_id: match?.id ?? null,
+        email_conflict_with: emailOwner ? { account_type: emailOwner.account_type, same_shop: emailOwner.shop_id === shopId } : null,
+        username_conflict: Boolean(usernameInShop),
+        username_ambiguous_online: usernameElsewhere,
+        pending_publish: Boolean(u.pending),
+      };
+    });
+    const count = (f: (a: any) => boolean) => accounts.filter(f).length;
+    return {
+      ...base, ready: true, accounts,
+      summary: {
+        local_users: accounts.length,
+        cloud_matches: count((a) => a.status === 'MATCHED'),
+        cloud_identities_to_create: count((a) => a.status === 'TO_CREATE'),
+        username_conflicts: count((a) => a.username_conflict),
+        usernames_also_used_by_another_shop: count((a) => a.username_ambiguous_online),
+        email_conflicts: count((a) => a.status === 'EMAIL_CONFLICT'),
+        inactive_users: count((a) => !a.active),
+        accounts_without_usable_password: count((a) => a.status === 'NO_PASSWORD_HASH'),
+      },
+    };
+  }
+
+  r.get('/admin/accounts/publish-preview', requireGlobalAdmin, route('GET publish-preview', async (req) =>
+    deps.withCloud((c) => publishPreview(c, deps.shopId(req)))));
+
+  // Turns credential publishing ON for the selected shop (the shop worker then publishes every staff
+  // account with a usable password; existing cloud identities are matched by shop_id + local_user_id,
+  // nothing is created twice). Requires the shop code typed back as confirmation.
+  r.post('/admin/accounts/publish-existing', requireGlobalAdmin, route('POST publish-existing', async (req) => {
+    const shopId = deps.shopId(req);
+    const out = await tx(deps, async (c) => {
+      const preview = await publishPreview(c, shopId);
+      if (String(req.body?.confirm_shop_code || '').trim().toUpperCase() !== String(preview.shop.shop_code || '').toUpperCase()) {
+        throw new HttpError(400, `Type the shop code (${preview.shop.shop_code}) to confirm.`);
+      }
+      if (!preview.ready) throw new HttpError(409, 'The shop has not reported its staff yet (it needs this release and local migration 016).');
+      await c.query('UPDATE giga_cloud.shops SET credential_sync_enabled = TRUE WHERE shop_id = $1', [shopId]);
+      return preview;
+    });
+    await deps.securityEvent(req, 'SHOP_USERS_PUBLISH_ENABLED', req.onlineUser.email, req.onlineUser.id, { shop_id: shopId, summary: out.summary });
+    return { enabled: true, already_enabled: out.credential_sync_enabled, summary: out.summary,
+      note: 'The shop publishes its staff within about 10 minutes while online (it re-checks the switch every 10 minutes).' };
   }));
 
   // ------------------------------------------------------------------ shop staff
@@ -259,6 +326,73 @@ export function buildUserAdminRouter(deps: UserAdminDeps) {
     return body;
   }));
 
+  // Name / username / email. The cloud login identity changes at once (a new email or username is the
+  // online login immediately, the old one stops, online sessions end) and USER_PROFILE_UPDATE carries
+  // what the Administrator SAW: the shop rejects it if its row changed meanwhile, then re-publishes
+  // its own values so the cloud converges back. Role / active / password have their own endpoints.
+  r.post('/admin/accounts/shop-users/:localUserId/profile', requireGlobalAdmin, route('POST shop-user profile', async (req) => {
+    const b = req.body || {};
+    const exp = b.expected && typeof b.expected === 'object' && !Array.isArray(b.expected) ? b.expected : null;
+    if (!exp) throw new HttpError(400, 'expected (the values you saw) is required.');
+    const reason = typeof b.reason === 'string' && b.reason.trim() ? b.reason : 'Profile edited by Global Administrator';
+    const out = await tx(deps, async (c) => {
+      const { shopId, identity, profile } = await shopUser(c, req, req.params.localUserId);
+      const localUserId = req.params.localUserId.toLowerCase();
+      const current: Record<UserProfileField, string | null> = {
+        name: profile?.name ?? identity?.name ?? null,
+        username: (identity?.username ?? profile?.username ?? null)?.toLowerCase() ?? null,
+        email: (profile?.email ?? identity?.email ?? null)?.toLowerCase() ?? null,
+      };
+      const changes: Record<string, string | null> = {};
+      const expected: Record<string, string | null> = {};
+      for (const f of USER_PROFILE_FIELDS) {
+        if (b[f] === undefined) continue;
+        const next = staffProfileValue(f, b[f]);
+        const saw = staffProfileValue(f, exp[f]);
+        if (saw !== current[f]) throw new HttpError(409, `This account changed meanwhile (${f}). Reload and edit again.`);
+        if (next !== current[f]) {
+          changes[f] = next;
+          expected[f] = saw;
+        }
+      }
+      if (!Object.keys(changes).length) throw new HttpError(400, 'Nothing changed.');
+      if (changes.email && (await c.query(
+        `SELECT 1 FROM giga_cloud.online_users WHERE lower(email) = $1 AND ($2::uuid IS NULL OR id <> $2)
+         UNION ALL SELECT 1 FROM giga_cloud.users WHERE shop_id = $3 AND lower(email) = $1 AND user_id <> $4 LIMIT 1`,
+        [changes.email, identity?.id ?? null, shopId, localUserId])).rows[0]) {
+        throw new HttpError(409, 'That email is already used by another account.');
+      }
+      if (changes.username && (await c.query(
+        `SELECT 1 FROM giga_cloud.online_users WHERE shop_id = $1 AND lower(username) = $2 AND ($3::uuid IS NULL OR id <> $3)
+         UNION ALL SELECT 1 FROM giga_cloud.users WHERE shop_id = $1 AND lower(username) = $2 AND user_id <> $4 LIMIT 1`,
+        [shopId, changes.username, identity?.id ?? null, localUserId])).rows[0]) {
+        throw new HttpError(409, 'That username is already used in this shop.');
+      }
+      const loginChanged = 'email' in changes || 'username' in changes;
+      if (identity) {
+        await c.query(
+          `UPDATE giga_cloud.online_users SET
+              name = CASE WHEN $2 THEN $3 ELSE name END,
+              username = CASE WHEN $4 THEN $5 ELSE username END,
+              email = CASE WHEN $6 THEN $7 ELSE email END,
+              token_version = token_version + CASE WHEN $8 THEN 1 ELSE 0 END, updated_at = now()
+            WHERE id = $1`,
+          [identity.id, 'name' in changes, changes.name ?? null, 'username' in changes, changes.username ?? null,
+           'email' in changes, changes.email ?? null, loginChanged]);
+      }
+      const command = await queue(c, req, shopId, 'USER_PROFILE_UPDATE', { user_id: localUserId, ...changes, expected, reason },
+        { user_name: current.name, profile_before: expected, profile_after: changes });
+      return { local_user_id: localUserId, before: expected, after: changes, online_sessions_revoked: Boolean(identity) && loginChanged, command, shopId };
+    });
+    await deps.securityEvent(req, 'USER_PROFILE_UPDATED', req.onlineUser.email, req.onlineUser.id,
+      { target_local_user_id: out.local_user_id, shop_id: out.shopId, before: out.before, after: out.after, command_id: out.command.command_id });
+    if (out.online_sessions_revoked) {
+      await deps.securityEvent(req, 'SESSIONS_REVOKED', req.onlineUser.email, req.onlineUser.id, { target_local_user_id: out.local_user_id, shop_id: out.shopId, reason: 'login identifier changed' });
+    }
+    const { shopId: _s, ...body } = out;
+    return body;
+  }));
+
   // Signs a staff member out EVERYWHERE: online sessions at once (token_version) and every shop
   // terminal through a USER_SESSION_REVOKE command (applied by the shop, like any staff change).
   r.post('/admin/accounts/shop-users/:localUserId/revoke-sessions', requireGlobalAdmin, route('POST shop-user revoke', async (req) => {
@@ -317,6 +451,39 @@ export function buildUserAdminRouter(deps: UserAdminDeps) {
     await deps.securityEvent(req, active ? 'GLOBAL_ADMIN_ACTIVATED' : 'GLOBAL_ADMIN_DEACTIVATED', req.onlineUser.email, req.onlineUser.id, { target_id: row.id, target_email: row.email });
     if (!active) await deps.securityEvent(req, 'SESSIONS_REVOKED', req.onlineUser.email, req.onlineUser.id, { target_id: row.id, reason: 'deactivated' });
     return row;
+  }));
+
+  // Name / email of a Global Administrator. The account type never changes here (a Global Admin is
+  // never turned into shop staff). A new email is the login at once; old sessions end.
+  r.post('/admin/accounts/global-admins/:id/profile', requireGlobalAdmin, route('POST global-admin profile', async (req) => {
+    const b = req.body || {};
+    if (b.account_type !== undefined || b.shop_id !== undefined || b.local_user_id !== undefined || b.role !== undefined) {
+      throw new HttpError(400, 'Only name and email of a Global Administrator can be edited.');
+    }
+    const out = await tx(deps, async (c) => {
+      const target = await globalAdmin(c, req.params.id);
+      const next = { name: b.name === undefined ? target.name : name(b.name), email: b.email === undefined ? String(target.email).toLowerCase() : email(b.email) };
+      const before = { name: target.name, email: String(target.email).toLowerCase() };
+      if (next.name === before.name && next.email === before.email) throw new HttpError(400, 'Nothing changed.');
+      if (b.expected && typeof b.expected === 'object') {
+        for (const f of ['name', 'email'] as const) {
+          if (b.expected[f] !== undefined && String(b.expected[f]).trim().toLowerCase() !== String(before[f]).toLowerCase()) {
+            throw new HttpError(409, `This account changed meanwhile (${f}). Reload and edit again.`);
+          }
+        }
+      }
+      if (next.email !== before.email && (await c.query('SELECT 1 FROM giga_cloud.online_users WHERE lower(email) = $1 AND id <> $2', [next.email, target.id])).rows[0]) {
+        throw new HttpError(409, 'That email is already used by another account.');
+      }
+      const emailChanged = next.email !== before.email;
+      await c.query(
+        `UPDATE giga_cloud.online_users SET name = $2, email = $3, token_version = token_version + CASE WHEN $4 THEN 1 ELSE 0 END, updated_at = now()
+          WHERE id = $1 AND account_type = 'GLOBAL_ADMIN'`, [target.id, next.name, next.email, emailChanged]);
+      return { id: target.id, before, after: next, sessions_revoked: emailChanged };
+    });
+    await deps.securityEvent(req, 'GLOBAL_ADMIN_UPDATED', req.onlineUser.email, req.onlineUser.id, { target_id: out.id, before: out.before, after: out.after });
+    if (out.sessions_revoked) await deps.securityEvent(req, 'SESSIONS_REVOKED', req.onlineUser.email, req.onlineUser.id, { target_id: out.id, reason: 'login email changed' });
+    return { ...out, note: out.sessions_revoked && out.id === req.onlineUser.id ? 'Your login email changed: sign in again with the new email.' : undefined };
   }));
 
   r.post('/admin/accounts/global-admins/:id/password', requireGlobalAdmin, route('POST global-admin password', async (req) => {

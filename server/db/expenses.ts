@@ -36,7 +36,7 @@ function toExpense(r: any): Expense {
 
 export async function getAllExpenses(q: Queryable = pgPool): Promise<Expense[]> {
   const res = await q.query(
-    `SELECT e.*, e.amount::float AS amount, u.name AS user_name
+    `SELECT e.*, e.amount::float AS amount, COALESCE(user_name_at(e.user_id, e.created_at), u.name) AS user_name
      FROM expenses e LEFT JOIN users u ON e.user_id = u.id
      ORDER BY e.date DESC, e.created_at DESC LIMIT 2000`
   );

@@ -43,6 +43,23 @@ function disk(dir: string) {
   }
 }
 
+/**
+ * Staff accounts for the online "publish existing shop users" DRY RUN: identity, role, active and
+ * whether the stored password is in the publishable PBKDF2 format (a yes/no — never the hash or PIN).
+ * pending = changed since the last credential publish. Null before local migration 016.
+ */
+async function staffCredentialSummary() {
+  try {
+    return (await pgPool.query(
+      `SELECT id AS local_user_id, name, LOWER(email) AS email, LOWER(username) AS username, role, active,
+              (password_hash ~ '^[0-9a-f]{32}[$][0-9a-f]{128}$') AS publishable,
+              (auth_sync_seq > auth_synced_seq) AS pending
+         FROM users ORDER BY role, name LIMIT 200`)).rows;
+  } catch {
+    return null;
+  }
+}
+
 export interface WorkerSnapshot {
   running: boolean;
   leader: boolean;
@@ -84,6 +101,7 @@ async function buildStatus(worker: WorkerSnapshot) {
   } catch (err: any) {
     backup = { error: sanitizeText(err?.message || err) };
   }
+  const staff = await staffCredentialSummary();
   const update = readUpdateState();
   const d = disk(path.parse(getBackupConfig().dir).root || getBackupConfig().dir) || disk(process.cwd());
   const status = {
@@ -110,6 +128,7 @@ async function buildStatus(worker: WorkerSnapshot) {
     } : null,
     restarts_last_hour: recentRestarts(1),
     inventory: inv,
+    staff,
   };
   return status;
 }

@@ -245,6 +245,7 @@ export const COMMAND_LABELS: Record<string, string> = {
   RETURN_REJECT: 'Reject return',
   SALE_VOID: 'Void sale',
   USER_SESSION_REVOKE: 'Sign out staff everywhere',
+  USER_PROFILE_UPDATE: 'Staff profile (name / username / email)',
   SHIFT_REVIEW: 'Review cashier shift',
 };
 
@@ -299,6 +300,15 @@ export const resetShopUserPassword = (localUserId: string, password: string) => 
 export const setShopUserActive = (localUserId: string, active: boolean, reason?: string) => apiFetch<any>(su(localUserId, 'active'), { body: { active, reason } });
 export const setShopUserRole = (localUserId: string, role: string, reason?: string) => apiFetch<any>(su(localUserId, 'role'), { body: { role, reason } });
 export const revokeShopUserSessions = (localUserId: string) => apiFetch<any>(su(localUserId, 'revoke-sessions'), { body: {} });
+export type StaffProfile = { name: string; username: string | null; email: string };
+/** Only the changed fields are sent, with what the Administrator SAW (the shop rejects a stale edit). */
+export const updateShopUserProfile = (localUserId: string, changes: Partial<StaffProfile>, expected: Partial<StaffProfile>) =>
+  apiFetch<any>(su(localUserId, 'profile'), { body: { ...changes, expected } });
+export const getPublishPreview = () => apiFetch<any>('/api/admin/accounts/publish-preview');
+export const publishExistingShopUsers = (confirmShopCode: string) =>
+  apiFetch<any>('/api/admin/accounts/publish-existing', { body: { confirm_shop_code: confirmShopCode } });
+export const updateGlobalAdminProfile = (id: string, changes: { name?: string; email?: string }, expected: { name: string; email: string }) =>
+  apiFetch<any>(`/api/admin/accounts/global-admins/${encodeURIComponent(id)}/profile`, { body: { ...changes, expected } });
 export const createGlobalAdmin = (body: { name: string; email: string; password: string }) => apiFetch<any>('/api/admin/accounts/global-admins', { body });
 const ga = (id: string, action: string) => `/api/admin/accounts/global-admins/${encodeURIComponent(id)}/${action}`;
 export const setGlobalAdminActive = (id: string, active: boolean) => apiFetch<any>(ga(id, 'active'), { body: { active } });

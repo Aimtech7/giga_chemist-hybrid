@@ -10,8 +10,8 @@ import { enqueueSyncEvent, userJson } from '../sync/outbox';
  * the self-contained "salt$hash" format (server/auth.ts). Plaintext secrets are never stored or logged.
  */
 
-/** Roles that can be assigned through user management. */
-export const ASSIGNABLE_ROLES: UserRole[] = ['ADMIN', 'CASHIER'];
+/** Roles that can be assigned through user management: every RBAC role (server/auth.ts). */
+export const ASSIGNABLE_ROLES: UserRole[] = ['ADMIN', 'MANAGER', 'CASHIER'];
 export const MIN_PASSWORD_LENGTH = 8;
 const PIN_PATTERN = /^\d{4,6}$/;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
