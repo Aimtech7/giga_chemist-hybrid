@@ -1,3 +1,4 @@
+import { setPriceContext } from './priceHistory';
 import crypto from 'crypto';
 import type pg from 'pg';
 import { pgPool, HttpError, requireUuid, withTransaction, roundMoney, cleanUuid } from './client';
@@ -310,6 +311,7 @@ export async function applyPricingUpdate(
   const old = locked.rows[0];
   if (!old) throw new HttpError(404, `Medicine "${id}" was not found.`);
 
+  await setPriceContext(client, actor as any, 'LOCAL_ADMIN', { reason: typeof (p as any).reason === 'string' ? (p as any).reason : null });
   await client.query(
     `UPDATE medicines SET
        selling_price = COALESCE($2, selling_price), purchase_price = COALESCE($3, purchase_price),

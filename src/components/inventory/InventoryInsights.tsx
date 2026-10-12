@@ -14,7 +14,7 @@ import type { User } from '../../types';
  *   Reconciliation (shop computer) movement ledger vs batch quantities
  * Money columns are sent by the server to Administrators only.
  */
-type Tab = 'reorder' | 'movement' | 'expiry' | 'reconciliation';
+type Tab = 'reorder' | 'movement' | 'expiry' | 'reconciliation' | 'prices';
 const input = 'px-2.5 py-2 border border-slate-300 rounded-lg text-xs bg-white focus:ring-2 focus:ring-teal-600 outline-none';
 const money = (n: number | null | undefined) => (n === null || n === undefined ? '—' : Number(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
 const n0 = (n: number | null | undefined) => (n === null || n === undefined ? '—' : Number(n).toLocaleString());
@@ -55,6 +55,13 @@ export const InventoryInsights: React.FC<{ currentUser: User; online: boolean }>
       if (tab === 'movement') { p.set('fast_per_day', String(params.fast_per_day)); p.set('slow_per_day', String(params.slow_per_day)); if (filter) p.set('class', filter); }
       if (tab === 'expiry' && filter) p.set('risk', filter);
       if (tab === 'reconciliation' && filter) p.set('status', filter);
+      if (tab === 'prices') {
+        const all: any = await apiFetch(`/api/price-history?limit=1000`);
+        const s = qApplied.toLowerCase();
+        const rows = all.rows.filter((r: any) => !s || String(r.medicine_name || '').toLowerCase().includes(s));
+        setData({ items: rows, total: rows.length, rule: 'Every price change, recorded by the database (immutable). Historical sales keep the price they were sold at.' });
+        return;
+      }
       const path = tab === 'expiry' ? 'expiry-risk' : tab;
       setData(await apiFetch(`/api/inventory/insights/${path}?${p.toString()}`));
     } catch (err: any) {
@@ -65,7 +72,7 @@ export const InventoryInsights: React.FC<{ currentUser: User; online: boolean }>
   }, [tab, qApplied, params, filter]);
   useEffect(() => { void load(); }, [load]);
 
-  const tabs: [Tab, string][] = [['reorder', 'Reorder suggestions'], ['movement', 'Fast / slow / dead'], ['expiry', 'Expiry risk'], ...(online ? [] : [['reconciliation', 'Stock reconciliation'] as [Tab, string]])];
+  const tabs: [Tab, string][] = [['reorder', 'Reorder suggestions'], ['movement', 'Fast / slow / dead'], ['expiry', 'Expiry risk'], ...(online ? [] : [['reconciliation', 'Stock reconciliation'], ['prices', 'Price history']] as [Tab, string][])];
   const summaryKeys = useMemo(() => Object.keys(data?.summary || {}), [data]);
 
   return (
@@ -123,6 +130,11 @@ export const InventoryInsights: React.FC<{ currentUser: User; online: boolean }>
         <Table cols={['Medicine', 'Expected (ledger)', 'Actual', 'Variance', ...(isAdmin ? ['Variance cost'] : []), 'Last count', 'Last movement', 'Status']}
           rows={data.items.map((r: any) => [<Name r={r} />, n0(r.expected), n0(r.actual), r.variance > 0 ? `+${r.variance}` : r.variance, ...(isAdmin ? [money(r.variance_cost)] : []),
             r.last_count ? new Date(r.last_count).toLocaleDateString() : '—', r.last_movement ? new Date(r.last_movement).toLocaleString() : '—', <Badge v={r.status} />])} />
+      )}
+      {tab === 'prices' && data && (
+        <Table cols={['When', 'Medicine', 'Batch', 'Field', 'Old', 'New', 'By', 'Source', 'Reason / reference']}
+          rows={data.items.map((r: any) => [new Date(r.changed_at).toLocaleString(), r.medicine_name, r.batch_number || '—', String(r.field).replace(/_/g, ' '), money(r.old_value), money(r.new_value),
+            r.changed_by_name || '—', <Badge v={r.source} />, [r.reason, r.reference].filter(Boolean).join(' · ') || '—'])} />
       )}
       {data && data.total > (data.items?.length || 0) && <p className="text-[11px] text-slate-500">Showing the first {data.items.length} of {data.total}. Use search or a filter to narrow.</p>}
     </div>

@@ -142,4 +142,29 @@ export async function insightsApiTests(admin: Fixture, cashier: Fixture, manager
   const ro = await api('GET', `/api/inventory/insights/reorder?search=${encodeURIComponent(`INS API ${RUN}`)}&cover_days=180`, A);
   const row = ro.data.items.find((x: any) => x.medicine_id === med);
   check(!row || row.on_order === 24, 'IN20: the pending draft counts as "on order" in the suggestions', row);
+
+  section('PRICE HISTORY (immutable, every path)');
+  await api('POST', '/api/inventory/physical-count', A, { medicine_id: med, counts: [{ batch_number: `PH-${RUN}`, quantity: 5, expiry_date: '2031-01-31' }] });
+  const price0 = Number((await pool.query('SELECT selling_price FROM medicines WHERE id = $1', [med])).rows[0].selling_price);
+  const sale = await api('POST', '/api/sales/checkout', C, { idempotency_key: `itest-${crypto.randomUUID()}`, items: [{ medicine_id: med, quantity: 1, unit_price: price0 }], payment: { method: 'Cash', amount_received: 100000 } });
+  let r = await api('PATCH', `/api/medicines/${med}/pricing`, A, { selling_price: price0 + 7, purchase_price: 13 });
+  check(r.status === 200, 'admin changes selling 30 -> 37 and purchase price 12 -> 13', r.data);
+  const ph = await api('GET', `/api/price-history?medicine_id=${med}`, A);
+  const sp = ph.data?.rows?.find((x: any) => x.field === 'selling_price'), pp = ph.data?.rows?.find((x: any) => x.field === 'purchase_price');
+  check(ph.status === 200 && sp?.old_value === price0 && sp?.new_value === price0 + 7 && sp?.source === 'LOCAL_ADMIN' && sp?.changed_by_name === 'ITest SH Admin' && pp?.new_value === 13,
+    'PH1: price history row per changed field (old / new / who / source LOCAL_ADMIN)', ph.data?.rows);
+  const mph = await api('GET', `/api/price-history?medicine_id=${med}`, M);
+  check(mph.status === 200 && mph.data.rows.some((x: any) => x.field === 'selling_price') && !mph.data.rows.some((x: any) => x.field === 'purchase_price'),
+    'PH2: MANAGER sees selling-price history, never purchase-cost rows');
+  check((await api('GET', `/api/price-history?medicine_id=${med}`, C)).status === 403, 'PH3: CASHIER -> 403');
+  await pool.query('UPDATE medicines SET wholesale_price = 25 WHERE id = $1', [med]);
+  const un = (await pool.query(`SELECT source FROM price_history WHERE medicine_id = $1 AND field = 'wholesale_price'`, [med])).rows[0];
+  check(un?.source === 'UNATTRIBUTED', 'PH4: a change made outside the app is still recorded (UNATTRIBUTED) by the trigger', un);
+  let immutable = 0;
+  for (const sql of ['UPDATE price_history SET new_value = 1 WHERE medicine_id = $1', 'DELETE FROM price_history WHERE medicine_id = $1']) {
+    try { await pool.query(sql, [med]); } catch (e: any) { if (/immutable/.test(e.message)) immutable++; }
+  }
+  check(immutable === 2, 'PH5: price history rows cannot be updated or deleted');
+  const item = (await pool.query('SELECT unit_price::float AS p FROM sale_items WHERE sale_id = $1', [sale.data?.sale?.id])).rows[0];
+  check(sale.status === 201 && item?.p === price0, 'PH6: the earlier sale keeps the price it was sold at (history is metadata only)', { item, sale: sale.status, err: sale.data?.error, price0 });
 }

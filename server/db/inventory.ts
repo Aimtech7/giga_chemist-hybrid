@@ -1,3 +1,4 @@
+import { setPriceContext } from './priceHistory';
 import crypto from 'crypto';
 import type pg from 'pg';
 import { pgPool, cleanUuid, HttpError, requireUuid, withTransaction } from './client';
@@ -389,6 +390,7 @@ export async function adminAddStockTx(client: pg.PoolClient, params: AdminAddSto
     previousQty = Number(existing.quantity_available) || 0;
     const newQty = previousQty + quantity;
     const effectiveExpiry = expiryDate ?? existing.expiry_date ?? null;
+    await setPriceContext(client, params, 'BATCH_EDIT', { reason: 'Stock added' });
     const upd = await client.query(`
       UPDATE medicine_batches
       SET quantity_available = $1,
@@ -840,6 +842,7 @@ export async function adminUpdateBatchTx(client: pg.PoolClient, params: AdminUpd
   if (params.supplier_id && !(await client.query('SELECT 1 FROM suppliers WHERE id = $1', [params.supplier_id])).rows[0]) {
     throw new HttpError(404, 'Supplier not found.');
   }
+  await setPriceContext(client, params, 'BATCH_EDIT', { reason: 'Batch edited' });
   const upd = await client.query(`
     UPDATE medicine_batches SET
       batch_number = COALESCE($2, batch_number),

@@ -74,6 +74,7 @@ import { pgPool } from './db/client';
 import { buildHistoryRouter } from './http/historyRoutes';
 import { buildInventoryRouter } from './http/inventoryRoutes';
 import { createDraftPurchaseTx } from './db/purchases';
+import { getPriceHistory } from './db/priceHistory';
 import { approveStocktake, cancelStocktake, countLine, createStocktake, getStocktake, listStocktakes, reopenStocktake, startCounting, submitStocktake } from './db/stocktakes';
 import { buildShiftRouter } from './http/shiftRoutes';
 import { openShift, getCurrentShift, closeShift, reviewShift, correctShift, listOpenTills } from './db/shifts';
@@ -653,6 +654,14 @@ apiRouter.use(buildInventoryRouter({
   withScope: withLocalScope,
   send: (res, err: any, label) => sendError(res, err, 'Inventory insight failed.', label),
 }));
+// Immutable price history (local 023): Administrator + Manager; purchase-cost rows for Administrators only.
+apiRouter.get('/price-history', requirePermission('reports.view'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    res.json(await getPriceHistory(req.query as any, req.userRole === 'ADMIN'));
+  } catch (err: any) {
+    sendError(res, err, 'Could not load the price history.', 'GET /price-history');
+  }
+});
 // A PENDING purchase (nothing enters stock until it is received). Administrator only.
 apiRouter.post('/purchases/drafts', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
   try {
