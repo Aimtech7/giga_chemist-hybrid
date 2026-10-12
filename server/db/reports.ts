@@ -171,9 +171,10 @@ export async function getSalesReport(rangeIn: ResolvedRange, scope: ReportScope,
   if (scope.includeCost) {
     const ex = await q.query(
       `SELECT e.id, to_char(e.date, 'YYYY-MM-DD') AS date, e.category, e.description, e.payment_method, e.amount,
-              COALESCE(u.name, '') AS user_name
+              COALESCE(u.name, e.created_by_name, '') AS user_name
          FROM expenses e LEFT JOIN users u ON u.id = e.user_id
-        WHERE e.date BETWEEN $1::date AND $2::date ORDER BY e.date DESC, e.created_at DESC`, [start, end]);
+        WHERE e.date BETWEEN $1::date AND $2::date AND COALESCE(e.status, 'posted') <> 'voided'
+        ORDER BY e.date DESC, e.created_at DESC`, [start, end]);
     expenses = ex.rows.map((e) => ({ ...e, amount: cents(e.amount) }));
     for (const e of expenses) {
       expenseCategoryStats[e.category] = cents((expenseCategoryStats[e.category] || 0) + e.amount);
@@ -181,7 +182,8 @@ export async function getSalesReport(rangeIn: ResolvedRange, scope: ReportScope,
     }
     const pu = (await q.query(
       `SELECT COUNT(*)::int AS n, COALESCE(SUM(total_amount), 0) AS total FROM purchases
-        WHERE COALESCE(received_date, order_date) BETWEEN $1::date AND $2::date`, [start, end])).rows[0];
+        WHERE COALESCE(received_date, order_date) BETWEEN $1::date AND $2::date
+          AND COALESCE(status, 'received') = 'received'`, [start, end])).rows[0];
     purchases = { count: pu.n, total: cents(pu.total) };
   }
 

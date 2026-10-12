@@ -23,6 +23,9 @@ const FUNCTIONS: Record<string, [string, string][]> = {
   gc_pull_commands: [['p_shop_id', 'uuid'], ['p_token', 'text'], ['p_limit', 'integer']],
   gc_ack_command: [['p_shop_id', 'uuid'], ['p_token', 'text'], ['p_command_id', 'uuid'], ['p_status', 'text'], ['p_result', 'jsonb'], ['p_error', 'text']],
   gc_heartbeat: [['p_shop_id', 'uuid'], ['p_token', 'text'], ['p_status', 'jsonb']],
+  gc_sync_user_credentials: [['p_shop_id', 'uuid'], ['p_token', 'text'], ['p_users', 'jsonb']],
+  gc_fetch_user_credential: [['p_shop_id', 'uuid'], ['p_token', 'text'], ['p_local_user_id', 'uuid']],
+  gc_credential_sync_preview: [['p_shop_id', 'uuid'], ['p_token', 'text'], ['p_users', 'jsonb']],
 };
 
 export type FaultMode = 'none' | 'timeout' | 'error500' | 'drop_response';

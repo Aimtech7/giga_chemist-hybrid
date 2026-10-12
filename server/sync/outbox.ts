@@ -34,7 +34,14 @@ export type SyncEventType =
   | 'CUSTOMER_UPSERTED'
   | 'EXPENSE_RECORDED'
   | 'SETTINGS_UPDATED'
-  | 'USER_UPSERTED';
+  | 'USER_UPSERTED'
+  // Cloud migration 006 and later only (deploy cloud 006 BEFORE a shop that can emit these).
+  | 'EXPENSE_UPDATED'
+  | 'EXPENSE_VOIDED'
+  | 'PURCHASE_DRAFTED'
+  | 'PURCHASE_UPDATED'
+  | 'PURCHASE_CANCELLED'
+  | 'BATCH_UPDATED';
 
 export interface SyncActor {
   user_id?: string | null;
@@ -140,10 +147,15 @@ export async function medicineJson(client: pg.PoolClient, medicineId: string): P
   return res.rows[0]?.j ?? null;
 }
 
-/** Public user profile for the cloud: credentials (password/PIN hashes) never leave the shop. */
+/**
+ * Public user profile for the cloud business copy: credentials (password/PIN hashes) and credential
+ * bookkeeping never travel in business events. The password HASH reaches the cloud login mirror only
+ * through the dedicated credential sync (server/sync/credentials.ts); the PIN never leaves the shop.
+ */
 export async function userJson(client: pg.PoolClient, userId: string): Promise<Record<string, unknown> | null> {
   const res = await client.query(
-    `SELECT to_jsonb(u) - 'password_hash' - 'pin_hash' AS j FROM users u WHERE u.id = $1`,
+    `SELECT to_jsonb(u) - 'password_hash' - 'pin_hash' - 'credential_version' - 'credential_updated_at'
+            - 'auth_sync_seq' - 'auth_synced_seq' AS j FROM users u WHERE u.id = $1`,
     [userId]
   );
   return res.rows[0]?.j ?? null;

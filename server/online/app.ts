@@ -1,9 +1,10 @@
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import express, { type Request, type Response, type NextFunction } from 'express';
 import pg from 'pg';
 import { applyCommonMiddleware, apiErrorHandler } from '../http/common';
-import { createJwtToken, verifyJwtToken, verifyCredential, hasPermission, ROLE_PERMISSIONS } from '../auth';
+import { createJwtToken, verifyJwtToken, verifyCredential, hashCredential, hasPermission, ROLE_PERMISSIONS } from '../auth';
 import { HttpError, isValidUuid } from '../db/client';
 import { resolveRange, getSalesReport } from '../db/reports';
 import { getAllSales, getTodaySalesSummary } from '../db/sales';
@@ -16,7 +17,8 @@ import { getAllSuppliers } from '../db/suppliers';
 import { getAllPurchases } from '../db/purchases';
 import { getAllExpenses } from '../db/expenses';
 import { getPharmacySettings, toSettings } from '../db/settings';
-import { buildRemoteAdminRouter } from './remoteAdmin';
+import { buildRemoteAdminRouter, isAllShopsScope } from './remoteAdmin';
+import { buildUserAdminRouter } from './userAdmin';
 import type { UserRole } from '../../src/types';
 
 /**
@@ -24,10 +26,10 @@ import type { UserRole } from '../../src/types';
  *
  *  - Data source: the CLOUD database (Supabase) — the giga_cloud tables filled by the shop's sync,
  *    read through the giga_online views (cloud migration 002). Never the shop's local PostgreSQL.
- *  - READ-ONLY: selling, stock, returns, purchases and every other write happen only on the shop
- *    server, whose local PostgreSQL is authoritative. Writes here answer 409 ONLINE_READ_ONLY.
- *  - ONE exception, ADMIN only: /api/admin/commands/* QUEUES a remote-administration command
- *    (giga_cloud.commands) for the shop. Nothing is changed in the cloud copy: the shop's sync
+ *  - NO DIRECT WRITES: selling, stock, returns, purchases and every other change happen only on the
+ *    shop server, whose local PostgreSQL is authoritative. Writes here answer 409 ONLINE_READ_ONLY.
+ *  - Administration is FULL-WRITE through commands, ADMIN only: /api/admin/commands/* QUEUES a
+ *    remote-administration command (giga_cloud.commands) for the selected shop. Nothing is changed in the cloud copy: the shop's sync
  *    worker pulls the command, applies it in its own PostgreSQL transaction and syncs the result
  *    back. The command's status (PENDING / DELIVERED / APPLIED / REJECTED) is readable here.
  *  - The same report / Sales History SQL as the shop server runs inside a READ ONLY transaction with
@@ -35,6 +37,13 @@ import type { UserRole } from '../../src/types';
  *  - Accounts: giga_cloud.online_users (separate from shop staff; shop password/PIN hashes are
  *    never synced). Same JWT format, Online JWT_SECRET, ADMIN / CASHIER RBAC.
  *  - No background workers, no filesystem state, no pg_dump: safe for serverless.
+ *  - MULTI-SHOP: every request resolves ONE authorized shop (resolveShop, below) and stores it on
+ *    the request object, never in module state, so concurrent requests cannot share a shop. The
+ *    optional X-GIGA-SHOP-ID header is a REQUEST, re-authorized on every call:
+ *      no header            -> the account's own shop, or SHOP_ID (the default shop) for a global account
+ *      global ADMIN         -> any ACTIVE registered shop (online_users.shop_id IS NULL)
+ *      shop-scoped account  -> only its own shop (403 otherwise); CASHIER never selects freely
+ *      anonymous            -> header ignored; default shop only
  */
 export interface OnlineConfig {
   databaseUrl: string;
@@ -81,14 +90,18 @@ function getPool(cfg: OnlineConfig): pg.Pool {
   return pool;
 }
 
-/** Runs fn in a READ ONLY transaction scoped to the configured shop (works with transaction pooling). */
-async function withShop<T>(fn: (c: pg.PoolClient) => Promise<T>): Promise<T> {
+/**
+ * Runs fn in a READ ONLY transaction scoped to ONE shop (works with transaction pooling: the
+ * setting is transaction-local, so it can never leak to another request on the same connection).
+ */
+async function withShop<T>(shopId: string, fn: (c: pg.PoolClient) => Promise<T>): Promise<T> {
   const cfg = getOnlineConfig();
   if (cfg.error) throw new HttpError(503, `Online API not configured: ${cfg.error}`);
+  if (!isValidUuid(shopId)) throw new HttpError(503, 'Online API: no shop resolved for this request.');
   const client = await getPool(cfg).connect();
   try {
     await client.query('BEGIN READ ONLY');
-    await client.query(`SELECT set_config('search_path', 'giga_online, pg_catalog', true), set_config('giga.shop_id', $1, true)`, [cfg.shopId]);
+    await client.query(`SELECT set_config('search_path', 'giga_online, pg_catalog', true), set_config('giga.shop_id', $1, true)`, [shopId]);
     const result = await fn(client);
     await client.query('COMMIT');
     return result;
@@ -120,10 +133,110 @@ try {
 
 // ---------------------------------------------------------------------------- auth
 interface OnlineRequest extends Request {
-  onlineUser?: { id: string; name: string; email: string; role: UserRole; local_user_id: string | null; shop_id: string | null };
+  onlineUser?: {
+    id: string; name: string; email: string; role: UserRole; local_user_id: string | null; shop_id: string | null;
+    /** GLOBAL_ADMIN (cloud-managed, every shop) or SHOP_USER (exactly one shop). */
+    account_type: 'GLOBAL_ADMIN' | 'SHOP_USER'; username?: string | null;
+  };
+  /** The ONE shop this request is authorized to read / command (set by resolveShop). */
+  shopId?: string | null;
+}
+
+/** Request header carrying the shop the browser asks for (re-authorized on every request). */
+export const SHOP_HEADER = 'x-giga-shop-id';
+
+/** Shop of a request (resolved and authorized by resolveShop). */
+export function requestShop(req: Request): string {
+  const id = (req as OnlineRequest).shopId;
+  if (!id) throw new HttpError(503, 'Online API not configured: SHOP_ID (the default shop) is missing.');
+  return id;
+}
+
+/** Shop an account uses when the request names none: its own shop, else the default shop (SHOP_ID). */
+function homeShop(u: NonNullable<OnlineRequest['onlineUser']>, cfg: OnlineConfig): string | null {
+  return u.shop_id ? String(u.shop_id).toLowerCase() : cfg.shopId;
+}
+
+/**
+ * Only a GLOBAL_ADMIN account may select an arbitrary shop. A shop's own ADMIN role is NOT global
+ * authority: the decision rests on account_type, never on role alone.
+ */
+export function isGlobalAdmin(u: OnlineRequest['onlineUser']): boolean {
+  return Boolean(u && u.account_type === 'GLOBAL_ADMIN' && u.role === 'ADMIN' && !u.shop_id);
+}
+
+async function resolveShop(req: OnlineRequest, res: Response, next: NextFunction) {
+  const cfg = getOnlineConfig();
+  const u = req.onlineUser;
+  // Anonymous requests (health, login, public settings) never select a shop: default shop only.
+  if (!u) {
+    req.shopId = cfg.shopId;
+    return next();
+  }
+  const raw = req.headers[SHOP_HEADER];
+  if (Array.isArray(raw)) return res.status(400).json({ error: 'Send X-GIGA-SHOP-ID once.', code: 'SHOP_ID_INVALID' });
+  const wanted = String(raw || '').trim().toLowerCase();
+  if (!wanted) {
+    req.shopId = homeShop(u, cfg);
+    return next();
+  }
+  if (!isValidUuid(wanted)) return res.status(400).json({ error: 'X-GIGA-SHOP-ID must be a shop UUID.', code: 'SHOP_ID_INVALID' });
+  if (!isGlobalAdmin(u)) {
+    if (wanted !== homeShop(u, cfg)) {
+      await securityEvent(req, 'SHOP_ACCESS_DENIED', u.email, u.id, { requested_shop_id: wanted });
+      return res.status(403).json({ error: 'Forbidden: this account may not access that shop.', code: 'SHOP_ACCESS_DENIED' });
+    }
+    req.shopId = wanted;
+    return next();
+  }
+  try {
+    const shop = (await withCloud((c) => c.query('SELECT 1 FROM giga_cloud.shops WHERE shop_id = $1 AND active', [wanted]))).rows[0];
+    if (!shop) return res.status(404).json({ error: 'Shop not found or inactive.', code: 'SHOP_NOT_FOUND' });
+  } catch {
+    return res.status(503).json({ error: 'Cloud database unavailable: cannot verify the shop.' });
+  }
+  req.shopId = wanted;
+  next();
+}
+
+/** Maintenance mode of the request's shop blocks non-Administrators (health stays reachable). */
+async function maintenanceGate(req: OnlineRequest, res: Response, next: NextFunction) {
+  if (!req.onlineUser || req.onlineUser.role === 'ADMIN' || !req.shopId) return next();
+  try {
+    const ctl = await getRemoteControl(req.shopId);
+    if (ctl.maintenance_mode && !req.path.startsWith('/health')) {
+      return res.status(503).json({ error: ctl.maintenance_message || 'The online app is in maintenance. Try again later.', code: 'MAINTENANCE' });
+    }
+    next();
+  } catch {
+    res.status(503).json({ error: 'Cloud database unavailable: cannot verify the session.' });
+  }
 }
 
 const loginAttempts = new Map<string, { n: number; reset: number }>();
+
+// Per-account brute-force brake (per serverless instance, on top of the per-IP limit): 10 failed
+// attempts for one identifier lock it for 15 minutes. Same generic answer, so no enumeration.
+const loginFailures = new Map<string, { n: number; until: number; first: number }>();
+const LOGIN_DUMMY_HASH = hashCredential(crypto.randomBytes(16).toString('hex')).combined;
+function identifierLocked(id: string): boolean {
+  const f = loginFailures.get(id);
+  return Boolean(f && f.until > Date.now());
+}
+function noteFailedLogin(id: string) {
+  const now = Date.now();
+  const f = loginFailures.get(id);
+  const rec = f && now - f.first < 15 * 60_000 ? f : { n: 0, until: 0, first: now };
+  rec.n++;
+  if (rec.n >= (Number(process.env.AUTH_ACCOUNT_LOCK_THRESHOLD) || 10)) rec.until = now + 15 * 60_000;
+  loginFailures.set(id, rec);
+  if (loginFailures.size > 10_000) loginFailures.clear();
+}
+
+/** What the browser may know about its own account (never hashes or tokens). */
+function accountInfo(u: any) {
+  return { type: u.account_type, shop_id: u.shop_id || null, local_user_id: u.local_user_id || null, username: u.username || null };
+}
 function loginRateLimit(req: Request, res: Response, next: NextFunction) {
   const ip = String(req.headers['x-forwarded-for'] || req.ip || '').split(',')[0].trim() || 'unknown';
   const now = Date.now();
@@ -153,56 +266,72 @@ async function authenticate(req: OnlineRequest, res: Response, next: NextFunctio
       delete row.token_version;
       req.onlineUser = row;
     }
-    if (req.onlineUser && req.onlineUser.role !== 'ADMIN') {
-      const ctl = await getRemoteControl();
-      if (ctl.maintenance_mode && !req.path.startsWith('/health')) {
-        return res.status(503).json({ error: ctl.maintenance_message || 'The online app is in maintenance. Try again later.', code: 'MAINTENANCE' });
-      }
-    }
     next();
   } catch (err: any) {
     res.status(503).json({ error: 'Cloud database unavailable: cannot verify the session.' });
   }
 }
 
-/** Active online account (+ token_version when cloud migration 004 is applied; 0 before). */
-async function findOnlineUser(by: string, column: 'id' | 'email' = 'id', withHash = false): Promise<any> {
-  const cols = `id, name, email, role, local_user_id, shop_id${withHash ? ', password_hash' : ''}`;
+/**
+ * Active online account whose shop (if any) is active. Columns of later cloud migrations are optional:
+ * before 005 the account type is derived (an ADMIN without a shop = GLOBAL_ADMIN), before 004
+ * token_version is 0. Lookup by id, email, or username (username only when exactly ONE active account
+ * in all shops uses it — an ambiguous username never authenticates anyone; use the email).
+ */
+async function findOnlineUser(by: string, column: 'id' | 'email' | 'username' = 'id', withHash = false): Promise<any> {
+  const base = `u.id, u.name, u.email, u.role, u.local_user_id, u.shop_id${withHash ? ', u.password_hash' : ''}`;
+  const where = column === 'id' ? 'u.id = $1' : column === 'email' ? 'lower(u.email) = $1' : 'lower(u.username) = $1';
+  const sql = (cols: string) =>
+    `SELECT ${cols} FROM giga_cloud.online_users u LEFT JOIN giga_cloud.shops s ON s.shop_id = u.shop_id
+      WHERE ${where} AND u.active AND (u.shop_id IS NULL OR s.active) LIMIT 2`;
+  const pick = (rows: any[]) => (rows.length === 1 ? rows[0] : undefined);
   try {
-    return (await withCloud((c) => c.query(`SELECT ${cols}, token_version FROM giga_cloud.online_users WHERE ${column} = $1 AND active`, [by]))).rows[0];
+    return pick((await withCloud((c) => c.query(sql(`${base}, u.token_version, u.account_type, u.username`), [by]))).rows);
   } catch (err: any) {
     if (err?.code !== '42703') throw err;
-    const row = (await withCloud((c) => c.query(`SELECT ${cols} FROM giga_cloud.online_users WHERE ${column} = $1 AND active`, [by]))).rows[0];
-    return row ? { ...row, token_version: 0 } : row;
+    if (column === 'username') return undefined; // usernames exist online from cloud migration 005
+    let row: any;
+    try {
+      row = pick((await withCloud((c) => c.query(sql(`${base}, u.token_version`), [by]))).rows);
+    } catch (err2: any) {
+      if (err2?.code !== '42703') throw err2;
+      row = pick((await withCloud((c) => c.query(sql(base), [by]))).rows);
+    }
+    if (row) row.account_type = row.role === 'ADMIN' && !row.shop_id && !row.local_user_id ? 'GLOBAL_ADMIN' : 'SHOP_USER';
+    return row ? { ...row, token_version: row.token_version ?? 0 } : row;
   }
 }
 
-// Emergency switches (giga_cloud.remote_control, migration 004), cached briefly per instance.
-let controlCache: { at: number; value: { remote_writes_enabled: boolean; maintenance_mode: boolean; maintenance_message: string | null } } | null = null;
-export async function getRemoteControl(fresh = false) {
-  if (!fresh && controlCache && Date.now() - controlCache.at < 10_000) return controlCache.value;
-  let value = { remote_writes_enabled: true, maintenance_mode: false, maintenance_message: null as string | null };
+// Emergency switches (giga_cloud.remote_control, migration 004), per shop, cached briefly per instance.
+type ControlValue = { remote_writes_enabled: boolean; maintenance_mode: boolean; maintenance_message: string | null };
+const controlCache = new Map<string, { at: number; value: ControlValue }>();
+export async function getRemoteControl(shopId: string | null, fresh = false): Promise<ControlValue> {
+  const key = String(shopId || '');
+  const hit = controlCache.get(key);
+  if (!fresh && hit && Date.now() - hit.at < 10_000) return hit.value;
+  let value: ControlValue = { remote_writes_enabled: true, maintenance_mode: false, maintenance_message: null };
   try {
     const row = (await withCloud((c) => c.query(
-      `SELECT remote_writes_enabled, maintenance_mode, maintenance_message FROM giga_cloud.remote_control WHERE shop_id = $1`, [getOnlineConfig().shopId]
+      `SELECT remote_writes_enabled, maintenance_mode, maintenance_message FROM giga_cloud.remote_control WHERE shop_id = $1`, [shopId]
     ))).rows[0];
     if (row) value = row;
   } catch (err: any) {
     if (err?.code !== '42P01') throw err; // table missing = migration 004 not applied = defaults
   }
-  controlCache = { at: Date.now(), value };
+  controlCache.set(key, { at: Date.now(), value });
   return value;
 }
-export function clearRemoteControlCache() {
-  controlCache = null;
+export function clearRemoteControlCache(shopId?: string | null) {
+  if (shopId === undefined) controlCache.clear();
+  else controlCache.delete(String(shopId || ''));
 }
 
-/** Security event in giga_cloud.online_audit (never passwords/tokens). Best effort. */
+/** Security event in giga_cloud.online_audit, tagged with the request's shop (never passwords/tokens). Best effort. */
 export async function securityEvent(req: Request, action: string, email: string | null, userId: string | null, details: Record<string, unknown> = {}) {
   try {
     await withCloud((c) => c.query(
       `INSERT INTO giga_cloud.online_audit (shop_id, online_user_id, user_email, action, details, client_ip, user_agent) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [getOnlineConfig().shopId, userId, email ? email.slice(0, 200) : null, action, JSON.stringify(details),
+      [(req as OnlineRequest).shopId || getOnlineConfig().shopId, userId, email ? email.slice(0, 200) : null, action, JSON.stringify(details),
        String(req.headers['x-forwarded-for'] || req.ip || '').split(',')[0].trim().slice(0, 100), String(req.headers['user-agent'] || '').slice(0, 300)]
     ));
   } catch {
@@ -231,7 +360,8 @@ function send(res: Response, err: any, label: string) {
   }
   const status = typeof err?.status === 'number' ? err.status : 500;
   if (status >= 500) console.error(`[Online] ${label} failed:`, err?.message || err);
-  res.status(status).json({ error: status >= 500 && !(err instanceof HttpError) ? 'Cloud database error.' : err.message });
+  const code = err instanceof HttpError && typeof err.details?.code === 'string' ? { code: err.details.code } : {};
+  res.status(status).json({ error: status >= 500 && !(err instanceof HttpError) ? 'Cloud database error.' : err.message, ...code });
 }
 const route = (label: string, fn: (req: OnlineRequest, res: Response) => Promise<unknown>) =>
   async (req: OnlineRequest, res: Response) => {
@@ -250,6 +380,15 @@ const cashierScope = (u: NonNullable<OnlineRequest['onlineUser']>) =>
 export function buildOnlineRouter() {
   const r = express.Router();
   r.use(authenticate);
+  r.use(resolveShop);
+  r.use(maintenanceGate);
+  // "All Shops" (X-GIGA-SCOPE: ALL) is a read-only consolidated view: no shop-scoped write may run
+  // from it. Only the explicit all-shops fan-out and the (shop-less) Global Administrator accounts.
+  r.use((req, res, next) => {
+    if (req.method === 'GET' || req.method === 'HEAD' || !isAllShopsScope(req)) return next();
+    if (req.path.startsWith('/admin/all-shops/') || req.path.startsWith('/admin/accounts/global-admins') || req.path.startsWith('/auth/')) return next();
+    res.status(409).json({ error: 'All Shops is a read-only view. Select one shop to change it.', code: 'ALL_SHOPS_READ_ONLY' });
+  });
 
   r.get('/health', async (_req, res) => {
     const cfg = getOnlineConfig();
@@ -281,26 +420,34 @@ export function buildOnlineRouter() {
     }
   });
 
+  // ONE login for every account: Global Administrators and shop staff (same password as at the shop).
+  // PASSWORD ONLY: a shop PIN is never an internet credential (a "pin" field is ignored entirely).
   r.post('/auth/login', loginRateLimit, async (req, res) => {
     try {
       const identifier = String(req.body?.email || req.body?.username || '').trim().toLowerCase();
       const secret = String(req.body?.password || '').trim();
-      if (!identifier || !secret) return res.status(400).json({ error: 'Email and password are required.' });
-      const user = await findOnlineUser(identifier, 'email', true);
-      const shopId = getOnlineConfig().shopId;
-      // Same answer for unknown user / wrong password / other shop.
-      if (!user || !verifyCredential(secret, user.password_hash) || (user.shop_id && user.shop_id !== shopId)) {
+      if (!identifier || !secret) return res.status(400).json({ error: 'Email/username and password are required.' });
+      if (identifierLocked(identifier)) return res.status(429).json({ error: 'Too many failed attempts for this account. Wait 15 minutes.' });
+      const user = await findOnlineUser(identifier, identifier.includes('@') ? 'email' : 'username', true);
+      // Same answer for unknown user / wrong password / inactive account or shop (no enumeration).
+      if (!verifyCredential(secret, user?.password_hash || LOGIN_DUMMY_HASH) || !user) {
+        noteFailedLogin(identifier);
         await securityEvent(req, 'ONLINE_LOGIN_FAILED', identifier, user?.id ?? null);
-        return res.status(401).json({ error: 'Invalid email or password.' });
+        return res.status(401).json({ error: 'Invalid email/username or password.' });
       }
+      loginFailures.delete(identifier);
+      const ownShop = user.shop_id ? String(user.shop_id).toLowerCase() : null;
+      const shopId = getOnlineConfig().shopId;
+      (req as OnlineRequest).shopId = ownShop || shopId;
       if (user.role !== 'ADMIN') {
-        const ctl = await getRemoteControl();
+        const ctl = await getRemoteControl(ownShop || shopId);
         if (ctl.maintenance_mode) return res.status(503).json({ error: ctl.maintenance_message || 'The online app is in maintenance. Try again later.', code: 'MAINTENANCE' });
       }
       await securityEvent(req, 'ONLINE_LOGIN', user.email, user.id, { role: user.role });
       await withCloud((c) => c.query('UPDATE giga_cloud.online_users SET last_login_at = now() WHERE id = $1', [user.id]));
       const token = createJwtToken({ userId: user.id, role: user.role, email: user.email, name: user.name, tv: Number(user.token_version || 0) });
-      res.json({ success: true, token, user: { id: user.id, name: user.name, email: user.email, role: user.role, active: true }, permissions: ROLE_PERMISSIONS[user.role as UserRole] });
+      res.json({ success: true, token, user: { id: user.id, name: user.name, email: user.email, role: user.role, active: true },
+        permissions: ROLE_PERMISSIONS[user.role as UserRole], account: accountInfo(user) });
     } catch (err) {
       send(res, err, 'POST /auth/login');
     }
@@ -308,13 +455,13 @@ export function buildOnlineRouter() {
 
   r.get('/auth/me', requireAuth, (req: OnlineRequest, res) => {
     const u = req.onlineUser!;
-    res.json({ user: { id: u.id, name: u.name, email: u.email, role: u.role, active: true }, permissions: ROLE_PERMISSIONS[u.role] });
+    res.json({ user: { id: u.id, name: u.name, email: u.email, role: u.role, active: true }, permissions: ROLE_PERMISSIONS[u.role], account: accountInfo(u) });
   });
 
   // Terminals are a shop concept; online browsers are not registered.
   r.post('/devices/register', requireAuth, (_req, res) => res.json({ status: 'not_tracked_online' }));
 
-  r.get('/settings', route('GET /settings', () => withShop(async (c) => {
+  r.get('/settings', route('GET /settings', (req) => withShop(requestShop(req), async (c) => {
     try {
       return await getPharmacySettings(c);
     } catch {
@@ -322,23 +469,22 @@ export function buildOnlineRouter() {
     }
   })));
 
-  r.get('/sync/status', requireAuth, route('GET /sync/status', async () => {
-    const cfg = getOnlineConfig();
-    const shop = await withCloud((c) => c.query('SELECT last_event_at FROM giga_cloud.shops WHERE shop_id = $1', [cfg.shopId]));
+  r.get('/sync/status', requireAuth, route('GET /sync/status', async (req) => {
+    const shop = await withCloud((c) => c.query('SELECT last_event_at FROM giga_cloud.shops WHERE shop_id = $1', [requestShop(req)]));
     return { mode: 'online', enabled: false, read_only: true, local_database: { connected: true }, cloud_reachable: true, counts: null, last_sync: shop.rows[0]?.last_event_at || null };
   }));
 
   const stripCost = (req: OnlineRequest, rows: any[], fields: string[]) =>
     req.onlineUser!.role === 'CASHIER' ? rows.map((x) => Object.fromEntries(Object.entries(x).map(([k, v]) => [k, fields.includes(k) ? 0 : v]))) : rows;
 
-  r.get('/medicines', requirePermission('medicine.view'), route('GET /medicines', async (req) => stripCost(req, await withShop((c) => getAllMedicines(c)), ['purchase_price'])));
-  r.get('/categories', requirePermission('medicine.view'), route('GET /categories', () => withShop((c) => getAllCategories(c))));
-  r.get('/batches', requirePermission('medicine.view'), route('GET /batches', async (req) => stripCost(req, await withShop((c) => getAllBatches(c)), ['purchase_price'])));
-  r.get('/customers', requirePermission('sales.view_own'), route('GET /customers', () => withShop((c) => getAllCustomers(c))));
+  r.get('/medicines', requirePermission('medicine.view'), route('GET /medicines', async (req) => stripCost(req, await withShop(requestShop(req), (c) => getAllMedicines(c)), ['purchase_price'])));
+  r.get('/categories', requirePermission('medicine.view'), route('GET /categories', (req) => withShop(requestShop(req), (c) => getAllCategories(c))));
+  r.get('/batches', requirePermission('medicine.view'), route('GET /batches', async (req) => stripCost(req, await withShop(requestShop(req), (c) => getAllBatches(c)), ['purchase_price'])));
+  r.get('/customers', requirePermission('sales.view_own'), route('GET /customers', (req) => withShop(requestShop(req), (c) => getAllCustomers(c))));
 
   r.get('/sales', requirePermission('sales.view_own'), route('GET /sales', async (req) => {
     const q = req.query;
-    const result: any = await withShop((c) => getAllSales({
+    const result: any = await withShop(requestShop(req), (c) => getAllSales({
       page: Number(q.page) || 1, limit: Number(q.limit) || 50, search: q.search as string, startDate: q.startDate as string, endDate: q.endDate as string,
       cashierId: cashierScope(req.onlineUser!) ?? (q.cashierId as string | undefined),
       paymentMethod: (q.paymentMethod as string) || undefined, customerId: (q.customerId as string) || undefined,
@@ -350,31 +496,35 @@ export function buildOnlineRouter() {
   }));
 
   r.get('/sales/today-summary', requireAuth, route('GET /sales/today-summary', async (req) => {
-    const s: any = await withShop((c) => getTodaySalesSummary({ cashierId: cashierScope(req.onlineUser!) ?? ((req.query.cashierId as string) || undefined) }, c));
+    const s: any = await withShop(requestShop(req), (c) => getTodaySalesSummary({ cashierId: cashierScope(req.onlineUser!) ?? ((req.query.cashierId as string) || undefined) }, c));
     if (req.onlineUser!.role !== 'ADMIN') delete s.grossProfit;
     return s;
   }));
 
-  r.get('/reports/summary', requirePermission('sales.view_own'), route('GET /reports/summary', (req) => withShop(async (c) => {
+  r.get('/reports/summary', requirePermission('sales.view_own'), route('GET /reports/summary', (req) => withShop(requestShop(req), async (c) => {
     const isAdmin = req.onlineUser!.role === 'ADMIN';
     const range = await resolveRange(req.query.range, req.query.start, req.query.end, c);
     return getSalesReport(range, { cashierId: isAdmin ? ((req.query.cashierId as string) || null) : cashierScope(req.onlineUser!), includeCost: isAdmin }, c);
   })));
 
-  r.get('/returns', requirePermission('returns.create'), route('GET /returns', (req) => withShop((c) => {
+  r.get('/returns', requirePermission('returns.create'), route('GET /returns', (req) => withShop(requestShop(req), (c) => {
     const status = typeof req.query.status === 'string' && req.query.status ? req.query.status.toUpperCase() : undefined;
     return getAllReturns({ userId: cashierScope(req.onlineUser!), status }, c);
   })));
 
-  r.get('/users', requireAdmin, route('GET /users', () => withShop(async (c) =>
+  r.get('/users', requireAdmin, route('GET /users', (req) => withShop(requestShop(req), async (c) =>
     (await c.query('SELECT id, name, email, username, role, active FROM users ORDER BY name')).rows)));
-  r.get('/suppliers', requireAdmin, route('GET /suppliers', () => withShop((c) => getAllSuppliers(c))));
-  r.get('/purchases', requireAdmin, route('GET /purchases', () => withShop((c) => getAllPurchases(c))));
-  r.get('/expenses', requireAdmin, route('GET /expenses', () => withShop((c) => getAllExpenses(c))));
+  r.get('/suppliers', requireAdmin, route('GET /suppliers', (req) => withShop(requestShop(req), (c) => getAllSuppliers(c))));
+  r.get('/purchases', requireAdmin, route('GET /purchases', (req) => withShop(requestShop(req), (c) => getAllPurchases(c))));
+  r.get('/expenses', requireAdmin, route('GET /expenses', (req) => withShop(requestShop(req), (c) => getAllExpenses(c))));
+
+  // User management (GLOBAL Administrators only): cloud login mirror + staff commands for the selected shop.
+  r.use(buildUserAdminRouter({ shopId: requestShop, withCloud, route, isGlobalAdmin, securityEvent }));
 
   // Remote administration (ADMIN only): queue commands for the shop; never a direct cloud write.
   r.use(buildRemoteAdminRouter({
-    shopId: () => getOnlineConfig().shopId, withShop, withCloud, requireAdmin, route, getRemoteControl, clearRemoteControlCache, securityEvent,
+    shopId: requestShop, withShop: (req, fn) => withShop(requestShop(req), fn), withShopId: withShop, withCloud, requireAdmin, route, getRemoteControl, clearRemoteControlCache, securityEvent,
+    isGlobalAdmin,
   }));
 
   // Shop-only features: not available from the cloud copy (yet).

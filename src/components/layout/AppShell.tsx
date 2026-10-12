@@ -32,6 +32,7 @@ import { runSync, subscribeToSyncStatus } from '../../services/syncEngine';
 import { getOrRegisterDevice } from '../../services/device';
 import { canAccessModule, isCashier } from '../../services/permissions';
 import { getServerMode } from '../../services/remoteAdmin';
+import { ShopContextStrip, ShopSelector } from './ShopSelector';
 import type { User, PharmacySettings, DeviceInfo } from '../../types';
 
 export type AppModule =
@@ -132,7 +133,17 @@ export const AppShell: React.FC<AppShellProps> = ({
     { id: 'settings' as AppModule, label: 'Settings', icon: SettingsIcon },
   ];
   // Online app (Vercel): remote administration of the shop, listed first for the Administrator.
-  if (serverMode === 'online') allNavItems.unshift({ id: 'remote' as AppModule, label: 'Remote Admin', icon: Smartphone });
+  if (serverMode === 'online') allNavItems.unshift({ id: 'remote' as AppModule, label: 'Remote Operations', icon: Smartphone });
+  // Online Administrator: the GLOBAL CONTROL CENTER structure (one shop at a time, or All Shops).
+  const onlineAdmin = serverMode === 'online' && currentUser?.role === 'ADMIN';
+  const ONLINE_SECTIONS: [string, AppModule[]][] = [
+    ['', ['dashboard' as AppModule]],
+    ['Operations', ['medicines', 'inventory', 'batches', 'expiry', 'purchases'] as AppModule[]],
+    ['Directory', ['suppliers', 'customers'] as AppModule[]],
+    ['Finance', ['sales', 'returns', 'expenses', 'reports'] as AppModule[]],
+    ['Administration', ['users', 'settings', 'audit'] as AppModule[]],
+    ['System', ['remote'] as AppModule[]],
+  ];
 
   // STRICT RBAC: Filter navigation items based on user role.
   // Cashiers ONLY see permitted modules: Dashboard, POS Register, Medicine Lookup, Customers, Sales History, Returns.
@@ -164,6 +175,8 @@ export const AppShell: React.FC<AppShellProps> = ({
               </span>
             )}
           </div>
+          {/* Online app only: the shop every screen and remote change applies to (never on the shop POS). */}
+          {serverMode === 'online' && currentUser?.role === 'ADMIN' && <ShopSelector />}
         </div>
 
         {/* Center: local POS server vs cloud sync status (kept separate) */}
@@ -282,7 +295,18 @@ export const AppShell: React.FC<AppShellProps> = ({
             </button>
           </div>
           <nav className="flex-1 px-1.5 py-2 space-y-0.5">
-            {visibleNavItems.map((item) => {
+            {(onlineAdmin
+              ? ONLINE_SECTIONS.flatMap(([title, ids]) => {
+                  const items = ids.map((id) => visibleNavItems.find((x) => x.id === id)).filter(Boolean) as typeof visibleNavItems;
+                  if (!items.length) return [];
+                  return [...(title ? [{ heading: title }] : []), ...items];
+                })
+              : visibleNavItems
+            ).map((entry: any) => {
+              if (entry.heading) {
+                return <div key={`h-${entry.heading}`} className="px-2.5 pt-3 pb-1 text-[10px] font-bold uppercase tracking-widest text-slate-500">{entry.heading}</div>;
+              }
+              const item = entry as (typeof visibleNavItems)[number];
               const active = currentModule === item.id;
               const Icon = item.icon;
 
@@ -314,6 +338,7 @@ export const AppShell: React.FC<AppShellProps> = ({
 
         {/* Content Outlet */}
         <main className="flex-1 flex flex-col overflow-hidden bg-slate-50">
+          {onlineAdmin && <ShopContextStrip />}
           {children}
         </main>
       </div>

@@ -211,6 +211,8 @@ export async function upsertFixtureMedicine(barcode: string, name: string, selli
 //   users      email LIKE 'itest-%@gigachemist.local'
 //   medicines  barcode LIKE 'ITEST-%'
 //   suppliers / customers  name LIKE 'ZZ ITEST%'
+//   expenses   description LIKE 'ZZ ITEST%' (remote expenses have no shop user)
+//   outbox     events of remote test Administrators (actor 'CLOUD (ITest ...)')
 // Sales are deleted only when made by an itest user AND every line is an ITEST medicine.
 // ---------------------------------------------------------------------------
 export async function cleanupFixtures(): Promise<Record<string, number>> {
@@ -225,7 +227,8 @@ export async function cleanupFixtures(): Promise<Record<string, number>> {
       `DELETE FROM sync_events WHERE actor_user_id IN (${itestUsers})
          OR (entity_type = 'medicine' AND entity_id IN (${itestMeds}))
          OR (entity_type = 'medicine_batch' AND entity_id IN (SELECT b.id::text FROM medicine_batches b JOIN medicines m ON m.id = b.medicine_id WHERE m.barcode LIKE 'ITEST-%'))
-         OR (entity_type = 'user' AND entity_id IN (SELECT id::text FROM users WHERE email LIKE 'itest-%@gigachemist.local'))`
+         OR (entity_type = 'user' AND entity_id IN (SELECT id::text FROM users WHERE email LIKE 'itest-%@gigachemist.local'))
+         OR actor_name LIKE 'CLOUD (ITest%'`
     )).rowCount || 0;
     counts.sync_inbound_commands = (await client.query(
       `DELETE FROM sync_inbound_commands WHERE payload->>'medicine_id' IN (${itestMeds}) OR payload->>'name' LIKE 'ZZ ITEST%'`
@@ -240,7 +243,7 @@ export async function cleanupFixtures(): Promise<Record<string, number>> {
     const testPurchases = `SELECT p.id FROM purchases p JOIN suppliers s ON s.id = p.supplier_id WHERE s.name LIKE 'ZZ ITEST%'`;
     counts.purchases = (await client.query(`DELETE FROM purchases WHERE id IN (${testPurchases})`)).rowCount || 0;
     counts.expenses = (await client.query(
-      `DELETE FROM expenses WHERE user_id IN (SELECT id FROM users WHERE email LIKE 'itest-%@gigachemist.local')`
+      `DELETE FROM expenses WHERE user_id IN (SELECT id FROM users WHERE email LIKE 'itest-%@gigachemist.local') OR description LIKE 'ZZ ITEST%'`
     )).rowCount || 0;
     counts.movements = (await client.query(
       `DELETE FROM inventory_movements WHERE medicine_id IN (SELECT id FROM medicines WHERE barcode LIKE 'ITEST-%')`

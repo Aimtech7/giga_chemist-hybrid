@@ -294,7 +294,7 @@ async function remoteAdminTests(ctx: Ctx, env: HybridEnv, o: { med: string; onli
 
   // 4. Physical count, price, expiry
   const prev5 = await batchQty();
-  const f5 = await follow((await c('POST', '/api/admin/commands/stock-set', A, { medicine_id: med, batch_id: batchId, quantity: 30, reason: 'ITEST phone count' })).data?.command_id);
+  const f5 = await follow((await c('POST', '/api/admin/commands/stock-set', A, { medicine_id: med, batch_id: batchId, quantity: 30, reason: 'ITEST phone count', expected_quantity: prev5 })).data?.command_id);
   check(f5.status === 'APPLIED' && (await batchQty()) === 30 && f5.result?.delta === 30 - prev5, `STOCK_SET -> 30 (delta ${f5.result?.delta})`, f5.result);
   const f6 = await follow((await c('POST', '/api/admin/commands/price-update', A, { medicine_id: med, selling_price: 175, wholesale_price: 160 })).data?.command_id);
   check(f6.status === 'APPLIED' && (await localMed()).sp === 175, 'PRICE_UPDATE from the phone applied (selling 175)', f6);

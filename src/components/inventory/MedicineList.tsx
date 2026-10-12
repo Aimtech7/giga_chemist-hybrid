@@ -20,6 +20,8 @@ import { PriceEditModal } from '../medicines/PriceEditModal';
 import { downloadCSV } from '../../services/exportUtils';
 import { searchMedicines } from '../../services/searchEngine';
 import { canViewCostData, isCashier } from '../../services/permissions';
+import { CATALOG_REFRESHED_EVENT, isCatalogForCurrentShop } from '../../services/syncEngine';
+import { CatalogStatusBanner } from '../common/CatalogStatusBanner';
 import type { Category, Medicine, PharmacySettings, User } from '../../types';
 
 interface MedicineListProps {
@@ -47,13 +49,18 @@ export const MedicineList: React.FC<MedicineListProps> = ({ currentUser, setting
   const isCashierUser = isCashier(currentUser);
 
   const loadMedicines = async () => {
-    const [list, cats] = await Promise.all([db.medicines.toArray(), db.categories.orderBy('name').toArray()]);
+    // Cross-shop guard: a catalogue cached for another shop is never listed (the banner explains).
+    const catalogOk = await isCatalogForCurrentShop();
+    const [list, cats] = await Promise.all([catalogOk ? db.medicines.toArray() : [], db.categories.orderBy('name').toArray()]);
     setMedicines(list);
     setCategories(cats);
   };
 
   useEffect(() => {
     loadMedicines();
+    const onCatalog = () => void loadMedicines();
+    window.addEventListener(CATALOG_REFRESHED_EVENT, onCatalog);
+    return () => window.removeEventListener(CATALOG_REFRESHED_EVENT, onCatalog);
   }, []);
 
   const handleExportCSV = () => {
@@ -122,6 +129,7 @@ export const MedicineList: React.FC<MedicineListProps> = ({ currentUser, setting
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden bg-slate-50">
+      <CatalogStatusBanner />
       {/* Top action header */}
       <div className="p-4 bg-white border-b border-slate-200 flex flex-col md:flex-row md:items-center justify-between gap-3 shrink-0">
         <div>

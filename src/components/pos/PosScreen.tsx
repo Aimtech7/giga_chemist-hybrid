@@ -27,6 +27,8 @@ import { HeldSalesModal } from './HeldSalesModal';
 import { ReceiptModal } from './ReceiptModal';
 import { apiFetch, ApiError } from '../../services/http';
 import { applyServerStockResult, refreshCacheAfterCommit } from '../../services/stockCache';
+import { CATALOG_REFRESHED_EVENT, isCatalogForCurrentShop } from '../../services/syncEngine';
+import { CatalogStatusBanner } from '../common/CatalogStatusBanner';
 import type {
   Medicine,
   MedicineBatch,
@@ -111,9 +113,11 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
   // Load active data from Dexie
   const loadData = async () => {
     try {
+      // Cross-shop guard: a catalogue cached for another shop is never shown (the banner explains).
+      const catalogOk = await isCatalogForCurrentShop();
       // Only ACTIVE medicines are sellable or searchable at the till (inactive ones, including the
       // automated-test fixtures, never appear here).
-      const meds = await db.medicines.where('status').equals('active').toArray();
+      const meds = catalogOk ? await db.medicines.where('status').equals('active').toArray() : [];
       setMedicines(meds);
 
       // Real categories (hydrated from PostgreSQL) that at least one active medicine uses.
@@ -133,13 +137,13 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
       // A remembered category that no longer exists falls back to All.
       setSelectedCategory((prev) => (prev === 'All' || seen.has(prev.toLowerCase()) ? prev : 'All'));
 
-      const allBatches = await db.medicine_batches.toArray();
+      const allBatches = catalogOk ? await db.medicine_batches.toArray() : [];
       setBatches(allBatches);
 
       const custs = await db.customers.toArray();
       setCustomers(custs);
-      if (!selectedCustomer && custs.length > 0) {
-        setSelectedCustomer(custs[0]); // default to Walk-in
+      if (custs.length > 0) {
+        setSelectedCustomer((prev) => prev ?? custs[0]); // default to Walk-in
       }
 
       const held = await db.held_sales.toArray();
@@ -151,6 +155,11 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
 
   useEffect(() => {
     loadData();
+    // A completed catalogue refresh (login, manual sync, shop switch) replaces the cached snapshot:
+    // re-read it so the till never keeps showing the previous one.
+    const onCatalog = () => void loadData();
+    window.addEventListener(CATALOG_REFRESHED_EVENT, onCatalog);
+    return () => window.removeEventListener(CATALOG_REFRESHED_EVENT, onCatalog);
   }, []);
 
   // Universal Search Integration with Category Filter
@@ -561,6 +570,7 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
     <div className="flex-1 flex overflow-hidden bg-slate-100">
       {/* LEFT COLUMN: Medicine Catalog & Universal Search */}
       <div className="flex-1 flex flex-col min-w-0 border-r border-slate-200 bg-white">
+        <CatalogStatusBanner />
         {/* Universal Search Bar & Scanner Status */}
         <div className="p-3 bg-white border-b border-slate-200 space-y-2">
           <div className="flex items-center gap-2">

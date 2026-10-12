@@ -1,5 +1,6 @@
 import crypto from 'crypto';
-import { pgPool, HttpError, requireUuid, withTransaction, businessNow, type Queryable } from './client';
+import type pg from 'pg';
+import { pgPool, HttpError, requireUuid, withTransaction, businessNow, cleanUuid, type Queryable } from './client';
 import { ensureDevice } from './devices';
 import { recordAuditLog } from './audit';
 import { enqueueSyncEvent, rowJson, rowsJson } from '../sync/outbox';
@@ -656,8 +657,17 @@ export async function voidSale(saleIdRaw: string, reasonRaw: unknown, actor: Sal
   const saleId = requireUuid(saleIdRaw, 'sale id');
   const reason = typeof reasonRaw === 'string' ? reasonRaw.trim().slice(0, 1000) : '';
   if (!reason) throw new HttpError(400, 'A void reason is required.');
+  return withTransaction((client) => voidSaleTx(client, saleId, reason, actor));
+}
 
-  return withTransaction(async (client) => {
+/**
+ * voidSale on the caller's transaction (remote commands). The completed sale itself is never edited:
+ * a void reverses its stock and marks it voided; returns/refunds have their own workflow.
+ */
+export async function voidSaleTx(client: pg.PoolClient, saleId: string, reasonRaw: string, actor: SaleActor) {
+  // A remote Administrator has no shop account: the void reason names them (voided_by stays empty).
+  const reason = cleanUuid(actor.user_id) ? reasonRaw : `${reasonRaw} [voided remotely by ${actor.user_name}]`.slice(0, 1000);
+  {
     const found = await client.query('SELECT * FROM sales WHERE id = $1 FOR UPDATE', [saleId]);
     const sale = found.rows[0];
     if (!sale) throw new HttpError(404, 'Sale not found.');
@@ -712,7 +722,7 @@ export async function voidSale(saleIdRaw: string, reasonRaw: unknown, actor: Sal
 
     await client.query(
       `UPDATE sales SET status = 'voided', void_reason = $1, voided_by = $2 WHERE id = $3`,
-      [reason, actor.user_id, saleId]
+      [reason, cleanUuid(actor.user_id), saleId]
     );
     if (sale.customer_id) {
       await client.query(
@@ -757,7 +767,7 @@ export async function voidSale(saleIdRaw: string, reasonRaw: unknown, actor: Sal
       medicines,
       batches: [...touched.values()].map((b) => toBatchDto(b)),
     };
-  });
+  }
 }
 
 // =============================================================================

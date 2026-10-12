@@ -1,8 +1,9 @@
 import pg from 'pg';
-import { pgPool, getDatabaseConnectionConfig } from '../db/client';
+import { pgPool, getDatabaseConnectionConfig, isValidUuid } from '../db/client';
 import { getSyncConfig, cloudHost } from './config';
 import { callCloud, CloudError } from './cloudClient';
-import { applyCloudCommand, type CloudCommand } from './commands';
+import { applyCloudCommand, CREDENTIAL_COMMANDS, type CloudCommand } from './commands';
+import { fetchCommandCredential, pushUserCredentials } from './credentials';
 import { getShopIdentity, reconcileShopIdentity } from './identity';
 import { collectRuntimeStatus } from './heartbeat';
 
@@ -20,6 +21,10 @@ import { collectRuntimeStatus } from './heartbeat';
  *  - startup never depends on the cloud: every cloud error is caught, logged and retried later
  */
 const LEADER_LOCK_KEY = 7_420_317_001; // arbitrary constant for pg_try_advisory_lock
+
+async function commandSeen(commandId: string): Promise<boolean> {
+  return Boolean((await pgPool.query('SELECT 1 FROM sync_inbound_commands WHERE command_id = $1', [commandId])).rows[0]);
+}
 const BASE_RETRY_SECONDS = 5;
 const MAX_BATCHES_PER_CYCLE = 20;
 const MANUAL_WAKE_MIN_INTERVAL_MS = 3000;
@@ -149,10 +154,17 @@ class SyncWorker {
     const inbound = await this.pullAndApplyCommands();
     if (inbound === 'unreachable') return;
 
-    // 3. Heartbeat (runtime health + alert conditions) for the Administrator's phone.
+    // 3. Staff credentials for the unified login (password hashes only; off until the cloud enables it).
+    try {
+      await pushUserCredentials();
+    } catch (err: any) {
+      console.warn('[Sync] Credential sync step failed (will retry):', err?.message || err);
+    }
+
+    // 4. Heartbeat (runtime health + alert conditions) for the Administrator's phone.
     await this.maybeHeartbeat();
 
-    // 4. Cloud just became reachable again: make backed-off events due and push them now.
+    // 5. Cloud just became reachable again: make backed-off events due and push them now.
     if (inbound === 'reconnected' || outbound === 'reconnected') {
       const res = await pgPool.query(
         `UPDATE sync_events SET next_attempt_at = CURRENT_TIMESTAMP WHERE status = 'PENDING' AND next_attempt_at > CURRENT_TIMESTAMP`
@@ -338,8 +350,17 @@ class SyncWorker {
     for (const cmd of commands) {
       let result;
       try {
+        // Credential commands: fetch the one password hash out of band, just before applying (never
+        // stored with the command). Already-applied commands skip the fetch (re-delivery is a no-op).
+        if (CREDENTIAL_COMMANDS.includes(cmd?.command_type) && isValidUuid(cmd?.payload?.user_id) && !(await commandSeen(cmd.command_id))) {
+          const fetched = await fetchCommandCredential(String(cmd.payload.user_id).toLowerCase());
+          cmd.credential = fetched.credential ?? null;
+          cmd.credential_error = fetched.error ?? null;
+        }
         result = await applyCloudCommand(cmd);
+        delete cmd.credential;
       } catch (err: any) {
+        delete cmd.credential;
         if (typeof err?.status === 'number') {
           // Malformed beyond recording (no usable id/key): nothing to apply or acknowledge.
           console.error('[Sync] Ignoring malformed cloud command:', err.message);

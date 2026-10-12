@@ -1,7 +1,7 @@
 import type { User } from '../types';
 import { apiFetch, ApiError } from './http';
 import { getOrRegisterDevice } from './device';
-import { syncFromLocalApiToDexie } from './syncEngine';
+import { purgeIfShopChanged, syncFromLocalApiToDexie } from './syncEngine';
 import {
   getAuthToken,
   setAuthToken,
@@ -10,6 +10,7 @@ import {
   clearSession,
   hasUsableToken,
 } from './session';
+import { setOnlineAccount, type OnlineAccount } from './shopContext';
 
 export { getAuthToken, setAuthToken, getCachedUser, setCachedUser, hasUsableToken };
 
@@ -32,6 +33,8 @@ interface LoginResponse {
   user: User;
   token: string;
   permissions: string[];
+  /** Online server only: GLOBAL_ADMIN or SHOP_USER (the local server sends none). */
+  account?: OnlineAccount;
 }
 
 export async function loginWithPinOrEmail(identifier: string, secret: string): Promise<User> {
@@ -50,6 +53,9 @@ export async function loginWithPinOrEmail(identifier: string, secret: string): P
 
     setAuthToken(data.token);
     setCachedUser(data.user);
+    setOnlineAccount(data.account ?? null);
+    // A cache filled for another shop (other account on this browser) is emptied BEFORE any screen renders.
+    await purgeIfShopChanged().catch((e) => console.warn('[Auth] Cache shop check failed:', e));
 
     // Register this terminal in PostgreSQL and hydrate the local cache in the background.
     apiFetch('/api/devices/register', { body: { device_id: (await getOrRegisterDevice()).id } }).catch((e) =>
@@ -75,9 +81,12 @@ export async function verifySession(): Promise<User | null> {
     return null;
   }
   try {
-    const data = await apiFetch<{ user: User }>('/api/auth/me');
+    const data = await apiFetch<{ user: User; account?: OnlineAccount }>('/api/auth/me');
     const merged = { ...(getCachedUser() || {}), ...data.user } as User;
     setCachedUser(merged);
+    setOnlineAccount(data.account ?? null);
+    // A cache filled for another shop (other account on this browser) is emptied BEFORE any screen renders.
+    await purgeIfShopChanged().catch((e) => console.warn('[Auth] Cache shop check failed:', e));
     return merged;
   } catch (err: any) {
     if (err instanceof ApiError && err.status === 0) return getCachedUser();

@@ -2,6 +2,7 @@ import { db, getDeviceId, getSettings, saveSettings } from '../db/dexie';
 import { setSyncingState, refreshNetworkStatus } from './network';
 import { apiFetch } from './http';
 import { getCachedUser, hasUsableToken } from './session';
+import { getOnlineAccount, shopCacheKey } from './shopContext';
 import type {
   Sale,
   InventoryMovement,
@@ -186,6 +187,38 @@ async function markLegacyQueueFailed(): Promise<number> {
   });
 }
 
+const CACHE_SHOP_KEY = 'giga_cache_shop';
+
+/** Empties every cached table that holds one shop's business data (online shop switch). */
+export async function purgeShopScopedCache(): Promise<void> {
+  const tables = [db.categories, db.customers, db.medicines, db.medicine_batches, db.sales, db.customer_returns,
+    db.suppliers, db.purchases, db.inventory_movements, db.expenses];
+  await db.transaction('rw', [...tables, db.meta], async () => {
+    for (const t of tables) await t.clear();
+    await db.meta.delete(CATALOG_META_KEY); // the catalogue no longer belongs to any shop
+  });
+  try {
+    localStorage.setItem(CACHE_SHOP_KEY, shopCacheKey());
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * Empties the shop-scoped cache when it was filled for another shop than the signed-in account's
+ * current one. Awaited at login (before any screen renders) and before every hydration.
+ */
+export async function purgeIfShopChanged(): Promise<void> {
+  let cached: string | null = null;
+  try {
+    cached = localStorage.getItem(CACHE_SHOP_KEY);
+  } catch {
+    return;
+  }
+  // No marker yet = the cache predates shop selection = the default shop (local app: always).
+  if ((cached || 'default') !== shopCacheKey()) await purgeShopScopedCache();
+}
+
 /**
  * Hydrates this browser's Dexie cache from the authenticated local API (PostgreSQL).
  * Admin-only resources are skipped for Cashiers (the server would answer 403 anyway).
@@ -210,11 +243,19 @@ export async function syncFromLocalApiToDexie(): Promise<boolean> {
     for (let i = 0; i < rows.length; i += 500) await table.bulkPut(rows.slice(i, i + 500));
   };
 
+  // Online app: the cache holds ONE shop's data. A different selected shop starts from an empty cache,
+  // so rows of the previous shop can never be shown under the new shop's name.
+  await purgeIfShopChanged();
+  // "All Shops" (Global Admin) is a consolidated view: no single shop's data is cached at all.
+  if (shopCacheKey() === 'ALL') {
+    setCatalogState({ status: 'error', shop_key: 'ALL', error: 'All Shops is selected: choose one shop to see its catalogue.' });
+    return false;
+  }
+
   // Keyed bulkPut: re-hydration overwrites cached rows with the server version, never duplicates.
   await load('Categories', '/api/categories', (rows) => putAll(db.categories, rows));
   await load('Customers', '/api/customers', (rows) => putAll(db.customers, rows));
-  const medsOk = await load('Medicines', '/api/medicines', (rows) => putAll(db.medicines, rows));
-  const batchesOk = await load('Batches', '/api/batches', (rows) => putAll(db.medicine_batches, rows));
+  const catalogOk = await replaceCatalog();
   await load<any>('Sales', '/api/sales?limit=500', (data) => putAll(db.sales, Array.isArray(data) ? data : data?.sales || []));
   await load('Returns', '/api/returns', (rows) => putAll(db.customer_returns, rows));
   if (isAdmin) {
@@ -229,7 +270,117 @@ export async function syncFromLocalApiToDexie(): Promise<boolean> {
 
   currentSummary.pendingCount = await getPendingCount();
   notifyListeners();
-  return medsOk && batchesOk;
+  return catalogOk;
+}
+
+/** Fired on window after the cached catalogue was replaced; open screens re-read Dexie. */
+export const CATALOG_REFRESHED_EVENT = 'giga:catalog-refreshed';
+/** Fired on window whenever the catalogue load state changes (loading / ready / error). */
+export const CATALOG_STATE_EVENT = 'giga:catalog-state';
+
+/** db.meta key: WHICH shop the cached medicines + batches belong to (written in the same transaction). */
+const CATALOG_META_KEY = 'catalogue';
+export interface CatalogMeta {
+  shop_key: string;
+  refreshed_at: string;
+  medicines: number;
+  batches: number;
+}
+export interface CatalogState {
+  status: 'loading' | 'ready' | 'error';
+  shop_key: string;
+  error: string | null;
+}
+let catalogState: CatalogState | null = null;
+function setCatalogState(state: CatalogState) {
+  catalogState = state;
+  if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent(CATALOG_STATE_EVENT, { detail: state }));
+}
+/** Load state of the CURRENT shop's catalogue (null when nothing was attempted for it yet). */
+export function getCatalogState(): CatalogState | null {
+  return catalogState && catalogState.shop_key === shopCacheKey() ? catalogState : null;
+}
+
+export async function getCatalogMeta(): Promise<CatalogMeta | null> {
+  return ((await db.meta.get(CATALOG_META_KEY))?.value as CatalogMeta | undefined) ?? null;
+}
+
+/**
+ * Cross-shop guard, checked by every screen BEFORE it reads the cached catalogue: true only when the
+ * cache was filled for the shop the signed-in account is using now. A cache without identity (filled
+ * before this check existed) is accepted only by the single-shop local pharmacy app.
+ */
+export async function isCatalogForCurrentShop(): Promise<boolean> {
+  const meta = await getCatalogMeta();
+  const key = shopCacheKey();
+  if (meta) return meta.shop_key === key;
+  return key === 'default' && !getOnlineAccount();
+}
+
+/**
+ * Authoritative catalogue refresh: the server's COMPLETE medicines and batches replace the cached
+ * ones in ONE Dexie transaction, so rows removed or re-based on the server never linger here.
+ * Both downloads must succeed first; if either fails the existing cache is left untouched (and keeps
+ * its own shop identity, so it is never shown as another shop's).
+ *
+ * Multi-shop: the API answers for the request's authorized shop (X-GIGA-SHOP-ID / the account's own
+ * shop); the snapshot is stamped with that shop key in the same transaction. A refresh whose shop
+ * changed while downloading is discarded. Concurrent calls for the same shop share one download.
+ */
+let catalogInFlight: { key: string; promise: Promise<boolean> } | null = null;
+export function replaceCatalog(): Promise<boolean> {
+  const key = shopCacheKey();
+  if (catalogInFlight && catalogInFlight.key === key) return catalogInFlight.promise;
+  const promise = replaceCatalogFor(key).finally(() => {
+    if (catalogInFlight?.promise === promise) catalogInFlight = null;
+  });
+  catalogInFlight = { key, promise };
+  return promise;
+}
+
+async function replaceCatalogFor(key: string): Promise<boolean> {
+  if (key === 'ALL') {
+    setCatalogState({ status: 'error', shop_key: key, error: 'All Shops is selected: choose one shop to see its catalogue.' });
+    return false;
+  }
+  setCatalogState({ status: 'loading', shop_key: key, error: null });
+  const fail = (msg: string, err?: any) => {
+    console.error(`[SyncEngine] ${msg}`, err?.message || err || '');
+    setCatalogState({ status: 'error', shop_key: key, error: err?.message || msg });
+    return false;
+  };
+  let medicines: unknown;
+  let batches: unknown;
+  try {
+    [medicines, batches] = await Promise.all([apiFetch<unknown>('/api/medicines'), apiFetch<unknown>('/api/batches')]);
+  } catch (err: any) {
+    return fail('Catalogue download failed; keeping the cached catalogue:', err);
+  }
+  if (!Array.isArray(medicines) || !Array.isArray(batches)) {
+    return fail('Catalogue download was not a complete list; keeping the cached catalogue.');
+  }
+  if (shopCacheKey() !== key) {
+    console.warn('[SyncEngine] Shop changed during the catalogue download; snapshot discarded.');
+    return false;
+  }
+  const meta: CatalogMeta = { shop_key: key, refreshed_at: new Date().toISOString(), medicines: medicines.length, batches: batches.length };
+  try {
+    await db.transaction('rw', db.medicines, db.medicine_batches, db.meta, async () => {
+      await db.medicines.clear();
+      await db.medicine_batches.clear();
+      await db.medicines.bulkPut(medicines as any[]);
+      await db.medicine_batches.bulkPut(batches as any[]);
+      await db.meta.put({ key: CATALOG_META_KEY, value: meta });
+    });
+  } catch (err: any) {
+    return fail('Catalogue cache update failed (rolled back):', err);
+  }
+  console.log(`[SyncEngine] Catalogue refreshed: ${medicines.length} medicines, ${batches.length} batches.`);
+  setCatalogState({ status: 'ready', shop_key: key, error: null });
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent(CATALOG_REFRESHED_EVENT, { detail: meta }));
+  }
+  return true;
 }
 
 // Global auto-sync lifecycle listeners

@@ -136,9 +136,12 @@ export function ensureUuid(id?: string | null): string {
 /** Error carrying an HTTP status, used for request validation failures (4xx). */
 export class HttpError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  /** Optional machine-readable facts (e.g. a CONFLICT's current shop value); never secrets. */
+  details?: Record<string, unknown>;
+  constructor(status: number, message: string, details?: Record<string, unknown>) {
     super(message);
     this.status = status;
+    if (details) this.details = details;
   }
 }
 

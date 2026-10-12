@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import { loginWithPinOrEmail } from '../../services/auth';
 import { verifyServerReachability } from '../../services/network';
+import { getServerMode } from '../../services/remoteAdmin';
 import type { User as UserType } from '../../types';
 
 interface LoginPageProps {
@@ -27,6 +28,12 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onSuccess, onBackToHome })
   const [showPassword, setShowPassword] = useState(false);
   // Login needs the LOCAL POS server only (never the internet), so that is what is shown here.
   const [isOnline, setIsOnline] = useState(true);
+  // Same screen for the shop server and the online app. The PIN is a shop-only quick login: the
+  // online app accepts the account PASSWORD only (same password as at the shop).
+  const [onlineApp, setOnlineApp] = useState(false);
+  useEffect(() => {
+    void getServerMode().then((m) => setOnlineApp(m === 'online'));
+  }, []);
 
   useEffect(() => {
     let alive = true;
@@ -46,7 +53,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onSuccess, onBackToHome })
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!identifier.trim() || !secret.trim()) {
-      setError('Please enter your email or username and your password or PIN.');
+      setError(onlineApp ? 'Please enter your email or username and your password.' : 'Please enter your email or username and your password or PIN.');
       return;
     }
     setError(null);
@@ -135,7 +142,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onSuccess, onBackToHome })
             <div>
               <div className="flex items-center justify-between mb-1">
                 <label className="block text-xs font-semibold text-slate-700">
-                  Password or Station PIN
+                  {onlineApp ? 'Password' : 'Password or Station PIN'}
                 </label>
               </div>
               <div className="relative">
@@ -143,7 +150,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onSuccess, onBackToHome })
                 <input
                   type={showPassword ? 'text' : 'password'}
                   required
-                  placeholder="Enter password or 4-digit PIN"
+                  placeholder={onlineApp ? 'Enter your password' : 'Enter password or 4-digit PIN'}
                   value={secret}
                   onChange={(e) => setSecret(e.target.value)}
                   className="w-full pl-9 pr-9 py-2 bg-white border border-slate-300 rounded text-xs text-slate-900 focus:ring-1 focus:ring-teal-700 focus:border-teal-700 focus:outline-hidden"

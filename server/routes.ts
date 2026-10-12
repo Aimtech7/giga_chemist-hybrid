@@ -19,6 +19,11 @@ import {
   getTodaySalesSummary,
   getAllCustomers,
   upsertCustomer,
+  setCustomerActiveTx,
+  setSupplierActiveTx,
+  updateExpense,
+  voidExpense,
+  withTransaction,
   getAllSuppliers,
   upsertSupplier,
   getAllPurchases,
@@ -144,7 +149,7 @@ export function authMiddleware(req: AuthenticatedRequest, res: Response, next: N
 
   // Re-read the account on every request: a deactivated user or changed role takes effect
   // immediately instead of when the 12-hour token expires.
-  getActiveUserForSession(payload.userId)
+  getActiveUserForSession(payload.userId, payload.iat)
     .then((user) => {
       if (user) {
         req.tokenPayload = payload;
@@ -1007,6 +1012,46 @@ apiRouter.post('/expenses', requireRole('ADMIN'), async (req: AuthenticatedReque
     res.status(201).json({ success: true, expense: await recordExpense(req.body || {}, saleActor(req)) });
   } catch (err: any) {
     sendError(res, err, 'Failed to record expense.', 'POST /expenses');
+  }
+});
+
+// Corrections keep history: a posted expense is edited (audited, old values kept) or VOIDED, never deleted.
+apiRouter.put('/expenses/:id', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    res.json({ success: true, expense: await updateExpense(req.params.id, req.body || {}, saleActor(req)) });
+  } catch (err: any) {
+    sendError(res, err, 'Failed to update expense.', 'PUT /expenses/:id');
+  }
+});
+
+apiRouter.post('/expenses/:id/void', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    res.json({ success: true, expense: await voidExpense(req.params.id, req.body?.reason, saleActor(req)) });
+  } catch (err: any) {
+    sendError(res, err, 'Failed to void expense.', 'POST /expenses/:id/void');
+  }
+});
+
+// Deactivate instead of delete: sales and purchases keep pointing at the customer / supplier.
+apiRouter.post('/customers/:id/active', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    if (typeof req.body?.active !== 'boolean') return res.status(400).json({ error: 'active must be true or false.' });
+    const id = requireUuid(req.params.id, 'customer id');
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim().slice(0, 500) || null : null;
+    res.json({ success: true, customer: await withTransaction((c) => setCustomerActiveTx(c, id, req.body.active, reason, saleActor(req))) });
+  } catch (err: any) {
+    sendError(res, err, 'Failed to update customer.', 'POST /customers/:id/active');
+  }
+});
+
+apiRouter.post('/suppliers/:id/active', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    if (typeof req.body?.active !== 'boolean') return res.status(400).json({ error: 'active must be true or false.' });
+    const id = requireUuid(req.params.id, 'supplier id');
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim().slice(0, 500) || null : null;
+    res.json({ success: true, supplier: await withTransaction((c) => setSupplierActiveTx(c, id, req.body.active, reason, saleActor(req))) });
+  } catch (err: any) {
+    sendError(res, err, 'Failed to update supplier.', 'POST /suppliers/:id/active');
   }
 });
 

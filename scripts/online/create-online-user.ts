@@ -9,7 +9,8 @@ import { hashCredential } from '../../server/auth';
  * never leave the shop). Roles: ADMIN | CASHIER.
  *
  *   npm run online:create-user -- --email owner@example.com --name "Owner" --role ADMIN [--env .env.online]
- *   options: --shop <uuid> (restrict to one shop; default SHOP_ID from the env file)
+ *   options: --global (ADMIN only: GLOBAL_ADMIN with authority over every shop; cloud migration 005)
+ *            --shop <uuid> (restrict to one shop; default SHOP_ID from the env file)
  *            --local-user <uuid> (Cashier: link to the shop staff account for "own sales")
  *            --print-sql (do not connect; print SQL to paste into the Supabase SQL editor)
  *
@@ -37,12 +38,15 @@ if (fs.existsSync(envFile)) {
 const email = (opt('--email') || '').trim().toLowerCase();
 const name = (opt('--name') || '').trim();
 const role = (opt('--role') || '').toUpperCase();
-const shopId = opt('--shop') || env.SHOP_ID || null;
+const globalAdmin = args.includes('--global');
+if (globalAdmin && (opt('--shop') || opt('--local-user'))) fail('--global cannot be combined with --shop / --local-user.');
+const shopId = globalAdmin ? null : opt('--shop') || env.SHOP_ID || null;
 const localUser = opt('--local-user') || null;
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) fail('--email is required (valid address).');
 if (!name) fail('--name is required.');
 if (!['ADMIN', 'CASHIER'].includes(role)) fail('--role must be ADMIN or CASHIER.');
+if (globalAdmin && role !== 'ADMIN') fail('--global requires --role ADMIN.');
 if (shopId && !uuid.test(shopId)) fail('--shop / SHOP_ID must be a UUID.');
 if (localUser && !uuid.test(localUser)) fail('--local-user must be a UUID.');
 
