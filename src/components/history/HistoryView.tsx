@@ -647,6 +647,24 @@ const ReturnSheet: React.FC<{ saleId: string; items: any[]; money: (n: any) => s
   );
 };
 
+/** Printable goods received note of a stored purchase (a copy of the record; nothing is created). */
+function printPurchase(d: any, money: (n: any) => string) {
+  const esc = (s: unknown) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
+  const w = window.open('', '_blank', 'width=800,height=800');
+  if (!w) return;
+  const p = d.purchase;
+  const rows = d.items.map((i: any) => `<tr><td>${esc(i.medicine_name)}</td><td>${esc(i.batch_number)}</td><td>${esc(i.expiry_date || 'unknown')}</td><td style="text-align:right">${esc(i.quantity)}</td><td style="text-align:right">${esc(money(i.purchase_price))}</td><td style="text-align:right">${esc(money(i.total))}</td></tr>`).join('');
+  w.document.write(`<!doctype html><html><head><title>${esc(p.order_number)}</title><style>body{font-family:sans-serif;font-size:12px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:3px 6px;text-align:left}</style></head><body>
+    <h2>${esc(p.shop_name || 'GIGA CHEMIST')} — Goods received note</h2>
+    <p>Purchase <b>${esc(p.order_number)}</b> · invoice ${esc(p.invoice_number || '—')} · supplier ${esc(p.supplier_name || '—')}<br/>
+    Ordered ${esc(p.order_date || '—')} · received ${esc(p.received_date || '—')} by ${esc(p.received_by || '—')} · status ${esc(p.status)} · payment ${esc(p.payment_status || '—')}</p>
+    <table><thead><tr><th>Medicine</th><th>Batch</th><th>Expiry</th><th>Qty</th><th>Buy price</th><th>Line total</th></tr></thead><tbody>${rows}</tbody></table>
+    <p style="text-align:right"><b>Total ${esc(money(p.total_amount))}</b></p><p>COPY printed ${esc(new Date().toLocaleString())} from the stored purchase.</p></body></html>`);
+  w.document.close();
+  w.focus();
+  w.print();
+}
+
 const SupplyDrawer: React.FC<{ id: string; money: (n: any) => string; onClose: () => void }> = ({ id, money, onClose }) => {
   const [d, setD] = useState<any>(null);
   const [error, setError] = useState<string | null>(null);
@@ -663,6 +681,9 @@ const SupplyDrawer: React.FC<{ id: string; money: (n: any) => string; onClose: (
             ['Supplier', d.purchase.supplier_name], ['Ordered', d.purchase.order_date], ['Received', d.purchase.received_date], ['Received by', d.purchase.received_by],
             ['Payment', d.purchase.payment_status], ['Status', <StatusTag key="s" s={d.purchase.status} />], ['Total', money(d.purchase.total_amount)], ['Notes', d.purchase.notes]]} />
           <p className="text-[11px] text-slate-500">A received purchase is never edited or deleted (its stock is posted). Corrections need an audited stock correction / return to supplier.</p>
+          <button className="flex items-center gap-1 px-3 py-2 rounded-lg border border-slate-300 text-xs font-semibold w-fit" onClick={() => printPurchase(d, money)}>
+            <Printer className="w-4 h-4" /> Print goods received note
+          </button>
           <Section title={`Items (${d.items.length})`}>
             <table className="w-full text-xs"><thead className="text-slate-500"><tr>{['Medicine', 'Batch', 'Expiry', 'Qty', 'Buy price', 'Line total', 'Sell now*', 'Wholesale now*'].map((h) => <th key={h} className="text-left pr-2">{h}</th>)}</tr></thead>
               <tbody>{d.items.map((i: any, n: number) => (
