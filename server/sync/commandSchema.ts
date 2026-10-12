@@ -52,6 +52,8 @@ export const COMMAND_TYPES = [
   'RETURN_REJECT',
   'SALE_VOID',
   'USER_SESSION_REVOKE',
+  // Cashier shifts (cloud migration 009): an online Administrator reviews a CLOSED shift.
+  'SHIFT_REVIEW',
 ] as const;
 export type CommandType = (typeof COMMAND_TYPES)[number];
 
@@ -533,9 +535,13 @@ export function validateCommandPayload(type: string, payload: unknown): Record<s
     }
     // ------------------------------------------------------------------ returns / sales
     case 'RETURN_APPROVE': {
-      onlyKeys(p, ['return_id', 'restock', 'disposition', 'notes'], 'RETURN_APPROVE');
+      onlyKeys(p, ['return_id', 'restock', 'disposition', 'notes', 'refund_method'], 'RETURN_APPROVE');
       const restock = bool(p.restock, 'restock');
       const out: Record<string, any> = { return_id: uuid(p.return_id, 'return_id'), restock };
+      if (p.refund_method !== undefined) {
+        if (!['Cash', 'M-Pesa', 'Card', 'Bank'].includes(p.refund_method)) throw new HttpError(400, 'refund_method must be Cash, M-Pesa, Card or Bank.');
+        out.refund_method = p.refund_method;
+      }
       if (!restock) {
         const d = p.disposition ?? 'quarantine';
         if (!RETURN_DISPOSITIONS.includes(d)) throw new HttpError(400, `disposition must be one of ${RETURN_DISPOSITIONS.join(', ')} when not restocking.`);
@@ -552,6 +558,13 @@ export function validateCommandPayload(type: string, payload: unknown): Record<s
     case 'SALE_VOID': {
       onlyKeys(p, ['sale_id', 'reason'], 'SALE_VOID');
       return { sale_id: uuid(p.sale_id, 'sale_id'), reason: reasonText(p.reason, true) };
+    }
+    case 'SHIFT_REVIEW': {
+      onlyKeys(p, ['shift_id', 'notes'], 'SHIFT_REVIEW');
+      const out: Record<string, any> = { shift_id: uuid(p.shift_id, 'shift_id') };
+      const notes = reasonText(p.notes, false, 'notes');
+      if (notes) out.notes = notes;
+      return out;
     }
     // ------------------------------------------------------------------ staff
     case 'USER_SET_ACTIVE': {

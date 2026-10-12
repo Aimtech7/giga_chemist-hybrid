@@ -12,6 +12,7 @@ import {
   toMedicineStockDto,
 } from './inventory';
 import { getSaleById, type SaleActor } from './sales';
+import { REFUND_METHODS, refundTill, type RefundMethod } from './shifts';
 import type { CustomerReturn } from '../../src/types';
 
 /**
@@ -40,6 +41,7 @@ const RETURN_SELECT = `
          r.approved_quantity, r.restocked, r.reason, r.action, r.status,
          r.user_id, u.name AS user_name, r.device_id, r.created_at,
          r.reviewed_by, COALESCE(rv.name, r.reviewed_by_name) AS reviewed_by_name, r.reviewed_at, r.review_notes,
+         r.refund_method, r.refund_shift_id,
          s.date AS sale_date, s.time AS sale_time, s.status AS sale_status, s.price_mode AS sale_price_mode,
          COALESCE(s.discount_percent, 0)::float AS sale_discount_percent,
          c.name AS customer_name,
@@ -89,6 +91,8 @@ function toReturn(r: any): CustomerReturn & Record<string, any> {
     reviewed_by_name: r.reviewed_by_name || undefined,
     reviewed_at: r.reviewed_at ? new Date(r.reviewed_at).toISOString() : undefined,
     review_notes: r.review_notes || undefined,
+    refund_method: r.refund_method || undefined,
+    refund_shift_id: r.refund_shift_id || undefined,
     sale_date: r.sale_date || '',
     sale_time: r.sale_time || '',
     sale_status: r.sale_status,
@@ -264,6 +268,14 @@ export interface ApproveReturnInput {
   restock: boolean;
   disposition?: Disposition;
   notes?: string;
+  /** How the refund is paid. Default Cash (handed over from the till). */
+  refund_method?: RefundMethod;
+}
+
+export function parseRefundMethod(value: unknown): RefundMethod {
+  if (value === undefined || value === null || value === '') return 'Cash';
+  if (!REFUND_METHODS.includes(value as RefundMethod)) throw new HttpError(400, `refund_method must be one of ${REFUND_METHODS.join(', ')}.`);
+  return value as RefundMethod;
 }
 
 export async function approveReturn(returnIdRaw: string, input: ApproveReturnInput, actor: SaleActor) {
@@ -276,14 +288,16 @@ export async function approveReturn(returnIdRaw: string, input: ApproveReturnInp
     throw new HttpError(400, `disposition must be one of ${NON_RESTOCK_DISPOSITIONS.join(', ')} when not restocking.`);
   }
   const notes = typeof input?.notes === 'string' ? input.notes.trim().slice(0, 1000) || null : null;
-  return withTransaction((client) => approveReturnTx(client, returnId, { restock, disposition, notes }, actor));
+  const refundMethod = parseRefundMethod(input?.refund_method);
+  return withTransaction((client) => approveReturnTx(client, returnId, { restock, disposition, notes, refund_method: refundMethod }, actor));
 }
 
 /** approveReturn on the caller's transaction (remote commands); input already validated. */
 export async function approveReturnTx(
-  client: pg.PoolClient, returnId: string, input: { restock: boolean; disposition: string; notes: string | null }, actor: SaleActor
+  client: pg.PoolClient, returnId: string, input: { restock: boolean; disposition: string; notes: string | null; refund_method?: RefundMethod }, actor: SaleActor
 ) {
   const { restock, disposition, notes } = input;
+  const refundMethod = parseRefundMethod(input.refund_method);
   if (actor.role !== 'ADMIN') throw new HttpError(403, 'Only an Administrator can approve returns.');
   {
     const { ret, sale } = await lockPendingReturn(client, returnId);
@@ -298,6 +312,10 @@ export async function approveReturnTx(
       throw new HttpError(409, `Only ${Math.max(0, line.qty - claimed.approved)} unit(s) of this item remain returnable.`);
     }
     const cents = refundCents(sale, line, qty, claimed.approved, claimed.refundedCents);
+    // The till that pays the refund: the requesting cashier's open shift, else the approver's (a remote
+    // Administrator has no shift), else none (paid outside any till; shown as such in reports).
+    // Locked BEFORE the batch, in the same order as checkout (shift, then stock), so they cannot deadlock.
+    const refundShiftId = await refundTill(client, ret.user_id, actor.user_id);
 
     const batch = (await client.query('SELECT * FROM medicine_batches WHERE id = $1 AND medicine_id = $2 FOR UPDATE', [ret.batch_id, ret.medicine_id])).rows[0];
     if (!batch) throw new HttpError(409, 'The batch of the original sale no longer exists.');
@@ -310,9 +328,10 @@ export async function approveReturnTx(
     const deviceId = await ensureDevice(client, actor.device_id, actor.user_id);
     await client.query(
       `UPDATE returns SET status = 'APPROVED', approved_quantity = $2, refund_amount = $3, restocked = $4, action = $5,
-         reviewed_by = $6, reviewed_at = CURRENT_TIMESTAMP, review_notes = $7, reviewed_by_name = $8
+         reviewed_by = $6, reviewed_at = CURRENT_TIMESTAMP, review_notes = $7, reviewed_by_name = $8, refund_method = $9, refund_shift_id = $10
        WHERE id = $1`,
-      [returnId, qty, fromCents(cents), restock, disposition, cleanUuid(actor.user_id), notes, (actor.user_name || '').slice(0, 255) || null]
+      [returnId, qty, fromCents(cents), restock, disposition, cleanUuid(actor.user_id), notes, (actor.user_name || '').slice(0, 255) || null,
+        refundMethod, refundShiftId]
     );
 
     const prev = Number(batch.quantity_available);
@@ -376,6 +395,8 @@ export async function approveReturnTx(
           restocked: restock,
           disposition,
           notes,
+          refund_method: refundMethod,
+          refund_shift_id: refundShiftId,
         },
       },
       client
@@ -399,6 +420,8 @@ export async function approveReturnTx(
       success: true,
       return: (await getReturnById(client, returnId))!,
       refund_amount: fromCents(cents),
+      refund_method: refundMethod,
+      refund_shift_id: refundShiftId,
       sale: (await getSaleById(ret.sale_id, client))!,
       medicine,
       batch: toBatchDto(savedBatch),

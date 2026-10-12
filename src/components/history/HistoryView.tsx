@@ -4,8 +4,9 @@ import { apiDownload, apiFetch, ApiError } from '../../services/http';
 import { createRequestId, getShops, getServerMode, queueRemoteCommand, type OnlineShop } from '../../services/remoteAdmin';
 import { isAllShopsScope } from '../../services/shopContext';
 import { printThermalReceipt } from '../../services/receiptPrinter';
-import { canViewStockHistory, canViewTransactionHistory } from '../../services/permissions';
+import { canViewAllShifts, canViewShifts, canViewStockHistory, canViewTransactionHistory } from '../../services/permissions';
 import { StockHistoryView } from './StockHistoryView';
+import { ShiftHistoryView } from './ShiftHistoryView';
 import type { PharmacySettings, Sale, User } from '../../types';
 
 /**
@@ -17,13 +18,15 @@ import type { PharmacySettings, Sale, User } from '../../types';
  * discount, total, price mode, batch; the sale's own totals and payments) — never today's prices.
  * Completed sales have no Edit: corrections are Void, Return (approved under Returns) or refund.
  */
-export type HistoryTab = 'sales' | 'supplies' | 'stock';
+export type HistoryTab = 'sales' | 'supplies' | 'stock' | 'shifts';
 /**
  * Filters a caller may open the list with, e.g. Stock History -> "View sales":
  * { medicine_id, medicine_label, from, to, shop_id } = the receipts behind one day's Sold figure.
  */
 export interface HistoryFilters {
   medicine?: string; medicine_id?: string; medicine_label?: string; from?: string; to?: string; receipt?: string; cashier?: string; status?: string; shop_id?: string;
+  /** One cashier shift: Sales -> the sales of that shift; Shifts -> open that shift's detail. */
+  shift_id?: string;
 }
 type Preset = 'today' | 'yesterday' | 'week' | 'month' | 'all' | 'custom';
 
@@ -57,6 +60,8 @@ export const HistoryView: React.FC<{ settings: PharmacySettings; currentUser: Us
   const tabs = useMemo(() => ([
     ...(canViewTransactionHistory(currentUser) ? [['sales', 'Sales'], ['supplies', 'Supply / Purchases']] : []),
     ...(canViewStockHistory(currentUser) ? [['stock', 'Stock History']] : []),
+    // Cashier: "My Shifts" (own shifts only, read only); Administrator / Manager: every shift.
+    ...(canViewShifts(currentUser) ? [['shifts', canViewAllShifts(currentUser) ? 'Shifts' : 'My Shifts']] : []),
   ] as [HistoryTab, string][]), [currentUser]);
   const allowed = (t?: HistoryTab) => (t && tabs.some(([id]) => id === t) ? t : tabs[0]?.[0] || 'stock');
   const [tab, setTab] = useState<HistoryTab>(allowed(initialTab));
@@ -75,9 +80,11 @@ export const HistoryView: React.FC<{ settings: PharmacySettings; currentUser: Us
   return (
     <div className="flex-1 flex flex-col overflow-hidden bg-slate-50">
       <div className="px-3 pt-3 pb-2 bg-white border-b border-slate-200 shrink-0">
-        <h1 className="text-base font-bold text-slate-900">{tab === 'sales' ? 'Sales History' : tab === 'supplies' ? 'Supply History' : 'Stock History'}</h1>
+        <h1 className="text-base font-bold text-slate-900">{tab === 'sales' ? 'Sales History' : tab === 'supplies' ? 'Supply History' : tab === 'shifts' ? (canViewAllShifts(currentUser) ? 'Shift History' : 'My Shifts') : 'Stock History'}</h1>
         <p className="text-[11px] text-slate-500">
-          {tab === 'stock'
+          {tab === 'shifts'
+            ? `Cashier shifts${allShops ? ' of every shop (each shift stays in its own shop)' : ''}: opening float, sales by payment method, refunds, till expenses, expected vs counted cash and the variance — read only.`
+            : tab === 'stock'
             ? `Daily stock per medicine${allShops ? ' for each shop' : ''}: opening, sold, returned, received, adjustments and the stock remaining at the end of each day — from the stock movement ledger, read only.`
             : `Every past transaction${allShops ? ' across ALL SHOPS' : ''}, exactly as recorded at the time — read only. Corrections use void / return (sales) or cancel (pending purchases), always audited.`}
         </p>
@@ -87,7 +94,10 @@ export const HistoryView: React.FC<{ settings: PharmacySettings; currentUser: Us
           ))}
         </div>
       </div>
-      {tab === 'stock' ? (
+      {tab === 'shifts' ? (
+        <ShiftHistoryView key={`shifts-${JSON.stringify(initialFilters || {})}`} settings={settings} currentUser={currentUser} online={online} allShops={allShops} shops={shops}
+          initialShiftId={initialTab === 'shifts' ? initialFilters?.shift_id || null : null} />
+      ) : tab === 'stock' ? (
         <StockHistoryView key={`stock-${JSON.stringify(initialFilters || {})}`} settings={settings} currentUser={currentUser} online={online} allShops={allShops} shops={shops}
           initialFilters={initialTab === 'stock' ? initialFilters || null : null} />
       ) : (
@@ -105,13 +115,15 @@ const HistoryList: React.FC<{ kind: 'sales' | 'supplies'; settings: PharmacySett
   const money = (n: number | null | undefined) => (n === null || n === undefined ? '—' : `${cur} ${Number(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
   const startFilters = (): Record<string, string> => {
     const f: Record<string, string> = kind === 'supplies' ? { status: 'received' } : {};
-    const keys = kind === 'sales' ? (['medicine', 'medicine_id', 'receipt', 'cashier', 'status', 'shop_id'] as const) : (['medicine', 'medicine_id', 'shop_id'] as const);
+    const keys = kind === 'sales' ? (['medicine', 'medicine_id', 'receipt', 'cashier', 'status', 'shop_id', 'shift_id'] as const) : (['medicine', 'medicine_id', 'shop_id'] as const);
     for (const k of keys) if (initialFilters?.[k]) f[k] = String(initialFilters[k]);
     return f;
   };
   const medicineLabel = initialFilters?.medicine_label || null;
-  const startRange = initialFilters && (initialFilters.from || initialFilters.to) ? { from: initialFilters.from || '', to: initialFilters.to || '' } : presetRange('month');
-  const [preset, setPreset] = useState<Preset>(initialFilters && (initialFilters.from || initialFilters.to) ? 'custom' : 'month');
+  // A shift filter shows ALL of that shift's sales, whatever their date.
+  const startRange = initialFilters?.shift_id ? presetRange('all')
+    : initialFilters && (initialFilters.from || initialFilters.to) ? { from: initialFilters.from || '', to: initialFilters.to || '' } : presetRange('month');
+  const [preset, setPreset] = useState<Preset>(initialFilters?.shift_id ? 'all' : initialFilters && (initialFilters.from || initialFilters.to) ? 'custom' : 'month');
   const [range, setRange] = useState(startRange);
   const [f, setF] = useState<Record<string, string>>(startFilters);
   const [applied, setApplied] = useState<Record<string, string>>(startFilters);
@@ -257,6 +269,12 @@ const HistoryList: React.FC<{ kind: 'sales' | 'supplies'; settings: PharmacySett
           <div className="flex items-center gap-2 text-xs bg-teal-50 border border-teal-200 text-teal-900 rounded-lg px-3 py-2">
             <span>Showing only {kind === 'sales' ? 'sales' : 'supplies'} of <b>{medicineLabel || 'the selected medicine'}</b> (opened from Stock History).</span>
             <button onClick={() => { const { medicine_id: _m, ...rest } = applied; setApplied(rest); setF(rest); setPage(1); }} className="ml-auto underline font-semibold">Show all</button>
+          </div>
+        )}
+        {applied.shift_id && (
+          <div className="flex items-center gap-2 text-xs bg-emerald-50 border border-emerald-200 text-emerald-900 rounded-lg px-3 py-2">
+            <span>Showing only the sales of one <b>cashier shift</b> (opened from Shift details).</span>
+            <button onClick={() => { const { shift_id: _s, ...rest } = applied; setApplied(rest); setF(rest); setPage(1); }} className="ml-auto underline font-semibold">Show all</button>
           </div>
         )}
         {error && <div className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded p-2">{error}</div>}

@@ -17,7 +17,8 @@ import { db } from '../../db/dexie';
 import { apiFetch } from '../../services/http';
 import { getInventoryValuation } from '../../services/inventoryEngine';
 import { getPendingCount } from '../../services/syncEngine';
-import { canViewCostData, isCashier } from '../../services/permissions';
+import { canViewAllShifts, canViewCostData, isCashier } from '../../services/permissions';
+import { ShiftOverviewPanel } from '../remote/GlobalControlCenter';
 import type { Sale, InventoryMovement, PharmacySettings, User } from '../../types';
 
 interface DashboardProps {
@@ -357,6 +358,9 @@ export const Dashboard: React.FC<DashboardProps> = ({ currentUser, settings, onN
           <span>Open POS Register (F2)</span>
         </button>
       </div>
+
+      {/* Cashier shifts: open / left open / variance (Administrator / Manager) */}
+      {canViewAllShifts(currentUser) && <ShiftOverviewPanel cur={settings.currency || 'KES'} />}
 
       {/* Primary Summary Row */}
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">

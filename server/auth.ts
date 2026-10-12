@@ -163,6 +163,13 @@ export const ROLE_PERMISSIONS: Record<UserRole, string[]> = {
     'expenses.manage',
     'devices.manage',
     'history.stock.view',
+    // Cashier shifts: every shift permission (incl. controlled closure / correction of others' shifts).
+    'shift.open',
+    'shift.close',
+    'shift.view_own',
+    'shift.view_all',
+    'shift.review',
+    'shift.correct',
   ],
   MANAGER: [
     'medicine.view',
@@ -179,6 +186,11 @@ export const ROLE_PERMISSIONS: Record<UserRole, string[]> = {
     'expenses.manage',
     'customers.manage',
     'history.stock.view',
+    'shift.open',
+    'shift.close',
+    'shift.view_own',
+    'shift.view_all',
+    'shift.review',
   ],
   // Cashier: History -> Stock History only (quantities, own shop, read only). No sales.view_all,
   // stock.receive, inventory.view or reports.view.
@@ -189,6 +201,10 @@ export const ROLE_PERMISSIONS: Record<UserRole, string[]> = {
     'returns.create',
     'customers.manage',
     'history.stock.view',
+    // Own shift only (open / close / read their own history). Never shift.view_all, reports.view or costs.
+    'shift.open',
+    'shift.close',
+    'shift.view_own',
   ],
 };
 

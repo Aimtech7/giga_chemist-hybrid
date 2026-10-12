@@ -41,7 +41,12 @@ export type SyncEventType =
   | 'PURCHASE_DRAFTED'
   | 'PURCHASE_UPDATED'
   | 'PURCHASE_CANCELLED'
-  | 'BATCH_UPDATED';
+  | 'BATCH_UPDATED'
+  // Cloud migration 009 and later only (cashier shifts; deploy cloud 009 BEFORE a shop on this release).
+  | 'SHIFT_OPENED'
+  | 'SHIFT_CLOSED'
+  | 'SHIFT_REVIEWED'
+  | 'SHIFT_CORRECTED';
 
 export interface SyncActor {
   user_id?: string | null;

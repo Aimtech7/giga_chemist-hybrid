@@ -146,8 +146,74 @@ export const GlobalControlCenter: React.FC<{ settings: PharmacySettings; focusSh
             </div>
           ))}
         </div>
+        <ShiftOverviewPanel cur={cur} focusShopId={focusShopId} />
         {focusShopId !== undefined && <RecentActivity money={money} />}
       </div>
+    </div>
+  );
+};
+
+/**
+ * Cashier shifts per shop (cloud copy): open shifts, shifts left open from a previous business day,
+ * closed today, cash variance today, closed shifts with an unreviewed variance. Physical cash of two
+ * shops is never added into one drawer: every figure stays on its own shop's card.
+ */
+export const ShiftOverviewPanel: React.FC<{ cur: string; focusShopId?: string | null }> = ({ cur, focusShopId }) => {
+  const [data, setData] = useState<any>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    const load = () => apiFetch<any>('/api/shifts/overview').then((d) => { setData(d); setError(null); })
+      .catch((e) => setError(e?.status === 404 ? null : e?.message || 'Shift overview unavailable.'));
+    void load();
+    const t = setInterval(load, 60_000);
+    return () => clearInterval(t);
+  }, []);
+  if (error) return <div className="text-xs text-slate-500">Cashier shifts: {error}</div>;
+  if (!data) return null;
+  const shops = (data.shops || []).filter((s: any) => !focusShopId || s.shop_id === focusShopId);
+  const flagged = (data.flagged || []).filter((f: any) => !focusShopId || f.shop_id === focusShopId);
+  const v = (n: number) => {
+    const c = Math.round(Number(n || 0) * 100);
+    return { text: `${c < 0 ? '-' : c > 0 ? '+' : ''}${cur} ${Math.abs(c / 100).toLocaleString(undefined, { minimumFractionDigits: 2 })}`, cls: c < 0 ? 'text-rose-700' : c > 0 ? 'text-amber-700' : 'text-emerald-700' };
+  };
+  return (
+    <div className="bg-white rounded-xl border border-slate-200 p-3 space-y-2">
+      <div className="flex items-center justify-between">
+        <div className="text-sm font-bold text-slate-900">Cashier shifts — {data.business_date}</div>
+        <button onClick={() => navigateTo('history', 'shifts')} className="text-xs font-semibold text-teal-800">Shift history →</button>
+      </div>
+      <div className={`grid gap-2 ${shops.length > 1 ? 'md:grid-cols-2' : ''}`}>
+        {shops.map((s: any) => (
+          <div key={s.shop_id} className="rounded-lg bg-slate-50 p-2">
+            <div className="text-xs font-black text-slate-800 mb-1">{s.shop_code} — {s.shop_name}</div>
+            <div className="grid grid-cols-5 gap-1 text-center">
+              {([
+                ['Open', s.open_shifts, s.open_shifts ? 'text-sky-700' : 'text-slate-900'],
+                ['Left open', s.open_from_previous_day, s.open_from_previous_day ? 'text-rose-700' : 'text-slate-900'],
+                ['Closed today', s.closed_today, 'text-slate-900'],
+                ['Variance today', v(s.variance_today).text, v(s.variance_today).cls],
+                ['Unreviewed', s.unreviewed_variances, s.unreviewed_variances ? 'text-amber-700' : 'text-slate-900'],
+              ] as [string, React.ReactNode, string][]).map(([k, val, cls]) => (
+                <div key={k} className="rounded bg-white py-1"><div className={`text-sm font-bold ${cls}`}>{val}</div><div className="text-[9px] uppercase tracking-wide text-slate-500">{k}</div></div>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+      {flagged.length > 0 && (
+        <div className="text-xs">
+          <div className="font-semibold text-slate-700 mb-0.5">Needs attention</div>
+          {flagged.slice(0, 8).map((f: any) => (
+            <div key={`${f.shop_id}-${f.id}`} className="flex justify-between gap-2 py-0.5 border-t border-slate-100">
+              <span className="truncate">
+                <b className={f.flag === 'SHIFT_SHORTAGE' || f.flag === 'SHIFT_LEFT_OPEN' ? 'text-rose-700' : 'text-amber-700'}>{f.flag.replace('SHIFT_', '').replace('_', ' ')}</b>
+                {' '}· {f.shop_code} · {f.cashier_name || 'cashier'} · {f.shift_number}
+              </span>
+              <span className="shrink-0">{f.flag === 'SHIFT_LEFT_OPEN' ? `opened ${String(f.opened_business_date).slice(0, 10)}` : v(f.cash_variance).text}</span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 };

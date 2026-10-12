@@ -72,6 +72,9 @@ import { getSystemHealth } from './ops/health';
 import { appVersion, currentCommit } from './ops/runtime';
 import { pgPool } from './db/client';
 import { buildHistoryRouter } from './http/historyRoutes';
+import { buildShiftRouter } from './http/shiftRoutes';
+import { openShift, getCurrentShift, closeShift, reviewShift, correctShift, listOpenTills } from './db/shifts';
+import type { HistoryScope } from './db/history';
 import { getShopIdentity } from './sync/identity';
 import type {
   User,
@@ -978,8 +981,8 @@ apiRouter.post('/returns', requirePermission('returns.create'), async (req: Auth
 // ADMIN ONLY: the single place where return effects (refund, restock, movement) are applied.
 apiRouter.post('/returns/:id/approve', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { restock, disposition, notes } = req.body || {};
-    res.json(await approveReturn(req.params.id, { restock, disposition, notes }, saleActor(req)));
+    const { restock, disposition, notes, refund_method } = req.body || {};
+    res.json(await approveReturn(req.params.id, { restock, disposition, notes, refund_method }, saleActor(req)));
   } catch (err: any) {
     sendError(res, err, 'Failed to approve return.', 'POST /returns/:id/approve');
   }
@@ -1088,6 +1091,81 @@ apiRouter.put('/settings', requireRole('ADMIN'), async (req: AuthenticatedReques
   }
 });
 
+/** This shop's own PostgreSQL, read only (history + shift reads). */
+async function withLocalScope<T>(req: Request, fn: (scope: HistoryScope) => Promise<T>): Promise<T> {
+  const identity = await getShopIdentity();
+  const client = await pgPool.connect();
+  try {
+    await client.query('BEGIN READ ONLY');
+    const out = await fn({ q: client, mode: 'local', shopIds: [identity.shop_id.toLowerCase()], includeCost: (req as AuthenticatedRequest).userRole === 'ADMIN' });
+    await client.query('COMMIT');
+    return out;
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// --- CASHIER SHIFTS (local, works with NO internet) ------------------------------------------------
+// Writes: one local PostgreSQL transaction each (audit + outbox). Registered before the shared read
+// router so /shifts/current and /shifts/open-tills are not taken for a shift id.
+apiRouter.get('/shifts/current', requirePermission('shift.view_own'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    res.json(await getCurrentShift(saleActor(req)));
+  } catch (err: any) {
+    sendError(res, err, 'Failed to load the current shift.', 'GET /shifts/current');
+  }
+});
+apiRouter.get('/shifts/open-tills', requirePermission('expenses.manage'), async (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    res.json({ tills: await listOpenTills(pgPool) });
+  } catch (err: any) {
+    sendError(res, err, 'Failed to load open tills.', 'GET /shifts/open-tills');
+  }
+});
+apiRouter.post('/shifts/open', requirePermission('shift.open'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const out = await openShift(req.body || {}, saleActor(req));
+    res.status(out.created ? 201 : 200).json(out);
+  } catch (err: any) {
+    sendError(res, err, 'Failed to open the shift.', 'POST /shifts/open');
+  }
+});
+apiRouter.post('/shifts/:id/close', requirePermission('shift.close'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    res.json(await closeShift(req.params.id, req.body || {}, saleActor(req)));
+  } catch (err: any) {
+    sendError(res, err, 'Failed to close the shift.', 'POST /shifts/:id/close');
+  }
+});
+apiRouter.post('/shifts/:id/review', requirePermission('shift.review'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    res.json({ success: true, ...(await reviewShift(req.params.id, req.body?.notes, saleActor(req))) });
+  } catch (err: any) {
+    sendError(res, err, 'Failed to review the shift.', 'POST /shifts/:id/review');
+  }
+});
+apiRouter.post('/shifts/:id/corrections', requirePermission('shift.correct'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    res.status(201).json(await correctShift(req.params.id, req.body || {}, saleActor(req)));
+  } catch (err: any) {
+    sendError(res, err, 'Failed to record the correction.', 'POST /shifts/:id/corrections');
+  }
+});
+apiRouter.use(buildShiftRouter({
+  canView: requirePermission('shift.view_own'),
+  canViewAll: requirePermission('shift.view_all'),
+  // A cashier (no shift.view_all) sees only their own shifts.
+  viewer: (req) => {
+    const a = req as AuthenticatedRequest;
+    return { ownCashierId: hasPermission(a.userRole!, 'shift.view_all') ? null : a.userId! };
+  },
+  withScope: withLocalScope,
+  send: (res, err: any, label) => sendError(res, err, 'Shift request failed.', label),
+}));
+
 // --- ADMIN HISTORY (sales + supply), read only, this shop's own PostgreSQL -------------------------
 apiRouter.use(buildHistoryRouter({
   canSales: requirePermission('sales.view_all'),
@@ -1095,21 +1173,7 @@ apiRouter.use(buildHistoryRouter({
   // Stock History: its own narrow permission (cashiers included); the scope is always this shop.
   canStockHistory: requirePermission('history.stock.view'),
   canStockExport: requirePermission('reports.view'),
-  withScope: async (req, fn) => {
-    const identity = await getShopIdentity();
-    const client = await pgPool.connect();
-    try {
-      await client.query('BEGIN READ ONLY');
-      const out = await fn({ q: client, mode: 'local', shopIds: [identity.shop_id.toLowerCase()], includeCost: (req as AuthenticatedRequest).userRole === 'ADMIN' });
-      await client.query('COMMIT');
-      return out;
-    } catch (err) {
-      await client.query('ROLLBACK').catch(() => {});
-      throw err;
-    } finally {
-      client.release();
-    }
-  },
+  withScope: withLocalScope,
   auditReprint: async (req, sale) => {
     const a = saleActor(req as AuthenticatedRequest);
     await recordAuditLog({

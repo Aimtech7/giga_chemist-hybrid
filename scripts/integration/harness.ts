@@ -146,10 +146,21 @@ export async function api(method: string, path: string, token?: string | null, b
   return { status: res.status, data, contentType };
 }
 
-export async function login(email: string, password: string): Promise<string> {
+export async function loginNoShift(email: string, password: string): Promise<string> {
   const r = await api('POST', '/api/auth/login', null, { email, password });
   if (r.status !== 200 || !r.data?.token) throw new Error(`Login failed for ${email}: ${r.status} ${JSON.stringify(r.data)}`);
   return r.data.token;
+}
+
+/**
+ * Login + make sure the account has an OPEN cashier shift (checkout requires one since local migration
+ * 020). Returns the existing open shift when there is one; float 0 so no suite's cash figures change.
+ */
+export async function login(email: string, password: string): Promise<string> {
+  const token = await loginNoShift(email, password);
+  const s = await api('POST', '/api/shifts/open', token, { opening_float: 0 });
+  if (s.status !== 200 && s.status !== 201 && s.status !== 404) throw new Error(`Could not open a shift for ${email}: ${s.status} ${JSON.stringify(s.data)}`);
+  return token;
 }
 
 // ---------------------------------------------------------------------------
@@ -238,6 +249,7 @@ export async function cleanupFixtures(): Promise<Record<string, number>> {
       WHERE u.email LIKE 'itest-%@gigachemist.local'
         AND NOT EXISTS (SELECT 1 FROM sale_items si JOIN medicines m ON m.id = si.medicine_id
                         WHERE si.sale_id = s.id AND m.barcode NOT LIKE 'ITEST-%')`;
+    // Test refunds may have been paid from a till (refund_shift_id) of a shift deleted below.
     counts.returns = (await client.query(`DELETE FROM returns WHERE sale_id IN (${testSales})`)).rowCount || 0;
     counts.sales = (await client.query(`DELETE FROM sales WHERE id IN (${testSales})`)).rowCount || 0; // items/payments cascade
     const testPurchases = `SELECT p.id FROM purchases p JOIN suppliers s ON s.id = p.supplier_id WHERE s.name LIKE 'ZZ ITEST%'`;
@@ -245,6 +257,14 @@ export async function cleanupFixtures(): Promise<Record<string, number>> {
     counts.expenses = (await client.query(
       `DELETE FROM expenses WHERE user_id IN (SELECT id FROM users WHERE email LIKE 'itest-%@gigachemist.local') OR description LIKE 'ZZ ITEST%'`
     )).rowCount || 0;
+    // Cashier shifts of test users that nothing real refers to any more (020). A shift still holding a
+    // real (non-ITEST) sale / return / expense is kept, closed sales history is never removed.
+    const testShifts = `SELECT x.id FROM cashier_shifts x WHERE x.cashier_id IN (${itestUsers})
+        AND NOT EXISTS (SELECT 1 FROM sales s WHERE s.shift_id = x.id)
+        AND NOT EXISTS (SELECT 1 FROM returns r WHERE r.refund_shift_id = x.id)
+        AND NOT EXISTS (SELECT 1 FROM expenses e WHERE e.shift_id = x.id)`;
+    await client.query(`DELETE FROM cashier_shift_corrections WHERE shift_id IN (${testShifts})`);
+    counts.shifts = (await client.query(`DELETE FROM cashier_shifts WHERE id IN (${testShifts})`)).rowCount || 0;
     counts.movements = (await client.query(
       `DELETE FROM inventory_movements WHERE medicine_id IN (SELECT id FROM medicines WHERE barcode LIKE 'ITEST-%')`
     )).rowCount || 0;

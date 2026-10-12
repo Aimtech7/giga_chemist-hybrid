@@ -67,6 +67,9 @@ export const ReturnsManager: React.FC<Props> = ({ currentUser, settings }) => {
   const [reviewing, setReviewing] = useState<{ row: ReturnRow; mode: 'approve' | 'reject' } | null>(null);
   const [restock, setRestock] = useState<'yes' | 'no' | ''>('');
   const [disposition, setDisposition] = useState<'quarantine' | 'damaged' | 'dispose'>('quarantine');
+  // How the refund is paid. Cash comes out of a till (the requesting cashier's open shift) and lowers
+  // that shift's expected cash; M-Pesa / Card / Bank do not touch the drawer.
+  const [refundMethod, setRefundMethod] = useState<'Cash' | 'M-Pesa' | 'Card' | 'Bank'>('Cash');
   const [notes, setNotes] = useState('');
   const [reviewError, setReviewError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -102,6 +105,7 @@ export const ReturnsManager: React.FC<Props> = ({ currentUser, settings }) => {
     setReviewing({ row, mode });
     setRestock('');
     setDisposition('quarantine');
+    setRefundMethod('Cash');
     setNotes('');
     setReviewError(null);
   };
@@ -122,7 +126,7 @@ export const ReturnsManager: React.FC<Props> = ({ currentUser, settings }) => {
     try {
       if (reviewing.mode === 'approve') {
         const result = await apiFetch<any>(`/api/returns/${reviewing.row.id}/approve`, {
-          body: { restock: restock === 'yes', disposition: restock === 'no' ? disposition : undefined, notes: notes.trim() || undefined },
+          body: { restock: restock === 'yes', disposition: restock === 'no' ? disposition : undefined, notes: notes.trim() || undefined, refund_method: refundMethod },
         });
         await refreshCacheAfterCommit(async () => {
           await db.customer_returns.put(result.return);
@@ -130,8 +134,9 @@ export const ReturnsManager: React.FC<Props> = ({ currentUser, settings }) => {
           await applyServerStockResult({ medicine: result.medicine, batch: result.batch });
         });
         setNotice(
-          `Approved: ${reviewing.row.quantity}x ${reviewing.row.medicine_name}, refund ${money(result.refund_amount)}` +
-            (restock === 'yes' ? ' — returned to sellable stock.' : ` — not restocked (${disposition}).`)
+          `Approved: ${reviewing.row.quantity}x ${reviewing.row.medicine_name}, refund ${money(result.refund_amount)} by ${result.refund_method || refundMethod}` +
+            (restock === 'yes' ? ' — returned to sellable stock.' : ` — not restocked (${disposition}).`) +
+            (result.refund_method === 'Cash' ? (result.refund_shift_id ? ' Cash paid from the open till (shift).' : ' No open till: cash paid outside any shift.') : '')
         );
       } else {
         const result = await apiFetch<any>(`/api/returns/${reviewing.row.id}/reject`, { body: { notes: notes.trim() } });
@@ -340,6 +345,13 @@ export const ReturnsManager: React.FC<Props> = ({ currentUser, settings }) => {
                     <input type="radio" name="restock" checked={restock === 'no'} onChange={() => setRestock('no')} />
                     <span>NO — refund only; stock is not increased</span>
                   </label>
+                  <div className="font-semibold text-slate-700 pt-1">Refund paid by *</div>
+                  <select value={refundMethod} onChange={(e) => setRefundMethod(e.target.value as any)} className="w-full p-2 border border-slate-300 rounded bg-white" aria-label="Refund method">
+                    <option value="Cash">Cash — from the till (reduces the shift's expected cash)</option>
+                    <option value="M-Pesa">M-Pesa</option>
+                    <option value="Card">Card</option>
+                    <option value="Bank">Bank</option>
+                  </select>
                   {restock === 'no' && (
                     <select
                       value={disposition}
