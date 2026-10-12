@@ -31,6 +31,8 @@ import { applyServerStockResult, refreshCacheAfterCommit } from '../../services/
 import { CATALOG_REFRESHED_EVENT, isCatalogForCurrentShop } from '../../services/syncEngine';
 import { CatalogStatusBanner } from '../common/CatalogStatusBanner';
 import { navigateTo } from '../../services/navigation';
+import { ShiftBar } from '../shifts/ShiftBar';
+import { getCurrentShift, type LiveTotals, type Shift } from '../../services/shifts';
 import type {
   Medicine,
   MedicineBatch,
@@ -107,6 +109,23 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
   const [isPaymentOpen, setIsPaymentOpen] = useState(false);
   const [isHeldOpen, setIsHeldOpen] = useState(false);
   const [completedSale, setCompletedSale] = useState<Sale | null>(null);
+  // Cashier shift: undefined = not loaded / server without shifts; null = no open shift (checkout locked).
+  const [shift, setShift] = useState<Shift | null | undefined>(undefined);
+  const [shiftLive, setShiftLive] = useState<LiveTotals | null>(null);
+  const refreshShift = React.useCallback(async () => {
+    try {
+      const d = await getCurrentShift();
+      setShift(d.shift);
+      setShiftLive(d.live || null);
+    } catch (err: any) {
+      // 404 = a server without shifts (older build / online app): no shift gate in the UI.
+      if (err instanceof ApiError && err.status === 404) setShift(undefined);
+    }
+  }, []);
+  useEffect(() => {
+    void refreshShift();
+  }, [refreshShift]);
+  const shiftLocked = shift === null;
   const [warningMessage, setWarningMessage] = useState<string | null>(null);
 
   // References
@@ -224,7 +243,7 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
         searchInputRef.current?.select();
       } else if (e.key === 'F4') {
         e.preventDefault();
-        if (cart.length > 0) setIsPaymentOpen(true);
+        if (cart.length > 0 && !shiftLocked) setIsPaymentOpen(true);
       } else if (e.key === 'F8') {
         e.preventDefault();
         if (cart.length > 0) handleHoldSale();
@@ -244,7 +263,7 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [cart, isPaymentOpen, isHeldOpen, completedSale, retailFallbackPrompt]);
+  }, [cart, isPaymentOpen, isHeldOpen, completedSale, retailFallbackPrompt, shiftLocked]);
 
   // Add medicine to cart with strict FEFO allocation & expired stock blocking
   const addToCart = async (medicine: Medicine) => {
@@ -523,6 +542,7 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
         const current = new Map<string, number>(err.data.details.map((d: any) => [d.medicine_id, Number(d.current)]));
         setCart((prev) => prev.map((i) => (current.has(i.medicine.id) ? { ...i, unit_price: current.get(i.medicine.id)! } : i)));
       }
+      if (err instanceof ApiError && (err.data?.code === 'SHIFT_REQUIRED')) void refreshShift();
       const msg = err?.message || 'Checkout failed.';
       setWarningMessage(`Sale NOT completed: ${msg}`);
       setTimeout(() => setWarningMessage(null), 6000);
@@ -538,6 +558,7 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
     await loadData();
     clearCart();
     setCompletedSale(result.sale);
+    void refreshShift();
     if (result.duplicate) {
       setWarningMessage('This sale was already completed earlier — showing the original receipt (no second sale was made).');
       setTimeout(() => setWarningMessage(null), 6000);
@@ -573,6 +594,7 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
       {/* LEFT COLUMN: Medicine Catalog & Universal Search */}
       <div className="flex-1 flex flex-col min-w-0 border-r border-slate-200 bg-white">
         <CatalogStatusBanner />
+        <ShiftBar settings={settings} shift={shift} live={shiftLive} onChanged={refreshShift} />
         {/* Universal Search Bar & Scanner Status */}
         <div className="p-3 bg-white border-b border-slate-200 space-y-2">
           <div className="flex items-center gap-2">
@@ -1012,7 +1034,8 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
 
             <button
               onClick={() => setIsPaymentOpen(true)}
-              disabled={cart.length === 0}
+              disabled={cart.length === 0 || shiftLocked}
+              title={shiftLocked ? 'Open your shift (opening cash float) before selling.' : undefined}
               className="py-2.5 rounded bg-teal-700 hover:bg-teal-800 text-white text-xs font-bold transition flex items-center justify-center gap-1.5 disabled:opacity-40 cursor-pointer"
             >
               <CreditCard className="w-4 h-4" />

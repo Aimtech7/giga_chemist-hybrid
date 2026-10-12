@@ -14,6 +14,7 @@ import { recordExpenseTx, updateExpenseTx, voidExpenseTx } from '../db/expenses'
 import { cancelPurchaseTx, createDraftPurchaseTx, receiveDraftPurchaseTx, receivePurchaseOrderTx, updateDraftPurchaseTx } from '../db/purchases';
 import { approveReturnTx, rejectReturnTx } from '../db/returns';
 import { voidSaleTx, type SaleActor } from '../db/sales';
+import { reviewShiftTx } from '../db/shifts';
 import { enqueueSyncEvent, medicineJson, userJson } from './outbox';
 import { getShopIdentity } from './identity';
 import { COMMAND_TYPES, validateCommandPayload } from './commandSchema';
@@ -418,8 +419,13 @@ const HANDLERS: Record<string, Handler> = {
   // Only an approved return affects stock, refunds and reports (same workflow as the shop).
   async RETURN_APPROVE(client, cmd) {
     const p = validateCommandPayload('RETURN_APPROVE', cmd.payload);
-    const out = await approveReturnTx(client, p.return_id, { restock: p.restock, disposition: p.restock ? 'return_to_stock' : p.disposition, notes: p.notes ?? null }, cloudActor(cmd));
-    return { return_id: p.return_id, status: 'APPROVED', refund_amount: out.refund_amount, restocked: p.restock, current_stock: out.medicine.current_stock };
+    const out = await approveReturnTx(client, p.return_id, {
+      restock: p.restock, disposition: p.restock ? 'return_to_stock' : p.disposition, notes: p.notes ?? null, refund_method: p.refund_method,
+    }, cloudActor(cmd));
+    return {
+      return_id: p.return_id, status: 'APPROVED', refund_amount: out.refund_amount, refund_method: out.refund_method, refund_shift_id: out.refund_shift_id,
+      restocked: p.restock, current_stock: out.medicine.current_stock,
+    };
   },
   async RETURN_REJECT(client, cmd) {
     const p = validateCommandPayload('RETURN_REJECT', cmd.payload);
@@ -431,6 +437,12 @@ const HANDLERS: Record<string, Handler> = {
     const p = validateCommandPayload('SALE_VOID', cmd.payload);
     const out = await voidSaleTx(client, p.sale_id, p.reason, cloudActor(cmd));
     return { sale_id: p.sale_id, receipt_number: out.sale.receipt_number, status: out.sale.status, batches_restocked: out.batches.length };
+  },
+
+  // ---------------------------------------------------------------- cashier shifts (figures never change)
+  async SHIFT_REVIEW(client, cmd) {
+    const p = validateCommandPayload('SHIFT_REVIEW', cmd.payload);
+    return reviewShiftTx(client, p.shift_id, p.notes ?? null, cloudActor(cmd));
   },
 
   // ---------------------------------------------------------------- shop staff (no credentials)

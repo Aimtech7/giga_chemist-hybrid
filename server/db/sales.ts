@@ -12,6 +12,7 @@ import {
   toMedicineStockDto,
   type StockActor,
 } from './inventory';
+import { assertSaleShiftOpen, requireOpenShiftForSale } from './shifts';
 import type { Sale, PaginatedSalesResponse, PaymentMethod, PriceMode, UserRole } from '../../src/types';
 
 // =============================================================================
@@ -402,6 +403,9 @@ export async function checkoutSale(
       return { success: true as const, duplicate: true, sale, medicines: [], batches: [] };
     }
 
+    // Every sale belongs to the seller's OPEN shift (cash reconciliation). FOR SHARE: a concurrent
+    // close waits for this checkout and then counts it.
+    const shiftId = await requireOpenShiftForSale(client, actor.user_id);
     const deviceId = await ensureDevice(client, actor.device_id, actor.user_id);
     const { date: today, time: nowTime } = await businessNow(client);
 
@@ -532,14 +536,14 @@ export async function checkoutSale(
       `INSERT INTO sales (
          id, sale_number, receipt_number, cashier_id, customer_id, device_id, date, time,
          subtotal, discount_percent, discount_total, tax_total, total, cost_total, gross_profit,
-         payment_method, payment_reference, amount_received, change_given, status, idempotency_key, sync_status, price_mode
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,'completed',$20,'synced',$21)`,
+         payment_method, payment_reference, amount_received, change_given, status, idempotency_key, sync_status, price_mode, shift_id
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,'completed',$20,'synced',$21,$22)`,
       [
         saleId, `SALE-${ymd}-${serial}`, receiptNumber, actor.user_id, customerId, deviceId, today, nowTime,
         fromCents(subtotalCents), discountPct, fromCents(discountCents), fromCents(taxCents), fromCents(totalCents),
         fromCents(costCents), fromCents(netCents - costCents),
         payment.method, payment.reference, fromCents(payment.amountReceivedCents), fromCents(payment.changeCents), key,
-        saleMode,
+        saleMode, shiftId,
       ]
     );
 
@@ -678,6 +682,8 @@ export async function voidSaleTx(client: pg.PoolClient, saleId: string, reasonRa
     }
     const hasReturns = await client.query(`SELECT 1 FROM returns WHERE sale_id = $1 AND status <> 'REJECTED' LIMIT 1`, [saleId]);
     if (hasReturns.rows[0]) throw new HttpError(409, 'This sale has approved or pending returns; resolve them instead of voiding the sale.');
+    // The cash of a CLOSED shift was counted: its sales are corrected by a return (refund), not a void.
+    await assertSaleShiftOpen(client, sale.shift_id ?? null);
 
     const deviceId = await ensureDevice(client, actor.device_id, actor.user_id);
     const items = await client.query(

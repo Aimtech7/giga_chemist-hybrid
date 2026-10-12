@@ -3,6 +3,7 @@ import { Plus, FileSpreadsheet, X } from 'lucide-react';
 import { db } from '../../db/dexie';
 import { downloadCSV } from '../../services/exportUtils';
 import { apiFetch } from '../../services/http';
+import { getOpenTills } from '../../services/shifts';
 import type { Expense, PharmacySettings, User } from '../../types';
 
 interface ExpenseListProps {
@@ -19,6 +20,9 @@ export const ExpenseList: React.FC<ExpenseListProps> = ({ currentUser, settings 
   const [amount, setAmount] = useState<number>(0);
   const [paymentMethod, setPaymentMethod] = useState('M-Pesa');
   const [reference, setReference] = useState('');
+  // Cash paid OUT OF A TILL: attach it to that open shift so the shift's expected cash goes down.
+  const [tills, setTills] = useState<{ id: string; shift_number: string; cashier_name: string | null; opened_at: string }[]>([]);
+  const [tillId, setTillId] = useState('');
   const [saveError, setSaveError] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
 
@@ -29,6 +33,11 @@ export const ExpenseList: React.FC<ExpenseListProps> = ({ currentUser, settings 
   useEffect(() => {
     loadExpenses();
   }, []);
+  useEffect(() => {
+    if (!isModalOpen) return;
+    setTillId('');
+    getOpenTills().then((d) => setTills(d.tills || [])).catch(() => setTills([]));
+  }, [isModalOpen]);
 
   // PostgreSQL first: the expense exists only once the server has committed it.
   const handleSave = async (e: React.FormEvent) => {
@@ -52,6 +61,7 @@ export const ExpenseList: React.FC<ExpenseListProps> = ({ currentUser, settings 
           amount,
           payment_method: paymentMethod,
           reference: reference.trim() || undefined,
+          shift_id: paymentMethod === 'Cash' && tillId ? tillId : undefined,
         },
       });
       await db.expenses.put(expense);
@@ -244,6 +254,14 @@ export const ExpenseList: React.FC<ExpenseListProps> = ({ currentUser, settings 
                     <option value="Bank">Bank Transfer</option>
                     <option value="Card">Card</option>
                   </select>
+                  {paymentMethod === 'Cash' && (
+                    <select value={tillId} onChange={(e) => setTillId(e.target.value)} className="w-full mt-1 p-2 border border-slate-300 rounded bg-white" aria-label="Paid from till">
+                      <option value="">Not from a till (petty cash box)</option>
+                      {tills.map((t) => (
+                        <option key={t.id} value={t.id}>Paid from till: {t.cashier_name || 'cashier'} ({t.shift_number})</option>
+                      ))}
+                    </select>
+                  )}
                 </div>
 
                 <div>

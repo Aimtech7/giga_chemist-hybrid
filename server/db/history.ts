@@ -28,7 +28,7 @@ const LOCAL = {
   sales: `(SELECT ($1::uuid[])[1] AS shop_id, s.id, s.sale_number, s.receipt_number, s.cashier_id, u.name AS cashier_name, s.customer_id, s.device_id,
              s.date, s.time::text AS time, s.subtotal, s.discount_total, s.tax_total, s.total, s.cost_total, s.gross_profit, s.payment_method,
              s.payment_reference, s.amount_received, s.change_given, s.status, s.void_reason, s.price_mode, s.created_at,
-             s.discount_percent, s.voided_by, vb.name AS voided_by_name
+             s.discount_percent, s.voided_by, vb.name AS voided_by_name, s.shift_id
              FROM sales s LEFT JOIN users u ON u.id = s.cashier_id LEFT JOIN users vb ON vb.id = s.voided_by)`,
   items: `(SELECT ($1::uuid[])[1] AS shop_id, i.id, i.sale_id, i.medicine_id, i.batch_id, i.batch_number, i.expiry_date, i.quantity, i.unit_price,
              i.discount, i.cost_price_snapshot, i.total, i.price_mode FROM sale_items i)`,
@@ -36,7 +36,8 @@ const LOCAL = {
   customers: `(SELECT ($1::uuid[])[1] AS shop_id, c.id, c.name, c.phone FROM customers c)`,
   medicines: `(SELECT ($1::uuid[])[1] AS shop_id, m.id, m.name, m.generic_name, m.brand_name, m.barcode, m.selling_price, m.wholesale_price FROM medicines m)`,
   returns: `(SELECT ($1::uuid[])[1] AS shop_id, r.id, r.sale_id, r.medicine_id, r.batch_id, r.quantity, r.approved_quantity, r.refund_amount,
-             r.requested_refund, r.status, r.reason, r.restocked, r.created_at, r.reviewed_at, COALESCE(rv.name, r.reviewed_by_name) AS reviewed_by_name
+             r.requested_refund, r.status, r.reason, r.restocked, r.created_at, r.reviewed_at, COALESCE(rv.name, r.reviewed_by_name) AS reviewed_by_name,
+             r.refund_method, r.refund_shift_id
              FROM returns r LEFT JOIN users rv ON rv.id = r.reviewed_by)`,
   purchases: `(SELECT ($1::uuid[])[1] AS shop_id, p.id, p.order_number, p.invoice_number, p.supplier_id, p.order_date, p.received_date,
              COALESCE(p.status, 'received') AS status, p.total_amount, p.payment_status, p.notes, u.name AS received_by, p.created_at
@@ -57,7 +58,8 @@ const CLOUD = {
              s.cost_total, s.gross_profit, s.payment_method, s.data->>'payment_reference' AS payment_reference,
              NULLIF(s.data->>'amount_received', '')::numeric AS amount_received, NULLIF(s.data->>'change_given', '')::numeric AS change_given,
              s.status, s.void_reason, s.price_mode, s.created_at_local AS created_at,
-             NULLIF(s.data->>'discount_percent', '')::numeric AS discount_percent, s.voided_by, vb.name AS voided_by_name
+             NULLIF(s.data->>'discount_percent', '')::numeric AS discount_percent, s.voided_by, vb.name AS voided_by_name,
+             (s.data->>'shift_id')::uuid AS shift_id
              FROM giga_cloud.sales s LEFT JOIN giga_cloud.users u ON u.shop_id = s.shop_id AND u.user_id = s.cashier_id
              LEFT JOIN giga_cloud.users vb ON vb.shop_id = s.shop_id AND vb.user_id = s.voided_by
             WHERE s.shop_id = ANY($1::uuid[]))`,
@@ -69,7 +71,8 @@ const CLOUD = {
              m.selling_price, m.wholesale_price FROM giga_cloud.medicines m WHERE m.shop_id = ANY($1::uuid[]))`,
   returns: `(SELECT r.shop_id, r.return_id AS id, r.sale_id, r.medicine_id, r.batch_id, r.quantity, r.approved_quantity, r.refund_amount, r.requested_refund,
              r.status, r.data->>'reason' AS reason, r.restocked, NULLIF(r.data->>'created_at', '')::timestamptz AS created_at, r.reviewed_at,
-             COALESCE(rv.name, r.data->>'reviewed_by_name') AS reviewed_by_name
+             COALESCE(rv.name, r.data->>'reviewed_by_name') AS reviewed_by_name,
+             r.data->>'refund_method' AS refund_method, (r.data->>'refund_shift_id')::uuid AS refund_shift_id
              FROM giga_cloud.returns r LEFT JOIN giga_cloud.users rv ON rv.shop_id = r.shop_id AND rv.user_id = r.reviewed_by
             WHERE r.shop_id = ANY($1::uuid[]))`,
   purchases: `(SELECT p.shop_id, p.purchase_id AS id, p.order_number, p.invoice_number, p.supplier_id, NULLIF(p.data->>'order_date', '')::date AS order_date,
@@ -164,6 +167,12 @@ function salesWhere(scope: HistoryScope, query: Record<string, unknown>) {
     if (!['RETAIL', 'WHOLESALE'].includes(mode)) throw new HttpError(400, 'price_mode must be RETAIL or WHOLESALE.');
     w.add((p) => `COALESCE(upper(s.price_mode), 'RETAIL') = ${p}`, mode);
   }
+  // One cashier shift (Shift detail -> "View sales of this shift").
+  const shift = str(query.shift_id, 64);
+  if (shift) {
+    if (!isValidUuid(shift)) throw new HttpError(400, 'shift_id must be a UUID.');
+    w.add((p) => `s.shift_id = ${p}::uuid`, shift);
+  }
   const receipt = str(query.receipt, 60);
   if (receipt) w.add((p) => `(s.receipt_number ILIKE ${p} OR s.sale_number ILIKE ${p})`, like(receipt));
   // Exact medicine (Stock History -> "View sales": the receipts behind one day's Sold figure).
@@ -219,7 +228,7 @@ function saleRow(r: any, cost: boolean) {
     subtotal: num(r.subtotal), discount_total: num(r.discount_total), tax_total: num(r.tax_total), total: num(r.total),
     discount_percent: r.discount_percent === null || r.discount_percent === undefined ? null : num(r.discount_percent),
     payment_method: r.payment_method, payment_reference: r.payment_reference ?? null, status: r.status, void_reason: r.void_reason ?? null,
-    device_id: r.device_id ?? null,
+    device_id: r.device_id ?? null, shift_id: r.shift_id ?? null,
     ...(cost ? { cost_total: num(r.cost_total), gross_profit: num(r.gross_profit) } : {}),
   };
 }
@@ -352,6 +361,7 @@ export async function saleDetail(scope: HistoryScope, saleId: string, expectShop
       quantity: Number(r.quantity), approved_quantity: r.approved_quantity ?? null, status: r.status,
       reason: r.reason ?? null, requested_refund: num(r.requested_refund), refund_amount: num(r.refund_amount), restocked: r.restocked ?? null,
       created_at: r.created_at, reviewed_at: r.reviewed_at, reviewed_by: r.reviewed_by_name ?? null,
+      refund_method: r.refund_method ?? null, refund_shift_id: r.refund_shift_id ?? null,
     })),
     void: isVoided ? { reason: head.void_reason ?? null, voided_by: head.voided_by_name ?? voidAudit?.user_name ?? null, voided_at: voidAudit?.occurred_at ?? null } : null,
     audit: audit.map((a: any) => ({ action: a.action, by: a.user_name, at: a.occurred_at })),

@@ -20,6 +20,8 @@ import { getPharmacySettings, toSettings } from '../db/settings';
 import { buildRemoteAdminRouter, isAllShopsScope } from './remoteAdmin';
 import { buildUserAdminRouter } from './userAdmin';
 import { buildHistoryRouter } from '../http/historyRoutes';
+import { buildShiftRouter } from '../http/shiftRoutes';
+import type { HistoryScope } from '../db/history';
 import type { UserRole } from '../../src/types';
 
 /**
@@ -522,33 +524,53 @@ export function buildOnlineRouter() {
 
   // Admin HISTORY (sales + supply), read only. Shops are decided HERE: the request's authorized shop,
   // or every active shop for a Global Administrator viewing "All Shops" — never a browser-supplied list.
+  // Shops are decided HERE: the request's authorized shop, or every active shop for a Global
+  // Administrator viewing "All Shops" — never a browser-supplied list. Read-only transaction.
+  const withCloudScope = async <T,>(req: Request, fn: (scope: HistoryScope) => Promise<T>): Promise<T> => {
+    const u = (req as OnlineRequest).onlineUser!;
+    let shopIds: string[];
+    if (isAllShopsScope(req)) {
+      if (!isGlobalAdmin(u)) throw new HttpError(403, 'Forbidden: only a Global Administrator can view all shops.');
+      shopIds = (await withCloud((c) => c.query('SELECT shop_id FROM giga_cloud.shops WHERE active ORDER BY shop_code'))).rows.map((x: any) => String(x.shop_id));
+    } else {
+      shopIds = [requestShop(req)];
+    }
+    return withCloud(async (c) => {
+      await c.query('BEGIN READ ONLY');
+      try {
+        const out = await fn({ q: c, mode: 'cloud', shopIds, includeCost: u.role === 'ADMIN' });
+        await c.query('COMMIT');
+        return out;
+      } catch (err) {
+        await c.query('ROLLBACK').catch(() => {});
+        throw err;
+      }
+    });
+  };
+
+  // Cashier shifts (cloud copy, read only). A shop CASHIER account sees only the shifts of its own shop
+  // staff account (local_user_id); Administrators / Managers every shift of their authorized shop(s).
+  // Reviewing a shift online = the SHIFT_REVIEW command (Remote administration), applied by the shop.
+  r.use(buildShiftRouter({
+    canView: requirePermission('shift.view_own'),
+    canViewAll: requirePermission('shift.view_all'),
+    viewer: (req) => {
+      const u = (req as OnlineRequest).onlineUser!;
+      if (hasPermission(u.role, 'shift.view_all')) return { ownCashierId: null };
+      if (!u.local_user_id) throw new HttpError(403, 'Forbidden: this online account is not linked to a shop staff account.');
+      return { ownCashierId: String(u.local_user_id).toLowerCase() };
+    },
+    withScope: withCloudScope,
+    send: (res, err, label) => send(res, err, label),
+  }));
+
   r.use(buildHistoryRouter({
     canSales: requirePermission('sales.view_all'),
     canSupplies: requirePermission('stock.receive'),
     // Cashier / Manager / Shop Admin: their own shop only (resolveShop already refused any other shop).
     canStockHistory: requirePermission('history.stock.view'),
     canStockExport: requirePermission('reports.view'),
-    withScope: async (req, fn) => {
-      const u = (req as OnlineRequest).onlineUser!;
-      let shopIds: string[];
-      if (isAllShopsScope(req)) {
-        if (!isGlobalAdmin(u)) throw new HttpError(403, 'Forbidden: only a Global Administrator can view all shops.');
-        shopIds = (await withCloud((c) => c.query('SELECT shop_id FROM giga_cloud.shops WHERE active ORDER BY shop_code'))).rows.map((x: any) => String(x.shop_id));
-      } else {
-        shopIds = [requestShop(req)];
-      }
-      return withCloud(async (c) => {
-        await c.query('BEGIN READ ONLY');
-        try {
-          const out = await fn({ q: c, mode: 'cloud', shopIds, includeCost: u.role === 'ADMIN' });
-          await c.query('COMMIT');
-          return out;
-        } catch (err) {
-          await c.query('ROLLBACK').catch(() => {});
-          throw err;
-        }
-      });
-    },
+    withScope: withCloudScope,
     auditReprint: (req, sale) => securityEvent(req, 'RECEIPT_REPRINTED', (req as OnlineRequest).onlineUser?.email ?? null, (req as OnlineRequest).onlineUser?.id ?? null,
       { sale_id: sale.id, receipt_number: sale.receipt_number, sale_shop_id: sale.shop_id }),
     send: (res, err, label) => send(res, err, label),

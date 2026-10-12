@@ -43,7 +43,9 @@ export type RemoteAction =
   | 'return-approve'
   | 'return-reject'
   | 'sale-void'
-  | 'user-session-revoke';
+  | 'user-session-revoke'
+  // Cashier shifts (cloud migration 009)
+  | 'shift-review';
 
 /** Actions a Global Administrator may apply to ALL shops (one independent command per shop). */
 export const ALL_SHOPS_ACTIONS: RemoteAction[] = ['price-update', 'medicine-update', 'category', 'settings'];
@@ -243,6 +245,7 @@ export const COMMAND_LABELS: Record<string, string> = {
   RETURN_REJECT: 'Reject return',
   SALE_VOID: 'Void sale',
   USER_SESSION_REVOKE: 'Sign out staff everywhere',
+  SHIFT_REVIEW: 'Review cashier shift',
 };
 
 // ---------------------------------------------------------------- health, alerts, insights, security

@@ -25,6 +25,12 @@ const ROLE_PERMISSIONS: Record<UserRole, PermissionKey[]> = {
     'customers.manage',
     'expenses.manage',
     'history.stock.view',
+    'shift.open',
+    'shift.close',
+    'shift.view_own',
+    'shift.view_all',
+    'shift.review',
+    'shift.correct',
   ],
   MANAGER: [
     'medicine.view',
@@ -39,6 +45,11 @@ const ROLE_PERMISSIONS: Record<UserRole, PermissionKey[]> = {
     'customers.manage',
     'expenses.manage',
     'history.stock.view',
+    'shift.open',
+    'shift.close',
+    'shift.view_own',
+    'shift.view_all',
+    'shift.review',
   ],
   CASHIER: [
     'sales.create',
@@ -47,6 +58,9 @@ const ROLE_PERMISSIONS: Record<UserRole, PermissionKey[]> = {
     'customers.manage',
     'returns.request',
     'history.stock.view',
+    'shift.open',
+    'shift.close',
+    'shift.view_own',
   ],
 };
 
@@ -112,6 +126,19 @@ export function canViewTransactionHistory(user: User | null | undefined): boolea
 }
 export function canViewStockHistory(user: User | null | undefined): boolean {
   return hasPermission(user, 'history.stock.view');
+}
+/** Shifts tab: every role sees its OWN shifts; Administrator / Manager see every shift of the shop. */
+export function canViewShifts(user: User | null | undefined): boolean {
+  return hasPermission(user, 'shift.view_own') || hasPermission(user, 'shift.view_all');
+}
+export function canViewAllShifts(user: User | null | undefined): boolean {
+  return hasPermission(user, 'shift.view_all');
+}
+export function canReviewShifts(user: User | null | undefined): boolean {
+  return hasPermission(user, 'shift.review');
+}
+export function canCorrectShifts(user: User | null | undefined): boolean {
+  return hasPermission(user, 'shift.correct');
 }
 
 /**

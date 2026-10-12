@@ -21,7 +21,13 @@ export type PermissionKey =
   | 'customers.manage'
   | 'expenses.manage'
   /** History -> Stock History (quantities only, own shop, read only). Cashiers have it; nothing else follows from it. */
-  | 'history.stock.view';
+  | 'history.stock.view'
+  | 'shift.open'
+  | 'shift.close'
+  | 'shift.view_own'
+  | 'shift.view_all'
+  | 'shift.review'
+  | 'shift.correct';
 
 export interface User {
   id: string;
@@ -404,6 +410,8 @@ export interface Expense {
   status?: 'posted' | 'voided';
   void_reason?: string;
   voided_at?: string;
+  /** Cash paid out of this OPEN shift's till (reduces the shift's expected cash). */
+  shift_id?: string;
   created_at: string;
   sync_status: SyncStatus;
 }

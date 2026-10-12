@@ -91,6 +91,8 @@ export const ACTIONS: Record<string, CommandType> = {
   'return-reject': 'RETURN_REJECT',
   'sale-void': 'SALE_VOID',
   'user-session-revoke': 'USER_SESSION_REVOKE',
+  // Cashier shifts (cloud migration 009)
+  'shift-review': 'SHIFT_REVIEW',
 };
 
 /**
@@ -256,6 +258,12 @@ async function contextFor(withShop: ShopReader, type: CommandType, p: Record<str
     if (p.sale_id) {
       const v = await one(c, 'SELECT receipt_number, total, status, date FROM sales WHERE id = $1', [p.sale_id], 'Sale not found in the cloud copy of this shop.');
       display.sale = { receipt_number: v.receipt_number, total: Number(v.total), status: v.status, date: v.date };
+    }
+    if (p.shift_id) {
+      // giga_online.cashier_shifts (cloud migration 009): the selected shop's shifts only.
+      const v = await one(c, 'SELECT shift_number, status, cashier_name, cash_variance FROM cashier_shifts WHERE id = $1', [p.shift_id], 'Shift not found in the cloud copy of this shop.');
+      if (v.status !== 'CLOSED') throw new HttpError(409, v.status === 'OPEN' ? 'That shift is still open; it can be reviewed after it is closed.' : 'That shift was already reviewed.');
+      display.shift = { shift_number: v.shift_number, status: v.status, cashier_name: v.cashier_name, cash_variance: v.cash_variance === null ? null : Number(v.cash_variance) };
     }
   });
   return display;
@@ -726,6 +734,11 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
     try {
       return await deps.withCloud(async (c) => {
         await c.query('SELECT giga_cloud.refresh_cloud_alerts($1, $2)', [shopId, HEARTBEAT_ONLINE_SECONDS]);
+        // Cashier shift alerts (cloud migration 009): SHIFT_LEFT_OPEN / SHIFT_NOT_CLOSED. Variance alerts
+        // (SHIFT_SHORTAGE / SHIFT_OVERAGE) are raised when the SHIFT_CLOSED event arrives.
+        await c.query('SELECT giga_cloud.refresh_shift_alerts($1)', [shopId]).catch((err: any) => {
+          if (err?.code !== '42883') throw err; // not applied yet: no shift alerts
+        });
         const rows = (await c.query(
           `SELECT id, alert_key, kind, severity, title, detail, source, status, first_seen_at, last_seen_at, acknowledged_by, acknowledged_at, resolved_at
              FROM giga_cloud.alerts WHERE shop_id = $1 AND ($2 = 'all' OR status <> 'RESOLVED')

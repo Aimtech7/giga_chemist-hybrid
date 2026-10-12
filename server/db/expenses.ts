@@ -5,6 +5,7 @@ import { recordAuditLog } from './audit';
 import { assertExpected } from './concurrency';
 import { enqueueSyncEvent, rowJson } from '../sync/outbox';
 import type { SaleActor } from './sales';
+import { lockOpenShiftForExpense } from './shifts';
 import type { Expense } from '../../src/types';
 
 export const EXPENSE_CATEGORIES = ['Rent', 'Electricity', 'Internet', 'Salaries', 'Transport', 'Maintenance', 'Supplies', 'Miscellaneous'] as const;
@@ -25,6 +26,7 @@ function toExpense(r: any): Expense {
     user_name: r.user_name || r.created_by_name || 'Staff',
     date: r.date || '',
     status: r.status === 'voided' ? 'voided' : 'posted',
+    shift_id: r.shift_id || undefined,
     void_reason: r.void_reason || undefined,
     voided_at: r.voided_at ? new Date(r.voided_at).toISOString() : undefined,
     sync_status: 'synced',
@@ -72,10 +74,17 @@ async function lockExpense(client: pg.PoolClient, id: string) {
 export async function recordExpenseTx(client: pg.PoolClient, id: string, input: Partial<Expense>, actor: SaleActor, extra: Record<string, unknown> = {}): Promise<Expense> {
   const v = normalize(input);
   const date = v.date || (await businessNow(client)).date;
+  // "Paid from the till": a CASH expense taken out of an OPEN shift's drawer reduces that shift's expected cash.
+  const rawShift = (input as any)?.shift_id;
+  const shiftId = rawShift === undefined || rawShift === null || rawShift === '' ? null : requireUuid(rawShift, 'shift_id');
+  if (shiftId) {
+    if (v.method !== 'Cash') throw new HttpError(400, 'Only a Cash expense can be paid from a till.');
+    await lockOpenShiftForExpense(client, shiftId);
+  }
   const res = await client.query(
-    `INSERT INTO expenses (id, category, description, amount, payment_method, reference, user_id, date, created_by_name)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *, amount::float AS amount`,
-    [id, v.category, v.description, v.amount, v.method, v.reference, cleanUuid(actor.user_id), date, (actor.user_name || 'Staff').slice(0, 255)]
+    `INSERT INTO expenses (id, category, description, amount, payment_method, reference, user_id, date, created_by_name, shift_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *, amount::float AS amount`,
+    [id, v.category, v.description, v.amount, v.method, v.reference, cleanUuid(actor.user_id), date, (actor.user_name || 'Staff').slice(0, 255), shiftId]
   );
   await recordAuditLog(
     {
@@ -83,7 +92,7 @@ export async function recordExpenseTx(client: pg.PoolClient, id: string, input: 
       action: 'EXPENSE_RECORDED',
       entity: 'expense',
       entity_id: id,
-      new_value: { category: v.category, description: v.description, amount: v.amount, payment_method: v.method, date, ...extra },
+      new_value: { category: v.category, description: v.description, amount: v.amount, payment_method: v.method, date, ...(shiftId ? { shift_id: shiftId } : {}), ...extra },
     },
     client
   );
@@ -110,6 +119,14 @@ export async function updateExpenseTx(
   if (before.status === 'voided') throw new HttpError(409, 'This expense is voided and can no longer be edited.');
   assertExpected(toExpense(before) as any, opts.expected, 'this expense');
   const v = normalize({ ...toExpense(before), ...patch });
+  if (before.shift_id) {
+    // A till expense stays a Cash expense of its shift (the shift's count depends on it).
+    if (v.method !== 'Cash') throw new HttpError(409, 'This expense was paid from a till; its payment method stays Cash. Void it and record a new one instead.');
+    const sh = (await client.query('SELECT status FROM cashier_shifts WHERE id = $1 FOR SHARE', [before.shift_id])).rows[0];
+    if (sh && sh.status !== 'OPEN' && Math.round(v.amount * 100) !== Math.round(Number(before.amount) * 100)) {
+      throw new HttpError(409, "This expense was paid from a till whose shift is already closed and counted; its amount can no longer change.");
+    }
+  }
   const res = await client.query(
     `UPDATE expenses SET category = $2, description = $3, amount = $4, payment_method = $5, reference = $6, date = COALESCE(NULLIF($7, '')::date, date),
        updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *, amount::float AS amount`,
