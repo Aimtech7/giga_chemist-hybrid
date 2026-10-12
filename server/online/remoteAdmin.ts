@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import express, { type Request, type Response, type NextFunction } from 'express';
 import type pg from 'pg';
 import { HttpError, isValidUuid } from '../db/client';
-import { getMedicineById } from '../db/medicines';
+import { getAllMedicines, getMedicineById } from '../db/medicines';
 import {
   validateCommandPayload, commandEntity, commandExpectation, STOCK_REMOVE_REASONS, ASSIGNABLE_ROLES, HIGH_CONFLICT_TYPES, ALL_SHOPS_TYPES,
   EXPENSE_CATEGORIES, EXPENSE_PAYMENT_METHODS, RETURN_DISPOSITIONS, PRICE_FIELDS, METADATA_FIELDS, type CommandType,
@@ -692,6 +692,31 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
         rejected_commands_7d: sum((x) => x.rejected_commands_7d),
       },
     };
+  }));
+
+  // ------------------------------------------------------------------ ALL SHOPS stock comparison
+  /**
+   * Global Administrator, All Shops: one row per medicine (matched across shops by barcode, else by
+   * exact normalized name), with EACH shop's own stock side by side. Read only; each shop is read in its
+   * own shop-scoped transaction; nothing is summed except the separate, labelled `combined` value.
+   */
+  r.get('/admin/stock-comparison', requireAdmin, route('GET /admin/stock-comparison', async (req) => {
+    if (!deps.isGlobalAdmin(req.onlineUser)) throw new HttpError(403, 'Forbidden: only a Global Administrator can compare shops.');
+    const shops = (await deps.withCloud((c) => c.query('SELECT shop_id, shop_code, name FROM giga_cloud.shops WHERE active ORDER BY shop_code, shop_id'))).rows;
+    const norm = (v: unknown) => String(v ?? '').toLowerCase().replace(/[-/.,()+_:;'"]/g, ' ').replace(/\s+/g, ' ').trim();
+    const rows = new Map<string, any>();
+    for (const shop of shops) {
+      const meds = await deps.withShopId(shop.shop_id, (c) => getAllMedicines(c));
+      for (const m of meds) {
+        const key = m.barcode && String(m.barcode).trim() ? `b:${norm(m.barcode)}` : `n:${norm(m.name)}`;
+        const row = rows.get(key) || { key, name: m.name, barcode: m.barcode || null, category: m.category || null, per_shop: {} as Record<string, any> };
+        row.per_shop[shop.shop_id] = { medicine_id: m.id, name: m.name, stock: Number(m.current_stock) || 0, reorder_level: Number(m.reorder_level) || 0, status: m.status, retail: m.selling_price };
+        rows.set(key, row);
+      }
+    }
+    const out = [...rows.values()].map((x) => ({ ...x, combined: Object.values(x.per_shop).reduce((t: number, v: any) => t + v.stock, 0) }))
+      .sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    return { shops: shops.map((x: any) => ({ shop_id: x.shop_id, shop_code: x.shop_code, name: x.name })), rows: out, match_rule: 'barcode, else exact name' };
   }));
 
   // ------------------------------------------------------------------ alerts

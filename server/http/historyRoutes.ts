@@ -29,6 +29,9 @@ export interface HistoryDeps {
   send: (res: Response, err: unknown, label: string) => void;
 }
 
+/** The shop a detail request expects (All Shops: the row's shop); verified against the sale and the scope. */
+const shopParam = (req: Request) => (typeof req.query.shop_id === 'string' && req.query.shop_id ? req.query.shop_id.toLowerCase() : null);
+
 export function buildHistoryRouter(deps: HistoryDeps) {
   const r = express.Router();
   const handle = (label: string, fn: (req: Request, res: Response) => Promise<unknown>) => async (req: Request, res: Response) => {
@@ -41,9 +44,9 @@ export function buildHistoryRouter(deps: HistoryDeps) {
   };
 
   r.get('/history/sales', deps.canSales, handle('GET /history/sales', (req) => deps.withScope(req, (s) => salesHistory(s, req.query as any))));
-  r.get('/history/sales/:id', deps.canSales, handle('GET /history/sales/:id', (req) => deps.withScope(req, (s) => saleDetail(s, req.params.id))));
+  r.get('/history/sales/:id', deps.canSales, handle('GET /history/sales/:id', (req) => deps.withScope(req, (s) => saleDetail(s, req.params.id, shopParam(req)))));
   r.post('/history/sales/:id/reprint', deps.canSales, handle('POST /history/sales/:id/reprint', async (req) => {
-    const detail = await deps.withScope(req, (s) => saleDetail(s, req.params.id));
+    const detail = await deps.withScope(req, (s) => saleDetail(s, req.params.id, shopParam(req)));
     await deps.auditReprint(req, { id: detail.sale.id, receipt_number: detail.sale.receipt_number, shop_id: detail.sale.shop_id });
     // The receipt is re-rendered from the stored sale: nothing is created or changed.
     return { ...detail, reprint: { copy: true, label: 'REPRINT — COPY', printed_at: new Date().toISOString() } };

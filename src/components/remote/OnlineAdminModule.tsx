@@ -2,9 +2,10 @@ import React from 'react';
 import { GlobalControlCenter, SelectShopPrompt } from './GlobalControlCenter';
 import { RemoteAdminPanel } from './RemoteAdminPanel';
 import { RemoteRecords } from './RemoteRecords';
+import { StockComparison } from './StockComparison';
 import { UsersTab } from './UserManagement';
 import { ReportsDashboard } from '../reports/ReportsDashboard';
-import { HistoryView, type HistoryTab } from '../history/HistoryView';
+import { HistoryView, type HistoryFilters, type HistoryTab } from '../history/HistoryView';
 import { isAllShopsScope, isGlobalAdminAccount, selectedShopId } from '../../services/shopContext';
 import type { PharmacySettings, User } from '../../types';
 
@@ -19,11 +20,17 @@ const LABELS: Record<string, string> = {
   audit: 'Audit', remote: 'Remote Operations', stocktake: 'Physical count', pos: 'POS', history: 'History',
 };
 
-export const OnlineAdminModule: React.FC<{ module: string; currentUser: User; settings: PharmacySettings; historyTab?: HistoryTab }> = ({ module, currentUser, settings, historyTab }) => {
+export const OnlineAdminModule: React.FC<{ module: string; currentUser: User; settings: PharmacySettings; historyTab?: HistoryTab; historyFilters?: HistoryFilters | null }> = ({
+  module, currentUser, settings, historyTab, historyFilters,
+}) => {
   if (isAllShopsScope()) {
     if (module === 'dashboard') return <GlobalControlCenter settings={settings} />;
     // History is read only: All Shops combines every shop (with a Shop column).
-    if (module === 'history') return <HistoryView settings={settings} currentUser={currentUser} initialTab={historyTab} />;
+    if (module === 'history') return <HistoryView settings={settings} currentUser={currentUser} initialTab={historyTab} initialFilters={historyFilters} />;
+    // Medicines / Inventory in All Shops: each shop's stock side by side (never merged), read only.
+    if (module === 'medicines' || module === 'inventory') return <StockComparison />;
+    // Sales is a read-only history view too (exact stored sale details, Shop column).
+    if (module === 'sales') return <HistoryView settings={settings} currentUser={currentUser} initialTab="sales" initialFilters={historyFilters} />;
     return <SelectShopPrompt settings={settings} module={LABELS[module] || module} />;
   }
   const panel = (tab?: React.ComponentProps<typeof RemoteAdminPanel>['initialTab'], filter?: React.ComponentProps<typeof RemoteAdminPanel>['initialStockFilter']) => (
@@ -38,17 +45,19 @@ export const OnlineAdminModule: React.FC<{ module: string; currentUser: User; se
       return panel('medicines');
     case 'expiry':
       return panel('medicines', 'expiring');
+    // Finance -> Sales: the complete, exact sale history (wide list + full detail drawer, void via command).
+    case 'sales':
+      return <HistoryView key="sales" settings={settings} currentUser={currentUser} initialTab="sales" initialFilters={historyFilters} />;
     case 'suppliers':
     case 'customers':
     case 'expenses':
     case 'purchases':
     case 'returns':
-    case 'sales':
       return <RemoteRecords key={module} kind={module} settings={settings} />;
     case 'reports':
       return <ReportsDashboard currentUser={currentUser} settings={settings} />;
     case 'history':
-      return <HistoryView settings={settings} currentUser={currentUser} initialTab={historyTab} />;
+      return <HistoryView settings={settings} currentUser={currentUser} initialTab={historyTab} initialFilters={historyFilters} />;
     case 'users':
       return isGlobalAdminAccount() ? (
         <div className="flex-1 overflow-y-auto bg-slate-50"><div className="max-w-2xl mx-auto p-3"><UsersTab currentUser={currentUser} /></div></div>

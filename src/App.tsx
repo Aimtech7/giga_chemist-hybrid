@@ -29,7 +29,7 @@ import { AuditLogViewer } from './components/audit/AuditLogViewer';
 import { SettingsView } from './components/settings/SettingsView';
 import { RemoteAdminPanel } from './components/remote/RemoteAdminPanel';
 import { OnlineAdminModule } from './components/remote/OnlineAdminModule';
-import { HistoryView, type HistoryTab } from './components/history/HistoryView';
+import { HistoryView, type HistoryFilters, type HistoryTab } from './components/history/HistoryView';
 import { NAVIGATE_EVENT } from './services/navigation';
 import { getServerMode } from './services/remoteAdmin';
 import type { PharmacySettings, User } from './types';
@@ -229,10 +229,12 @@ export default function App() {
   const onlineAdmin = serverMode === 'online' && currentUser?.role === 'ADMIN';
   // Dashboard shortcuts ("View All Sales", "View Supply History"): same shop context, chosen tab.
   const [historyTab, setHistoryTab] = useState<HistoryTab>('sales');
+  const [historyFilters, setHistoryFilters] = useState<HistoryFilters | null>(null);
   useEffect(() => {
     const go = (e: Event) => {
       const d = (e as CustomEvent).detail || {};
       if (d.tab) setHistoryTab(d.tab);
+      setHistoryFilters(d.filters || null);
       if (d.module) setCurrentModule(d.module);
     };
     window.addEventListener(NAVIGATE_EVENT, go);
@@ -310,7 +312,7 @@ export default function App() {
     >
       {/* ONLINE ADMINISTRATOR: Global Control Center modules (commands to the selected shop only) */}
       {onlineAdmin && canAccessModule(currentUser, currentModule) && (
-        <OnlineAdminModule module={currentModule} currentUser={currentUser} settings={settings} historyTab={historyTab} />
+        <OnlineAdminModule module={currentModule} currentUser={currentUser} settings={settings} historyTab={historyTab} historyFilters={historyFilters} />
       )}
       {!onlineAdmin && (<>
       {/* EXECUTIVE & OPERATIONAL DASHBOARD */}
@@ -378,7 +380,7 @@ export default function App() {
 
       {/* HISTORY (Admin / Manager): every past sale and supply, read only */}
       {currentModule === 'history' && canAccessModule(currentUser, 'history') && (
-        <HistoryView settings={settings} currentUser={currentUser} initialTab={historyTab} />
+        <HistoryView settings={settings} currentUser={currentUser} initialTab={historyTab} initialFilters={historyFilters} />
       )}
 
       {/* RETURNS */}

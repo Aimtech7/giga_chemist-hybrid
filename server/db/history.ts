@@ -27,13 +27,14 @@ const LOCAL = {
   shops: `(SELECT si.shop_id, si.shop_code, COALESCE(si.shop_name, 'This shop') AS shop_name FROM shop_identity si WHERE si.shop_id = ANY($1::uuid[]))`,
   sales: `(SELECT ($1::uuid[])[1] AS shop_id, s.id, s.sale_number, s.receipt_number, s.cashier_id, u.name AS cashier_name, s.customer_id, s.device_id,
              s.date, s.time::text AS time, s.subtotal, s.discount_total, s.tax_total, s.total, s.cost_total, s.gross_profit, s.payment_method,
-             s.payment_reference, s.amount_received, s.change_given, s.status, s.void_reason, s.price_mode, s.created_at
-             FROM sales s LEFT JOIN users u ON u.id = s.cashier_id)`,
+             s.payment_reference, s.amount_received, s.change_given, s.status, s.void_reason, s.price_mode, s.created_at,
+             s.discount_percent, s.voided_by, vb.name AS voided_by_name
+             FROM sales s LEFT JOIN users u ON u.id = s.cashier_id LEFT JOIN users vb ON vb.id = s.voided_by)`,
   items: `(SELECT ($1::uuid[])[1] AS shop_id, i.id, i.sale_id, i.medicine_id, i.batch_id, i.batch_number, i.expiry_date, i.quantity, i.unit_price,
              i.discount, i.cost_price_snapshot, i.total, i.price_mode FROM sale_items i)`,
   payments: `(SELECT ($1::uuid[])[1] AS shop_id, p.sale_id, p.method, p.amount, p.reference FROM payments p)`,
   customers: `(SELECT ($1::uuid[])[1] AS shop_id, c.id, c.name, c.phone FROM customers c)`,
-  medicines: `(SELECT ($1::uuid[])[1] AS shop_id, m.id, m.name, m.barcode, m.selling_price, m.wholesale_price FROM medicines m)`,
+  medicines: `(SELECT ($1::uuid[])[1] AS shop_id, m.id, m.name, m.generic_name, m.brand_name, m.barcode, m.selling_price, m.wholesale_price FROM medicines m)`,
   returns: `(SELECT ($1::uuid[])[1] AS shop_id, r.id, r.sale_id, r.medicine_id, r.batch_id, r.quantity, r.approved_quantity, r.refund_amount,
              r.requested_refund, r.status, r.reason, r.restocked, r.created_at, r.reviewed_at, COALESCE(rv.name, r.reviewed_by_name) AS reviewed_by_name
              FROM returns r LEFT JOIN users rv ON rv.id = r.reviewed_by)`,
@@ -55,14 +56,17 @@ const CLOUD = {
              s.customer_id, s.device_id, s.business_date AS date, s.business_time AS time, s.subtotal, s.discount_total, s.tax_total, s.total,
              s.cost_total, s.gross_profit, s.payment_method, s.data->>'payment_reference' AS payment_reference,
              NULLIF(s.data->>'amount_received', '')::numeric AS amount_received, NULLIF(s.data->>'change_given', '')::numeric AS change_given,
-             s.status, s.void_reason, s.price_mode, s.created_at_local AS created_at
+             s.status, s.void_reason, s.price_mode, s.created_at_local AS created_at,
+             NULLIF(s.data->>'discount_percent', '')::numeric AS discount_percent, s.voided_by, vb.name AS voided_by_name
              FROM giga_cloud.sales s LEFT JOIN giga_cloud.users u ON u.shop_id = s.shop_id AND u.user_id = s.cashier_id
+             LEFT JOIN giga_cloud.users vb ON vb.shop_id = s.shop_id AND vb.user_id = s.voided_by
             WHERE s.shop_id = ANY($1::uuid[]))`,
   items: `(SELECT i.shop_id, i.sale_item_id AS id, i.sale_id, i.medicine_id, i.batch_id, i.batch_number, NULLIF(i.data->>'expiry_date', '')::date AS expiry_date,
              i.quantity, i.unit_price, i.discount, i.cost_price_snapshot, i.total, i.price_mode FROM giga_cloud.sale_items i WHERE i.shop_id = ANY($1::uuid[]))`,
   payments: `(SELECT p.shop_id, p.sale_id, p.method, p.amount, p.reference FROM giga_cloud.payments p WHERE p.shop_id = ANY($1::uuid[]))`,
   customers: `(SELECT c.shop_id, c.customer_id AS id, c.name, c.phone FROM giga_cloud.customers c WHERE c.shop_id = ANY($1::uuid[]))`,
-  medicines: `(SELECT m.shop_id, m.medicine_id AS id, m.name, m.barcode, m.selling_price, m.wholesale_price FROM giga_cloud.medicines m WHERE m.shop_id = ANY($1::uuid[]))`,
+  medicines: `(SELECT m.shop_id, m.medicine_id AS id, m.name, m.data->>'generic_name' AS generic_name, m.data->>'brand_name' AS brand_name, m.barcode,
+             m.selling_price, m.wholesale_price FROM giga_cloud.medicines m WHERE m.shop_id = ANY($1::uuid[]))`,
   returns: `(SELECT r.shop_id, r.return_id AS id, r.sale_id, r.medicine_id, r.batch_id, r.quantity, r.approved_quantity, r.refund_amount, r.requested_refund,
              r.status, r.data->>'reason' AS reason, r.restocked, NULLIF(r.data->>'created_at', '')::timestamptz AS created_at, r.reviewed_at,
              COALESCE(rv.name, r.data->>'reviewed_by_name') AS reviewed_by_name
@@ -152,7 +156,7 @@ function salesWhere(scope: HistoryScope, query: Record<string, unknown>) {
     else w.add((p) => `(s.shop_id, s.customer_id) IN (SELECT c.shop_id, c.id FROM ${R.customers} c WHERE c.name ILIKE ${p} OR c.phone ILIKE ${p})`, like(customer));
   }
   const method = str(query.payment_method, 40);
-  if (method) w.add((p) => `lower(s.payment_method) = lower(${p})`, method);
+  if (method) w.add((p) => `(lower(s.payment_method) = lower(${p}) OR (s.shop_id, s.id) IN (SELECT x.shop_id, x.sale_id FROM ${R.payments} x WHERE lower(x.method) = lower(${p})))`, method);
   const status = str(query.status, 100).toLowerCase();
   if (status) w.add((p) => `lower(s.status) = ANY(string_to_array(${p}, ','))`, status);
   const mode = str(query.price_mode, 20).toUpperCase();
@@ -207,6 +211,7 @@ function saleRow(r: any, cost: boolean) {
     cashier_id: r.cashier_id, cashier_name: r.cashier_name ?? null, customer_id: r.customer_id, customer_name: r.customer_name ?? null,
     item_count: Number(r.item_count) || 0, units: Number(r.units) || 0, price_mode: r.price_mode || 'RETAIL',
     subtotal: num(r.subtotal), discount_total: num(r.discount_total), tax_total: num(r.tax_total), total: num(r.total),
+    discount_percent: r.discount_percent === null || r.discount_percent === undefined ? null : num(r.discount_percent),
     payment_method: r.payment_method, payment_reference: r.payment_reference ?? null, status: r.status, void_reason: r.void_reason ?? null,
     device_id: r.device_id ?? null,
     ...(cost ? { cost_total: num(r.cost_total), gross_profit: num(r.gross_profit) } : {}),
@@ -215,7 +220,7 @@ function saleRow(r: any, cost: boolean) {
 
 async function salesSummary(scope: HistoryScope, w: Where) {
   const R = rel(scope);
-  const base = `SELECT s.shop_id, s.id, s.subtotal, s.discount_total, s.total, s.gross_profit, s.status FROM ${R.sales} s ${w.sql}`;
+  const base = `SELECT s.shop_id, s.id, s.subtotal, s.discount_total, s.total, s.cost_total, s.gross_profit, s.status FROM ${R.sales} s ${w.sql}`;
   // One pass over each table: sales aggregate, payments by kind, approved refunds (joined per shop).
   const per = (await scope.q.query(
     `WITH f AS (${base}),
@@ -225,8 +230,13 @@ async function salesSummary(scope: HistoryScope, w: Where) {
               COALESCE(SUM(f.subtotal) FILTER (WHERE lower(f.status) <> 'voided'), 0)::float AS gross,
               COALESCE(SUM(f.discount_total) FILTER (WHERE lower(f.status) <> 'voided'), 0)::float AS discounts,
               COALESCE(SUM(f.total) FILTER (WHERE lower(f.status) <> 'voided'), 0)::float AS net,
-              COALESCE(SUM(f.gross_profit) FILTER (WHERE lower(f.status) <> 'voided'), 0)::float AS profit
+              COALESCE(SUM(f.gross_profit) FILTER (WHERE lower(f.status) <> 'voided'), 0)::float AS profit,
+              COALESCE(SUM(f.cost_total) FILTER (WHERE lower(f.status) <> 'voided'), 0)::float AS cost
          FROM f GROUP BY f.shop_id),
+     units AS (
+       SELECT x.shop_id, COALESCE(SUM(i.quantity), 0)::bigint AS units
+         FROM ${R.items} i JOIN f x ON x.shop_id = i.shop_id AND x.id = i.sale_id
+        WHERE lower(x.status) <> 'voided' AND i.quantity > 0 GROUP BY x.shop_id),
      pay AS (
        SELECT x.shop_id,
               COALESCE(SUM(p.amount) FILTER (WHERE lower(p.method) = 'cash'), 0)::float AS cash,
@@ -238,43 +248,53 @@ async function salesSummary(scope: HistoryScope, w: Where) {
        SELECT x.shop_id, COALESCE(SUM(r.refund_amount), 0)::float AS refunds
          FROM ${R.returns} r JOIN f x ON x.shop_id = r.shop_id AND x.id = r.sale_id
         WHERE r.status = 'APPROVED' GROUP BY x.shop_id)
-     SELECT agg.*, COALESCE(pay.cash, 0) AS cash, COALESCE(pay.mobile, 0) AS mobile, COALESCE(pay.paid, 0) AS paid, COALESCE(ref.refunds, 0) AS refunds
-       FROM agg LEFT JOIN pay ON pay.shop_id = agg.shop_id LEFT JOIN ref ON ref.shop_id = agg.shop_id`,
+     SELECT agg.*, COALESCE(pay.cash, 0) AS cash, COALESCE(pay.mobile, 0) AS mobile, COALESCE(pay.paid, 0) AS paid, COALESCE(ref.refunds, 0) AS refunds,
+            COALESCE(units.units, 0) AS units
+       FROM agg LEFT JOIN pay ON pay.shop_id = agg.shop_id LEFT JOIN ref ON ref.shop_id = agg.shop_id LEFT JOIN units ON units.shop_id = agg.shop_id`,
     w.params
   )).rows;
   const shops = new Map((await scope.q.query(`SELECT * FROM ${R.shops} sh`, [scope.shopIds])).rows.map((x: any) => [x.shop_id, x]));
   const round = (v: number) => Math.round(v * 100) / 100;
   const byShop = per.map((x: any) => ({
     shop_id: x.shop_id, shop_code: shops.get(x.shop_id)?.shop_code ?? null, shop_name: shops.get(x.shop_id)?.shop_name ?? null,
-    transactions: x.transactions, voided: x.voided, gross_sales: round(x.gross), discounts: round(x.discounts), net_sales: round(x.net),
+    transactions: x.transactions, voided: x.voided, units_sold: Number(x.units), gross_sales: round(x.gross), discounts: round(x.discounts), net_sales: round(x.net),
     cash: round(x.cash), mobile_money: round(x.mobile), other_payments: round(x.paid - x.cash - x.mobile), refunds: round(x.refunds),
-    ...(scope.includeCost ? { gross_profit: round(x.profit) } : {}),
+    ...(scope.includeCost ? { cost_of_goods: round(x.cost), gross_profit: round(x.profit) } : {}),
   }));
   const sum = (k: string) => round(byShop.reduce((t: number, x: any) => t + (Number(x[k]) || 0), 0));
   return {
     transactions: byShop.reduce((t: number, x: any) => t + x.transactions, 0),
     voided: byShop.reduce((t: number, x: any) => t + x.voided, 0),
+    units_sold: byShop.reduce((t: number, x: any) => t + x.units_sold, 0),
     gross_sales: sum('gross_sales'), discounts: sum('discounts'), net_sales: sum('net_sales'), cash: sum('cash'),
     mobile_money: sum('mobile_money'), other_payments: sum('other_payments'), refunds: sum('refunds'),
-    ...(scope.includeCost ? { gross_profit: sum('gross_profit') } : {}),
+    ...(scope.includeCost ? { cost_of_goods: sum('cost_of_goods'), gross_profit: sum('gross_profit') } : {}),
     by_shop: byShop,
   };
 }
 
-export async function saleDetail(scope: HistoryScope, saleId: string) {
+/**
+ * One sale EXACTLY as stored at the time of sale: sale_items quantity / unit_price / discount / total /
+ * price_mode / batch, the sale's own subtotal / discount / tax / total / payments. Nothing is derived from
+ * today's medicine prices. `expectShopId` (All Shops: the row's shop) must match the sale's real shop.
+ */
+export async function saleDetail(scope: HistoryScope, saleId: string, expectShopId?: string | null) {
   if (!isValidUuid(saleId)) throw new HttpError(400, 'Sale id must be a UUID.');
+  if (expectShopId && (!isValidUuid(expectShopId) || !scope.shopIds.includes(expectShopId.toLowerCase()))) {
+    throw new HttpError(403, 'Forbidden: that shop is not in your history scope.');
+  }
   const R = rel(scope);
   const head = (await scope.q.query(
     `SELECT s.*, sh.shop_code, sh.shop_name, c.name AS customer_name, c.phone AS customer_phone
        FROM ${R.sales} s LEFT JOIN ${R.shops} sh ON sh.shop_id = s.shop_id
        LEFT JOIN ${R.customers} c ON c.shop_id = s.shop_id AND c.id = s.customer_id
-      WHERE s.id = $2::uuid`, [scope.shopIds, saleId])).rows[0];
+      WHERE s.id = $2::uuid AND ($3::uuid IS NULL OR s.shop_id = $3::uuid)`, [scope.shopIds, saleId, expectShopId || null])).rows[0];
   if (!head) throw new HttpError(404, 'Sale not found in your history scope.');
   const p = [scope.shopIds, saleId, head.shop_id];
   const items = (await scope.q.query(
-    `SELECT i.*, m.name AS medicine_name, m.barcode FROM ${R.items} i LEFT JOIN ${R.medicines} m ON m.shop_id = i.shop_id AND m.id = i.medicine_id
+    `SELECT i.*, m.name AS medicine_name, m.generic_name, m.brand_name, m.barcode FROM ${R.items} i LEFT JOIN ${R.medicines} m ON m.shop_id = i.shop_id AND m.id = i.medicine_id
       WHERE i.sale_id = $2::uuid AND i.shop_id = $3::uuid ORDER BY m.name NULLS LAST, i.id`, p)).rows;
-  const payments = (await scope.q.query(`SELECT method, amount, reference FROM ${R.payments} p WHERE p.sale_id = $2::uuid AND p.shop_id = $3::uuid`, p)).rows;
+  const payments = (await scope.q.query(`SELECT method, amount, reference FROM ${R.payments} p WHERE p.sale_id = $2::uuid AND p.shop_id = $3::uuid ORDER BY method`, p)).rows;
   const returns = (await scope.q.query(
     `SELECT r.*, m.name AS medicine_name FROM ${R.returns} r LEFT JOIN ${R.medicines} m ON m.shop_id = r.shop_id AND m.id = r.medicine_id
       WHERE r.sale_id = $2::uuid AND r.shop_id = $3::uuid ORDER BY r.created_at`, p)).rows;
@@ -283,21 +303,51 @@ export async function saleDetail(scope: HistoryScope, saleId: string) {
       WHERE a.shop_id = $3::uuid AND (a.entity_id = $2::text OR a.entity_id IN (SELECT r.id::text FROM ${R.returns} r WHERE r.sale_id = $2::uuid AND r.shop_id = $3::uuid))
       ORDER BY a.occurred_at LIMIT 100`, p)).rows;
   const cost = scope.includeCost;
+  // Per sold line (medicine + batch): quantities returned by APPROVED returns and still PENDING.
+  const lineKey = (m: unknown, b: unknown) => `${m}|${b}`;
+  const approved = new Map<string, number>(), pending = new Map<string, number>(), sold = new Map<string, number>();
+  for (const r of returns) {
+    const k = lineKey(r.medicine_id, r.batch_id);
+    if (r.status === 'APPROVED') approved.set(k, (approved.get(k) || 0) + Number(r.approved_quantity || 0));
+    if (r.status === 'PENDING') pending.set(k, (pending.get(k) || 0) + Number(r.quantity || 0));
+  }
+  for (const i of items) sold.set(lineKey(i.medicine_id, i.batch_id), (sold.get(lineKey(i.medicine_id, i.batch_id)) || 0) + Number(i.quantity));
+  const voidAudit = audit.find((a: any) => a.action === 'SALE_VOIDED');
+  const totalPaid = payments.reduce((t: number, x: any) => t + Number(x.amount || 0), 0);
+  const isVoided = String(head.status).toLowerCase() === 'voided';
   return {
-    sale: { ...saleRow(head, cost), customer_phone: head.customer_phone ?? null, amount_received: num(head.amount_received), change_given: num(head.change_given), created_at: head.created_at },
-    items: items.map((i: any) => ({
-      medicine_id: i.medicine_id, medicine_name: i.medicine_name || 'Item', barcode: i.barcode ?? null, batch_number: i.batch_number,
-      expiry_date: i.expiry_date ?? null, quantity: Number(i.quantity), unit_price: num(i.unit_price), price_mode: i.price_mode || head.price_mode || 'RETAIL',
-      discount: num(i.discount), total: num(i.total),
-      ...(cost ? { cost_price_snapshot: num(i.cost_price_snapshot), profit: num(Number(i.total) - Number(i.cost_price_snapshot || 0) * Number(i.quantity)) } : {}),
-    })),
+    sale: {
+      ...saleRow(head, cost), customer_phone: head.customer_phone ?? null, amount_received: num(head.amount_received), change_given: num(head.change_given),
+      created_at: head.created_at, walk_in: !head.customer_id,
+    },
+    items: items.map((i: any) => {
+      const k = lineKey(i.medicine_id, i.batch_id);
+      const share = Number(i.quantity) / (sold.get(k) || Number(i.quantity) || 1);
+      const returned = Math.round((approved.get(k) || 0) * share);
+      return {
+        medicine_id: i.medicine_id, batch_id: i.batch_id ?? null, medicine_name: i.medicine_name || 'Item', generic_name: i.generic_name ?? null, brand_name: i.brand_name ?? null,
+        barcode: i.barcode ?? null, batch_number: i.batch_number, expiry_date: i.expiry_date ?? null,
+        quantity: Number(i.quantity), returned_quantity: returned, pending_return_quantity: Math.round((pending.get(k) || 0) * share),
+        net_quantity: isVoided ? 0 : Number(i.quantity) - returned,
+        unit_price: num(i.unit_price), price_mode: i.price_mode || head.price_mode || 'RETAIL', discount: num(i.discount), total: num(i.total),
+        ...(cost ? { cost_price_snapshot: num(i.cost_price_snapshot), profit: num(Number(i.total) - Number(i.cost_price_snapshot || 0) * Number(i.quantity)) } : {}),
+      };
+    }),
+    quantities: {
+      different_medicines: new Set(items.map((i: any) => i.medicine_id)).size,
+      total_units: items.reduce((t: number, i: any) => t + Number(i.quantity), 0),
+      returned_units: [...approved.values()].reduce((t, n) => t + n, 0),
+      net_units: isVoided ? 0 : items.reduce((t: number, i: any) => t + Number(i.quantity), 0) - [...approved.values()].reduce((t, n) => t + n, 0),
+    },
     payments: payments.map((x: any) => ({ method: x.method, amount: num(x.amount), reference: x.reference ?? null })),
+    total_paid: num(totalPaid),
     returns: returns.map((r: any) => ({
-      id: r.id, medicine_name: r.medicine_name || 'Item', quantity: Number(r.quantity), approved_quantity: r.approved_quantity ?? null, status: r.status,
-      reason: r.reason ?? null, refund_amount: num(r.refund_amount), restocked: r.restocked ?? null, created_at: r.created_at, reviewed_at: r.reviewed_at,
-      reviewed_by: r.reviewed_by_name ?? null,
+      id: r.id, medicine_name: r.medicine_name || 'Item', original_quantity: sold.get(lineKey(r.medicine_id, r.batch_id)) ?? null,
+      quantity: Number(r.quantity), approved_quantity: r.approved_quantity ?? null, status: r.status,
+      reason: r.reason ?? null, requested_refund: num(r.requested_refund), refund_amount: num(r.refund_amount), restocked: r.restocked ?? null,
+      created_at: r.created_at, reviewed_at: r.reviewed_at, reviewed_by: r.reviewed_by_name ?? null,
     })),
-    void: head.status === 'voided' ? { reason: head.void_reason ?? null } : null,
+    void: isVoided ? { reason: head.void_reason ?? null, voided_by: head.voided_by_name ?? voidAudit?.user_name ?? null, voided_at: voidAudit?.occurred_at ?? null } : null,
     audit: audit.map((a: any) => ({ action: a.action, by: a.user_name, at: a.occurred_at })),
   };
 }
