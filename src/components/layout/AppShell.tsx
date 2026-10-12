@@ -129,7 +129,7 @@ export const AppShell: React.FC<AppShellProps> = ({
     { id: 'expenses' as AppModule, label: 'Expenses', icon: Receipt },
     { id: 'sales' as AppModule, label: 'Sales History', icon: RotateCcw },
     { id: 'returns' as AppModule, label: 'Returns', icon: RotateCcw },
-    { id: 'history' as AppModule, label: 'History', icon: History },
+    { id: 'history' as AppModule, label: isCashier(currentUser) ? 'Stock History' : 'History', icon: History },
     { id: 'reports' as AppModule, label: 'Reports', icon: BarChart3 },
     { id: 'users' as AppModule, label: 'Users', icon: ShieldCheck },
     { id: 'audit' as AppModule, label: 'Audit Logs', icon: FileText },

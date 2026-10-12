@@ -42,6 +42,7 @@
     "test:updater": "tsx scripts/integration/updater.test.ts",
     "test:pos-cache": "tsx scripts/integration/pos-cache.test.ts",
     "test:full-write": "tsx scripts/integration/run-full-write.ts",
+    "test:stock-history": "tsx scripts/integration/run-stock-history.ts",
     "sandbox:online": "tsx scripts/dev/online-sandbox.ts",
     "test:medicine-search": "tsx scripts/integration/medicine-search.test.ts",
     "scan:dist": "node scripts/scan-dist.mjs",

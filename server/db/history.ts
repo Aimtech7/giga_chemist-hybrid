@@ -166,6 +166,12 @@ function salesWhere(scope: HistoryScope, query: Record<string, unknown>) {
   }
   const receipt = str(query.receipt, 60);
   if (receipt) w.add((p) => `(s.receipt_number ILIKE ${p} OR s.sale_number ILIKE ${p})`, like(receipt));
+  // Exact medicine (Stock History -> "View sales": the receipts behind one day's Sold figure).
+  const medicineId = str(query.medicine_id, 64);
+  if (medicineId) {
+    if (!isValidUuid(medicineId)) throw new HttpError(400, 'medicine_id must be a UUID.');
+    w.add((p) => `(s.shop_id, s.id) IN (SELECT i.shop_id, i.sale_id FROM ${R.items} i WHERE i.medicine_id = ${p}::uuid)`, medicineId);
+  }
   const medicine = str(query.medicine);
   if (medicine) {
     w.add((p) => `(s.shop_id, s.id) IN (SELECT i.shop_id, i.sale_id FROM ${R.items} i WHERE (i.shop_id, i.medicine_id) IN
@@ -371,6 +377,11 @@ function suppliesWhere(scope: HistoryScope, query: Record<string, unknown>) {
   if (status) w.add((x) => `lower(p.status) = ${x}`, status);
   const pay = str(query.payment_status, 20).toLowerCase();
   if (pay) w.add((x) => `lower(p.payment_status) = ${x}`, pay);
+  const medicineId = str(query.medicine_id, 64);
+  if (medicineId) {
+    if (!isValidUuid(medicineId)) throw new HttpError(400, 'medicine_id must be a UUID.');
+    w.add((x) => `(p.shop_id, p.id) IN (SELECT i.shop_id, i.purchase_id FROM ${R.purchase_items} i WHERE i.medicine_id = ${x}::uuid)`, medicineId);
+  }
   const medicine = str(query.medicine);
   if (medicine) {
     w.add((x) => `(p.shop_id, p.id) IN (SELECT i.shop_id, i.purchase_id FROM ${R.purchase_items} i WHERE (i.shop_id, i.medicine_id) IN

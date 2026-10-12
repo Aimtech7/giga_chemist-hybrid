@@ -189,3 +189,53 @@ Global dashboard: *View All Sales*, *View Supply History*; a shop dashboard show
   `purchase_items(medicine_id)` (sales already indexed); cloud **007** `(shop_id, …)` indexes on sales cashier/status/receipt,
   sale_items medicine, payments, returns, purchases date/supplier, purchase_items, movements reference, audit entity.
   Deploy cloud 007 with 006 (indexes only; safe at any time).
+
+## 14. Stock History (History → Stock History), read only
+
+Per **business day** (Africa/Nairobi, via PostgreSQL) and medicine: *Opening, Sold, Returned (restocked), Net sold, Received,
+Adjustments, Remaining (end of day)*, newest day first, with weekday headings (`MONDAY, 12 OCTOBER 2026`) and per-day cards
+(medicines sold, units sold, units received, restocked returns, adjustments, closing units). Default: **today**, medicines **with
+activity**; *Show all medicines*, Today / Yesterday / This week / Custom date / Custom range (max 62 days), server-side search
+(name, generic, brand, barcode, SKU — every medicine), pages of 50–500, Print (browser; *Save as PDF*), CSV (Admin / Manager).
+Click a row: **Stock activity** drawer — batches (opening / sold / returned / received / adjustment / closing / expiry), itemised
+adjustments and the chronological movement timeline (time, event, change, before → after, reference, user, batch); for Admin /
+Manager *View sales* / *View supplies* open Sales / Supply History filtered to that medicine (exact `medicine_id`), day and shop.
+POS: **Stock History** button in the cart header (today).
+
+* **Endpoints** (shared router, local + online): `GET /api/history/stock` (`date | from,to`, `shop_id`, `q`, `medicine_id`,
+  `activity_only`, `order`, `page`, `page_size`), `GET /api/history/stock/:medicineId?date=&shop_id=`, `GET /api/history/export/stock`.
+  Code: `server/db/stockHistory.ts` (one calculation; `LOCAL` = shop tables, `CLOUD` = `giga_cloud`), UI `src/components/history/StockHistoryView.tsx`.
+* **Access**: new narrow permission **`history.stock.view`** (Admin, Manager, **Cashier**). A cashier sees *History → Stock History*
+  only; `sales.view_all`, `stock.receive`, `inventory.view`, `reports.view` are NOT granted. Cashier: own shop only (local: the shop's
+  identity; online: the account's shop, `X-GIGA-SHOP-ID` to any other shop → 403), no CSV, no write anywhere (`/api/history/*` writes → 405,
+  stock endpoints stay Admin-only). Responses contain **quantities only** — no price, cost, profit or valuation field for anyone.
+* **Offline**: the shop server reads only its own PostgreSQL; Stock History works with the internet / Supabase / Vercel down.
+* **Calculation** — only the movement ledger, never `medicines.current_stock` for a past day:
+  * a batch's quantity at an instant = `new_quantity` of its last movement at or before it; opening = quantity at 00:00, remaining =
+    quantity at 24:00 (business day); medicine = sum of its batches.
+  * **Anchor** per batch = the moment from which the ledger holds every change. Local: the batch's creation. Cloud: the shop's
+    `MEDICINE_BASELINE` event (sync start; movements with a lower `local_seq` are inside the baseline), else the batch's creation.
+    Before the anchor the batch is 0 (did not exist) or **UNKNOWN** if it existed outside the ledger (local: old-system movements dated
+    before the batch was imported, which carry deltas only — previous = new = 0; cloud: before sync start).
+  * A medicine-day touching UNKNOWN is **INCOMPLETE STOCK HISTORY**: sales shown, every stock figure blank — never a guess.
+  * Sold = `sale_items` of valid sales of that business date (voided excluded). Received = `PURCHASE` movements (supplier receipts and
+    *stock added*). Returned = `RETURN_APPROVED` (restocked only; not-restocked approvals move 0; pending / rejected move nothing).
+    Adjustments = every other movement (physical count — its stored resulting quantity —, correction, damage, expiry, loss, supplier
+    return, void reversal) + stock of sales voided later (`Sold, sale later voided`), itemised.
+  * Each row must reconcile: opening − sold + returned + received + adjustments = remaining. Otherwise **LEDGER MISMATCH** is shown;
+    nothing is ever corrected or inserted by this feature.
+* **Shop 1 data** (checked on a copy of its database): the old-system import (2,181 batches, 2 Oct 2026 05:49 EAT) carried 263,107
+  delta-only movements → exact stock history **from 3 Oct 2026**; earlier days show sales only. The native ledger since then has 0 chain
+  breaks and its last balances equal every batch's quantity (8,677 units). The online copy is exact from **10 Oct 2026** (Shop 1
+  sync start 9 Oct 19:37 EAT); the shop's own History has the full local ledger.
+* **Cloud stock rebase** (`CLOUD_STOCK_REBASE_FROM_PC2`, 10 Oct 2026 21:38 EAT, `giga_cloud.online_audit`) reset the cloud's
+  `stock_levels` only; it is not a movement and does not change Stock History. It is shown as a boundary note on its day.
+* **All Shops** (Global Administrator): one row per shop per medicine (Shop column), per-shop day lines, a combined total labelled
+  *combined across shops*; stock is never merged silently.
+* **Indexes** (additive, no data change): local **019** `inventory_movements(batch_id, created_at)`; cloud **008**
+  `inventory_movements (shop_id, batch_id, occurred_at)`, `(shop_id, occurred_at)`, `(shop_id, medicine_id, occurred_at)`,
+  `processed_events (shop_id, local_seq) WHERE event_type = 'MEDICINE_BASELINE'`. The feature works without them (slower).
+  Measured on the Shop 1 copy: one week, every medicine ~0.3 s; medicine detail ~50 ms.
+* **Tests**: `npm run test:stock-history` (calculation scenario on local AND cloud sources in rolled-back transactions — local = cloud
+  for the same events —, Kenya midnight, voids, every return state, rebase, multi-shop, cashier API with the cloud unreachable);
+  online Global Admin / shop-scope / online-cashier checks are in `npm run test:full-write`.
