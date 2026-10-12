@@ -1,6 +1,6 @@
 import { apiUrl } from './api';
 import { getAuthToken, hasUsableToken, expireSession } from './session';
-import { selectedShopId, setSelectedShop } from './shopContext';
+import { isAllShopsScope, selectedShopId, setSelectedShop } from './shopContext';
 
 /**
  * Canonical client for the local GIGA CHEMIST API. Every protected request goes through apiFetch so
@@ -54,8 +54,10 @@ export async function apiFetch<T = any>(endpoint: string, options: ApiFetchOptio
   }
   // Online app: the shop the Administrator selected (re-authorized by the server on every request).
   // Never set on the local pharmacy app, so local requests are unchanged.
-  const shopId = auth ? selectedShopId() : null;
+  const allShops = auth && isAllShopsScope();
+  const shopId = auth && !allShops ? selectedShopId() : null;
   if (shopId) headers['X-GIGA-SHOP-ID'] = shopId;
+  if (allShops) headers['X-GIGA-SCOPE'] = 'ALL'; // read-only consolidated view: the server refuses shop writes
 
   let res: Response;
   try {

@@ -17,7 +17,7 @@ import { getAllSuppliers } from '../db/suppliers';
 import { getAllPurchases } from '../db/purchases';
 import { getAllExpenses } from '../db/expenses';
 import { getPharmacySettings, toSettings } from '../db/settings';
-import { buildRemoteAdminRouter } from './remoteAdmin';
+import { buildRemoteAdminRouter, isAllShopsScope } from './remoteAdmin';
 import { buildUserAdminRouter } from './userAdmin';
 import type { UserRole } from '../../src/types';
 
@@ -26,10 +26,10 @@ import type { UserRole } from '../../src/types';
  *
  *  - Data source: the CLOUD database (Supabase) — the giga_cloud tables filled by the shop's sync,
  *    read through the giga_online views (cloud migration 002). Never the shop's local PostgreSQL.
- *  - READ-ONLY: selling, stock, returns, purchases and every other write happen only on the shop
- *    server, whose local PostgreSQL is authoritative. Writes here answer 409 ONLINE_READ_ONLY.
- *  - ONE exception, ADMIN only: /api/admin/commands/* QUEUES a remote-administration command
- *    (giga_cloud.commands) for the shop. Nothing is changed in the cloud copy: the shop's sync
+ *  - NO DIRECT WRITES: selling, stock, returns, purchases and every other change happen only on the
+ *    shop server, whose local PostgreSQL is authoritative. Writes here answer 409 ONLINE_READ_ONLY.
+ *  - Administration is FULL-WRITE through commands, ADMIN only: /api/admin/commands/* QUEUES a
+ *    remote-administration command (giga_cloud.commands) for the selected shop. Nothing is changed in the cloud copy: the shop's sync
  *    worker pulls the command, applies it in its own PostgreSQL transaction and syncs the result
  *    back. The command's status (PENDING / DELIVERED / APPLIED / REJECTED) is readable here.
  *  - The same report / Sales History SQL as the shop server runs inside a READ ONLY transaction with
@@ -360,7 +360,8 @@ function send(res: Response, err: any, label: string) {
   }
   const status = typeof err?.status === 'number' ? err.status : 500;
   if (status >= 500) console.error(`[Online] ${label} failed:`, err?.message || err);
-  res.status(status).json({ error: status >= 500 && !(err instanceof HttpError) ? 'Cloud database error.' : err.message });
+  const code = err instanceof HttpError && typeof err.details?.code === 'string' ? { code: err.details.code } : {};
+  res.status(status).json({ error: status >= 500 && !(err instanceof HttpError) ? 'Cloud database error.' : err.message, ...code });
 }
 const route = (label: string, fn: (req: OnlineRequest, res: Response) => Promise<unknown>) =>
   async (req: OnlineRequest, res: Response) => {
@@ -381,6 +382,13 @@ export function buildOnlineRouter() {
   r.use(authenticate);
   r.use(resolveShop);
   r.use(maintenanceGate);
+  // "All Shops" (X-GIGA-SCOPE: ALL) is a read-only consolidated view: no shop-scoped write may run
+  // from it. Only the explicit all-shops fan-out and the (shop-less) Global Administrator accounts.
+  r.use((req, res, next) => {
+    if (req.method === 'GET' || req.method === 'HEAD' || !isAllShopsScope(req)) return next();
+    if (req.path.startsWith('/admin/all-shops/') || req.path.startsWith('/admin/accounts/global-admins') || req.path.startsWith('/auth/')) return next();
+    res.status(409).json({ error: 'All Shops is a read-only view. Select one shop to change it.', code: 'ALL_SHOPS_READ_ONLY' });
+  });
 
   r.get('/health', async (_req, res) => {
     const cfg = getOnlineConfig();
@@ -515,7 +523,7 @@ export function buildOnlineRouter() {
 
   // Remote administration (ADMIN only): queue commands for the shop; never a direct cloud write.
   r.use(buildRemoteAdminRouter({
-    shopId: requestShop, withShop: (req, fn) => withShop(requestShop(req), fn), withCloud, requireAdmin, route, getRemoteControl, clearRemoteControlCache, securityEvent,
+    shopId: requestShop, withShop: (req, fn) => withShop(requestShop(req), fn), withShopId: withShop, withCloud, requireAdmin, route, getRemoteControl, clearRemoteControlCache, securityEvent,
     isGlobalAdmin,
   }));
 

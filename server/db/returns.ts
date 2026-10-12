@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import type pg from 'pg';
-import { pgPool, HttpError, requireUuid, withTransaction, businessNow, type Queryable } from './client';
+import { pgPool, HttpError, requireUuid, withTransaction, businessNow, cleanUuid, type Queryable } from './client';
 import { ensureDevice } from './devices';
 import { recordAuditLog } from './audit';
 import { enqueueSyncEvent, rowJson } from '../sync/outbox';
@@ -39,7 +39,7 @@ const RETURN_SELECT = `
          r.refund_amount::float AS refund_amount, r.requested_refund::float AS requested_refund,
          r.approved_quantity, r.restocked, r.reason, r.action, r.status,
          r.user_id, u.name AS user_name, r.device_id, r.created_at,
-         r.reviewed_by, rv.name AS reviewed_by_name, r.reviewed_at, r.review_notes,
+         r.reviewed_by, COALESCE(rv.name, r.reviewed_by_name) AS reviewed_by_name, r.reviewed_at, r.review_notes,
          s.date AS sale_date, s.time AS sale_time, s.status AS sale_status, s.price_mode AS sale_price_mode,
          COALESCE(s.discount_percent, 0)::float AS sale_discount_percent,
          c.name AS customer_name,
@@ -276,8 +276,16 @@ export async function approveReturn(returnIdRaw: string, input: ApproveReturnInp
     throw new HttpError(400, `disposition must be one of ${NON_RESTOCK_DISPOSITIONS.join(', ')} when not restocking.`);
   }
   const notes = typeof input?.notes === 'string' ? input.notes.trim().slice(0, 1000) || null : null;
+  return withTransaction((client) => approveReturnTx(client, returnId, { restock, disposition, notes }, actor));
+}
 
-  return withTransaction(async (client) => {
+/** approveReturn on the caller's transaction (remote commands); input already validated. */
+export async function approveReturnTx(
+  client: pg.PoolClient, returnId: string, input: { restock: boolean; disposition: string; notes: string | null }, actor: SaleActor
+) {
+  const { restock, disposition, notes } = input;
+  if (actor.role !== 'ADMIN') throw new HttpError(403, 'Only an Administrator can approve returns.');
+  {
     const { ret, sale } = await lockPendingReturn(client, returnId);
     if (!sale) throw new HttpError(409, 'The original sale no longer exists.');
     if (sale.status === 'voided') throw new HttpError(409, 'The original sale has been voided; reject this return instead.');
@@ -302,9 +310,9 @@ export async function approveReturn(returnIdRaw: string, input: ApproveReturnInp
     const deviceId = await ensureDevice(client, actor.device_id, actor.user_id);
     await client.query(
       `UPDATE returns SET status = 'APPROVED', approved_quantity = $2, refund_amount = $3, restocked = $4, action = $5,
-         reviewed_by = $6, reviewed_at = CURRENT_TIMESTAMP, review_notes = $7
+         reviewed_by = $6, reviewed_at = CURRENT_TIMESTAMP, review_notes = $7, reviewed_by_name = $8
        WHERE id = $1`,
-      [returnId, qty, fromCents(cents), restock, disposition, actor.user_id, notes]
+      [returnId, qty, fromCents(cents), restock, disposition, cleanUuid(actor.user_id), notes, (actor.user_name || '').slice(0, 255) || null]
     );
 
     const prev = Number(batch.quantity_available);
@@ -395,7 +403,7 @@ export async function approveReturn(returnIdRaw: string, input: ApproveReturnInp
       medicine,
       batch: toBatchDto(savedBatch),
     };
-  });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -406,13 +414,18 @@ export async function rejectReturn(returnIdRaw: string, notesRaw: unknown, actor
   if (actor.role !== 'ADMIN') throw new HttpError(403, 'Only an Administrator can reject returns.');
   const notes = typeof notesRaw === 'string' ? notesRaw.trim().slice(0, 1000) : '';
   if (!notes) throw new HttpError(400, 'A rejection reason is required.');
+  return withTransaction((client) => rejectReturnTx(client, returnId, notes, actor));
+}
 
-  return withTransaction(async (client) => {
+/** rejectReturn on the caller's transaction (remote commands); notes already validated. */
+export async function rejectReturnTx(client: pg.PoolClient, returnId: string, notes: string, actor: SaleActor) {
+  if (actor.role !== 'ADMIN') throw new HttpError(403, 'Only an Administrator can reject returns.');
+  {
     const { ret } = await lockPendingReturn(client, returnId);
     const deviceId = await ensureDevice(client, actor.device_id, actor.user_id);
     await client.query(
-      `UPDATE returns SET status = 'REJECTED', reviewed_by = $2, reviewed_at = CURRENT_TIMESTAMP, review_notes = $3 WHERE id = $1`,
-      [returnId, actor.user_id, notes]
+      `UPDATE returns SET status = 'REJECTED', reviewed_by = $2, reviewed_at = CURRENT_TIMESTAMP, review_notes = $3, reviewed_by_name = $4 WHERE id = $1`,
+      [returnId, cleanUuid(actor.user_id), notes, (actor.user_name || '').slice(0, 255) || null]
     );
     await recordAuditLog(
       {
@@ -439,5 +452,5 @@ export async function rejectReturn(returnIdRaw: string, notesRaw: unknown, actor
       business_ref: ret.receipt_number,
     });
     return { success: true, return: (await getReturnById(client, returnId))!, sale: (await getSaleById(ret.sale_id, client))! };
-  });
+  }
 }

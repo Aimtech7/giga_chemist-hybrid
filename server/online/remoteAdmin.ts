@@ -2,7 +2,11 @@ import crypto from 'crypto';
 import express, { type Request, type Response, type NextFunction } from 'express';
 import type pg from 'pg';
 import { HttpError, isValidUuid } from '../db/client';
-import { validateCommandPayload, STOCK_REMOVE_REASONS, ASSIGNABLE_ROLES, type CommandType } from '../sync/commandSchema';
+import { getMedicineById } from '../db/medicines';
+import {
+  validateCommandPayload, commandEntity, commandExpectation, STOCK_REMOVE_REASONS, ASSIGNABLE_ROLES, HIGH_CONFLICT_TYPES, ALL_SHOPS_TYPES,
+  EXPENSE_CATEGORIES, EXPENSE_PAYMENT_METHODS, RETURN_DISPOSITIONS, PRICE_FIELDS, METADATA_FIELDS, type CommandType,
+} from '../sync/commandSchema';
 
 /**
  * Remote administration from the online app (ADMIN only).
@@ -15,6 +19,11 @@ import { validateCommandPayload, STOCK_REMOVE_REASONS, ASSIGNABLE_ROLES, type Co
  *   GET  /api/admin/alerts  POST /api/admin/alerts/:id/ack
  *   GET  /api/admin/insights             inventory intelligence + retail/wholesale split (cloud copy)
  *   GET  /api/admin/security  POST /api/admin/security/*   emergency controls, session revocation
+ *   GET  /api/admin/overview             GLOBAL CONTROL CENTER: per-shop health + business totals
+ *   POST /api/admin/all-shops/commands/<action>   APPLY TO ALL SHOPS: one independent command per shop
+ *
+ * "All Shops" is READ-ONLY: a browser in that view sends X-GIGA-SCOPE: ALL and every shop-scoped write
+ * is refused (409 ALL_SHOPS_READ_ONLY); only the explicit all-shops endpoint fans out a change.
  *
  * Queueing never changes data in the cloud copy. The shop's local PostgreSQL applies the command
  * and its sync reports the result back, so a queued command is "PENDING", never "done". shop_id
@@ -34,6 +43,8 @@ export interface RemoteAdminDeps {
   shopId: (req: Request) => string;
   /** Read-only transaction over the giga_online views of the request's shop. */
   withShop: <T>(req: Request, fn: (c: pg.PoolClient) => Promise<T>) => Promise<T>;
+  /** Same, for an explicit (already authorized) shop: all-shops fan-out and the overview. */
+  withShopId: <T>(shopId: string, fn: (c: pg.PoolClient) => Promise<T>) => Promise<T>;
   /** Plain connection to the cloud database. */
   withCloud: <T>(fn: (c: pg.PoolClient) => Promise<T>) => Promise<T>;
   requireAdmin: (req: any, res: Response, next: NextFunction) => unknown;
@@ -57,7 +68,53 @@ export const ACTIONS: Record<string, CommandType> = {
   'user-active': 'USER_SET_ACTIVE',
   'user-role': 'USER_ROLE_UPDATE',
   'app-update': 'APP_UPDATE_APPROVE',
+  // Full-write Global Admin (cloud migration 006)
+  'medicine-create': 'MEDICINE_CREATE',
+  'medicine-active': 'MEDICINE_SET_ACTIVE',
+  'batch-create': 'BATCH_CREATE',
+  'batch-update': 'BATCH_UPDATE',
+  'batch-active': 'BATCH_SET_ACTIVE',
+  'supplier-create': 'SUPPLIER_CREATE',
+  'supplier-update': 'SUPPLIER_UPDATE',
+  'supplier-active': 'SUPPLIER_SET_ACTIVE',
+  'customer-create': 'CUSTOMER_CREATE',
+  'customer-update': 'CUSTOMER_UPDATE',
+  'customer-active': 'CUSTOMER_SET_ACTIVE',
+  'purchase-create': 'PURCHASE_CREATE',
+  'purchase-update': 'PURCHASE_UPDATE_DRAFT',
+  'purchase-receive': 'PURCHASE_RECEIVE',
+  'purchase-cancel': 'PURCHASE_CANCEL',
+  'expense-create': 'EXPENSE_CREATE',
+  'expense-update': 'EXPENSE_UPDATE',
+  'expense-void': 'EXPENSE_VOID',
+  'return-approve': 'RETURN_APPROVE',
+  'return-reject': 'RETURN_REJECT',
+  'sale-void': 'SALE_VOID',
+  'user-session-revoke': 'USER_SESSION_REVOKE',
 };
+
+/**
+ * Create commands name their new record by an id chosen HERE (before the shop applies it), so the
+ * record can be referenced at once and a re-delivered command never creates it twice. With a client
+ * request id the id is derived from it: the same retried request names the same record.
+ */
+const CREATE_ID_FIELD: Partial<Record<CommandType, string>> = {
+  MEDICINE_CREATE: 'medicine_id', BATCH_CREATE: 'batch_id', SUPPLIER_CREATE: 'supplier_id', CUSTOMER_CREATE: 'customer_id',
+  PURCHASE_CREATE: 'purchase_id', EXPENSE_CREATE: 'expense_id',
+};
+
+/** Deterministic UUID (version-4 layout) from a seed. */
+function derivedUuid(seed: string): string {
+  const h = crypto.createHash('sha256').update(seed).digest();
+  h[6] = (h[6] & 0x0f) | 0x40;
+  h[8] = (h[8] & 0x3f) | 0x80;
+  const x = h.subarray(0, 16).toString('hex');
+  return `${x.slice(0, 8)}-${x.slice(8, 12)}-${x.slice(12, 16)}-${x.slice(16, 20)}-${x.slice(20, 32)}`;
+}
+
+/** Header a browser sends while it shows "All Shops" (read-only consolidated view). */
+export const SCOPE_HEADER = 'x-giga-scope';
+export const isAllShopsScope = (req: Request) => String(req.headers[SCOPE_HEADER] || '').trim().toUpperCase() === 'ALL';
 
 /** Shop PC is ONLINE when its last heartbeat (every ~60 s) is younger than this. */
 export const HEARTBEAT_ONLINE_SECONDS = Math.max(60, Number(process.env.HEARTBEAT_ONLINE_SECONDS) || 180);
@@ -92,9 +149,16 @@ function safeError(e: unknown): string | null {
 }
 
 function toCommand(r: any) {
+  const entity = commandEntity(r.command_type, r.payload);
   return {
     command_id: r.command_id,
+    shop_id: r.shop_id ?? null,
     command_type: r.command_type,
+    entity: entity?.entity ?? null,
+    entity_id: entity?.entity_id ?? null,
+    idempotency_key: r.idempotency_key ?? null,
+    expected: commandExpectation(r.payload),
+    high_conflict: HIGH_CONFLICT_TYPES.includes(r.command_type),
     status: r.status,
     payload: r.payload,
     display: r.display ?? null,
@@ -116,19 +180,26 @@ function clientIp(req: Request): string {
 }
 
 /**
- * Checks the medicine / batch / user named in a payload exist in this shop's cloud copy and returns
- * what the Admin was looking at (names, values before the change) for the activity history.
+ * Checks every record named in a payload exists in THIS shop's cloud copy (so a command can never
+ * address another shop's record) and returns what the Admin was looking at (names, values before the
+ * change) for the activity history. Ids of records a create command introduces are not looked up.
  */
-async function contextFor(deps: RemoteAdminDeps, req: Request, type: CommandType, p: Record<string, any>): Promise<Record<string, unknown>> {
+async function contextFor(withShop: ShopReader, type: CommandType, p: Record<string, any>): Promise<Record<string, unknown>> {
   const display: Record<string, unknown> = {};
-  await deps.withShop(req, async (c) => {
-    if (p.medicine_id) {
-      const m = (await c.query(
+  const creates = CREATE_ID_FIELD[type] ?? (type === 'PURCHASE_RECEIVE' && p.items ? 'purchase_id' : null);
+  const one = async (c: pg.PoolClient, sql: string, params: unknown[], missing: string) => {
+    const row = (await c.query(sql, params)).rows[0];
+    if (!row) throw new HttpError(404, missing);
+    return row;
+  };
+  await withShop(async (c) => {
+    if (p.medicine_id && creates !== 'medicine_id') {
+      const m = await one(c,
         `SELECT name, current_stock, selling_price, wholesale_price, min_selling_price, purchase_price, reorder_level, status FROM medicines WHERE id = $1`,
-        [p.medicine_id])).rows[0];
-      if (!m) throw new HttpError(404, 'Medicine not found in the cloud copy of this shop (has the shop synced it yet?).');
+        [p.medicine_id], 'Medicine not found in the cloud copy of this shop (has the shop synced it yet?).');
       display.medicine_name = m.name;
       display.cloud_stock_before = Number(m.current_stock);
+      display.medicine_status_before = m.status;
       if (type === 'PRICE_UPDATE') {
         display.prices_before = {
           selling_price: Number(m.selling_price), wholesale_price: m.wholesale_price === null ? null : Number(m.wholesale_price),
@@ -136,26 +207,63 @@ async function contextFor(deps: RemoteAdminDeps, req: Request, type: CommandType
         };
       }
     }
-    if (p.batch_id) {
-      const b = (await c.query('SELECT batch_number, quantity_available, expiry_date FROM medicine_batches WHERE id = $1 AND medicine_id = $2',
-        [p.batch_id, p.medicine_id])).rows[0];
-      if (!b) throw new HttpError(404, 'Batch not found for this medicine in the cloud copy.');
+    if (p.batch_id && creates !== 'batch_id') {
+      const b = await one(c, 'SELECT batch_number, quantity_available, expiry_date, status FROM medicine_batches WHERE id = $1 AND medicine_id = $2',
+        [p.batch_id, p.medicine_id], 'Batch not found for this medicine in the cloud copy.');
       display.batch_number = b.batch_number;
       display.batch_quantity_before = Number(b.quantity_available);
       display.expiry_before = b.expiry_date ? new Date(b.expiry_date).toISOString().slice(0, 10) : null;
+      display.batch_status_before = b.status;
     }
     if (p.user_id) {
-      const u = (await c.query('SELECT name, role, active FROM users WHERE id = $1 AND email IS NOT NULL', [p.user_id])).rows[0];
-      if (!u) throw new HttpError(404, 'Staff account not found in the cloud copy of this shop.');
+      const u = await one(c, 'SELECT name, role, active FROM users WHERE id = $1 AND email IS NOT NULL', [p.user_id], 'Staff account not found in the cloud copy of this shop.');
       display.user_name = u.name;
       display.role_before = u.role;
       display.active_before = u.active;
+    }
+    if (p.supplier_id && creates !== 'supplier_id') {
+      const v = await one(c, 'SELECT name, status FROM suppliers WHERE id = $1', [p.supplier_id], 'Supplier not found in the cloud copy of this shop.');
+      display.supplier_name = v.name;
+      display.supplier_status_before = v.status;
+    }
+    if (p.customer_id && creates !== 'customer_id') {
+      const v = await one(c, 'SELECT name, active FROM customers WHERE id = $1', [p.customer_id], 'Customer not found in the cloud copy of this shop.');
+      display.customer_name = v.name;
+      display.customer_active_before = v.active;
+    }
+    if (p.purchase_id && creates !== 'purchase_id') {
+      const v = await one(c, 'SELECT order_number, invoice_number, status, total_amount FROM purchases WHERE id = $1', [p.purchase_id],
+        'Purchase not found in the cloud copy of this shop.');
+      display.order_number = v.order_number;
+      display.purchase_status_before = v.status;
+      display.purchase_total_before = v.total_amount === null ? null : Number(v.total_amount);
+    }
+    if (Array.isArray(p.items)) {
+      const ids = [...new Set(p.items.map((i: any) => i.medicine_id))];
+      const n = (await c.query('SELECT COUNT(*)::int AS n FROM medicines WHERE id = ANY($1::uuid[])', [ids])).rows[0].n;
+      if (n !== ids.length) throw new HttpError(404, 'A purchase line names a medicine that is not in the cloud copy of this shop.');
+      display.lines = p.items.length;
+      display.total = Math.round(p.items.reduce((sum: number, i: any) => sum + i.quantity * i.purchase_price, 0) * 100) / 100;
+    }
+    if (p.expense_id && creates !== 'expense_id') {
+      const v = await one(c, 'SELECT description, amount, category, status FROM expenses WHERE id = $1', [p.expense_id], 'Expense not found in the cloud copy of this shop.');
+      display.expense = { description: v.description, amount: Number(v.amount), category: v.category, status: v.status };
+    }
+    if (p.return_id) {
+      const v = await one(c, 'SELECT receipt_number, quantity, status, requested_refund FROM returns WHERE id = $1', [p.return_id], 'Return not found in the cloud copy of this shop.');
+      display.return = { receipt_number: v.receipt_number, quantity: Number(v.quantity), status: v.status, requested_refund: v.requested_refund === null ? null : Number(v.requested_refund) };
+    }
+    if (p.sale_id) {
+      const v = await one(c, 'SELECT receipt_number, total, status, date FROM sales WHERE id = $1', [p.sale_id], 'Sale not found in the cloud copy of this shop.');
+      display.sale = { receipt_number: v.receipt_number, total: Number(v.total), status: v.status, date: v.date };
     }
   });
   return display;
 }
 
-const COMMAND_COLUMNS = `command_id, command_type, status, payload, created_at, created_by, source, delivered_at, delivery_count, acked_at, result, error`;
+type ShopReader = <T>(fn: (c: pg.PoolClient) => Promise<T>) => Promise<T>;
+
+const COMMAND_COLUMNS = `command_id, shop_id, idempotency_key, command_type, status, payload, created_at, created_by, source, delivered_at, delivery_count, acked_at, result, error`;
 
 /** Same query with the display column when migration 004 is applied. */
 async function commandQuery(deps: RemoteAdminDeps, where: string, params: unknown[], tail = '') {
@@ -215,21 +323,37 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
     res.json({ actions: Object.keys(ACTIONS), stock_remove_reasons: STOCK_REMOVE_REASONS, assignable_roles: ASSIGNABLE_ROLES });
   });
 
-  r.post('/admin/commands/:action', requireAdmin, commandRateLimit, route('POST /admin/commands', async (req, res) => {
-    const type = ACTIONS[String(req.params.action)];
-    if (!type) throw new HttpError(404, `Unknown remote action "${req.params.action}".`);
-    const shopId = deps.shopId(req);
+  /** Shop online? (heartbeat when available, else last contact). null = unknown. */
+  async function shopOnline(shopId: string): Promise<boolean | null> {
+    const rt = await runtimeRow(deps, shopId);
+    if (rt) return rt.age_seconds <= HEARTBEAT_ONLINE_SECONDS;
+    if (rt === null) return false;
+    const shop = (await deps.withCloud((c) => c.query(
+      `SELECT (last_seen_at IS NOT NULL AND last_seen_at > now() - make_interval(secs => $2)) AS in_contact FROM giga_cloud.shops WHERE shop_id = $1`,
+      [shopId, CONTACT_WINDOW_SECONDS]))).rows[0];
+    return shop ? Boolean(shop.in_contact) : null;
+  }
+
+  /**
+   * Validates, checks against the target shop's cloud copy and queues ONE command for ONE shop.
+   * The only queueing path: single-shop requests and the all-shops fan-out both use it.
+   */
+  async function queueForShop(req: any, shopId: string, type: CommandType, bodyIn: Record<string, any>, seed: string | null, extraDisplay: Record<string, unknown> = {}) {
     const ctl = await deps.getRemoteControl(shopId, true);
     if (!ctl.remote_writes_enabled) throw new HttpError(423, 'Remote changes are disabled (emergency switch). Re-enable them under Security.');
-    const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? { ...req.body } : {};
-    // Optional client request id: the SAME phone request retried (bad network) queues ONE command.
-    const requestId = body.request_id;
-    delete body.request_id;
+    const u = req.onlineUser;
+    let body = bodyIn;
+    const createField = CREATE_ID_FIELD[type] ?? (type === 'PURCHASE_RECEIVE' && Array.isArray(body.items) ? 'purchase_id' : undefined);
+    if (createField) {
+      if (body[createField] !== undefined) throw new HttpError(400, `${createField} of a new record is assigned by the server; do not send it.`);
+      body = { ...body, [createField]: seed ? derivedUuid(`${u.id}:${seed}:${type}:${shopId}`) : crypto.randomUUID() };
+    }
     const payload = validateCommandPayload(type, body);
-    const display = await contextFor(deps, req, type, payload);
+    const display = await contextFor((fn) => deps.withShopId(shopId, fn), type, payload);
     // Target shop recorded with the command, so its history always names the shop it was sent to.
     const target = (await deps.withCloud((c) => c.query('SELECT shop_code, name FROM giga_cloud.shops WHERE shop_id = $1', [shopId]))).rows[0];
     display.target_shop = { shop_id: shopId, shop_code: target?.shop_code ?? null, name: target?.name ?? null };
+    Object.assign(display, extraDisplay);
     if (type === 'APP_UPDATE_APPROVE') {
       const rt = await runtimeRow(deps, shopId);
       const available = rt?.update_state?.available_commit;
@@ -239,9 +363,12 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
       display.current_commit = rt.update_state.current_commit ?? null;
       display.available_version = rt.update_state.available_version ?? null;
     }
+    const online = await shopOnline(shopId);
+    const highConflict = HIGH_CONFLICT_TYPES.includes(type);
+    if (online === false) display.queued_while_shop_offline = true;
 
-    const u = req.onlineUser;
-    const key = `online:${u.id}:${isValidUuid(requestId) ? String(requestId).toLowerCase() : crypto.randomUUID()}`;
+    // Same request (+ same shop for a fan-out) = same key = ONE command, however often it is retried.
+    const key = `online:${u.id}:${seed ? `${seed}${extraDisplay.fanout_group ? `:${shopId}` : ''}` : crypto.randomUUID()}`;
     let row: any;
     try {
       row = (await deps.withCloud((c) => c.query(
@@ -253,23 +380,120 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
       if (err?.code === 'PT404') throw new HttpError(409, 'The shop is not registered (or inactive) in the cloud.');
       if (err?.code === 'PT409') throw new HttpError(409, 'This request id was already used for another command.');
       if (err?.code === 'PT423') throw new HttpError(423, 'Remote changes are disabled (emergency switch).');
-      if (err?.code === '42883' || err?.code === '23514' || err?.code === '42703') {
+      if (err?.code === '23514') throw new HttpError(503, `The cloud does not accept ${type} yet (apply cloud migration 006).`);
+      if (err?.code === '42883' || err?.code === '42703') {
         throw new HttpError(503, 'Remote administration is not fully enabled in the cloud yet (apply cloud migrations 003 and 004).');
       }
       throw err;
     }
-    console.log(`[Online] ${u.email} queued ${type} ${row.command_id}${row.duplicate ? ' (replayed request)' : ''}`);
-    res.status(202);
+    // A replayed request returns the ORIGINAL command: report the record id it really names.
+    let entity = commandEntity(type, payload);
+    if (row.duplicate) {
+      const orig = (await commandQuery(deps, 'command_id = $1', [row.command_id]))[0];
+      if (orig) entity = commandEntity(orig.command_type, orig.payload);
+    }
+    console.log(`[Online] ${u.email} queued ${type} ${row.command_id} for shop ${target?.shop_code || shopId}${row.duplicate ? ' (replayed request)' : ''}`);
+    const offlineWarning = highConflict
+      ? 'The shop computer is OFFLINE. This stock/financial change waits as PENDING and is re-checked against the shop live data when it arrives; it may be REJECTED if anything changed meanwhile.'
+      : 'The shop computer is offline: the change waits as PENDING and is applied when the shop reconnects.';
     return {
       command_id: row.command_id,
       command_type: type,
       shop_id: shopId,
       shop_code: target?.shop_code ?? null,
+      shop_name: target?.name ?? null,
+      entity: entity?.entity ?? null,
+      entity_id: entity?.entity_id ?? null,
       status: row.status,
       created_at: row.created_at,
       duplicate: row.duplicate,
+      shop_online: online,
+      warning: online === false ? offlineWarning : null,
       message: 'Remote change queued. It is applied when the shop computer picks it up; watch the status.',
     };
+  }
+
+  const requestSeed = (requestId: unknown) => (typeof requestId === 'string' && isValidUuid(requestId) ? requestId.toLowerCase() : null);
+
+  r.post('/admin/commands/:action', requireAdmin, commandRateLimit, route('POST /admin/commands', async (req, res) => {
+    const type = ACTIONS[String(req.params.action)];
+    if (!type) throw new HttpError(404, `Unknown remote action "${req.params.action}".`);
+    if (isAllShopsScope(req)) {
+      throw new HttpError(409, 'All Shops is a read-only view. Select one shop to change it, or use "Apply to all shops" where it is offered.', { code: 'ALL_SHOPS_READ_ONLY' });
+    }
+    const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? { ...req.body } : {};
+    // Optional client request id: the SAME phone request retried (bad network) queues ONE command.
+    const seed = requestSeed(body.request_id);
+    delete body.request_id;
+    const out = await queueForShop(req, deps.shopId(req), type, body, seed);
+    res.status(202);
+    return out;
+  }));
+
+  /**
+   * APPLY TO ALL SHOPS (Global Administrator only; catalogue prices/details, categories, settings):
+   * ONE independent shop-scoped command per active shop, never one cross-shop command. A medicine
+   * is identified in each shop by its barcode (medicine ids differ per shop); a shop without exactly
+   * one matching medicine is SKIPPED and reported. Each shop's command carries that shop's own current
+   * cloud values as `expected`, so a shop with newer local changes rejects instead of being overwritten.
+   */
+  r.post('/admin/all-shops/commands/:action', requireAdmin, commandRateLimit, route('POST /admin/all-shops/commands', async (req, res) => {
+    if (!deps.isGlobalAdmin(req.onlineUser)) throw new HttpError(403, 'Forbidden: only a Global Administrator can apply a change to all shops.');
+    const type = ACTIONS[String(req.params.action)];
+    if (!type || !ALL_SHOPS_TYPES.includes(type)) {
+      throw new HttpError(400, `"${req.params.action}" cannot be applied to all shops (allowed: prices, medicine details, categories, settings).`);
+    }
+    const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? { ...req.body } : {};
+    const seed = requestSeed(body.request_id) || crypto.randomUUID();
+    delete body.request_id;
+    const sourceShop = typeof body.source_shop_id === 'string' ? body.source_shop_id.toLowerCase() : '';
+    delete body.source_shop_id;
+    delete body.expected; // each shop gets its own expectation below
+    validateCommandPayload(type, body); // the request itself must be valid before anything is queued
+    const shops = (await deps.withCloud((c) => c.query('SELECT shop_id, shop_code, name FROM giga_cloud.shops WHERE active ORDER BY shop_code, shop_id'))).rows;
+
+    let barcode: string | null = null;
+    if (body.medicine_id) {
+      if (!isValidUuid(sourceShop) || !shops.some((x: any) => x.shop_id === sourceShop)) {
+        throw new HttpError(400, 'source_shop_id (the shop whose medicine you selected) is required and must be an active shop.');
+      }
+      const src = (await deps.withShopId(sourceShop, (c) => c.query('SELECT name, barcode FROM medicines WHERE id = $1', [body.medicine_id]))).rows[0];
+      if (!src) throw new HttpError(404, 'Medicine not found in the source shop.');
+      barcode = typeof src.barcode === 'string' && src.barcode.trim() ? src.barcode.trim() : null;
+      if (!barcode) throw new HttpError(409, 'This medicine has no barcode, so it cannot be matched in other shops. Change each shop separately.');
+    }
+    const fields = Object.keys(body).filter((k) => !['medicine_id', 'reason'].includes(k));
+    const allowed: readonly string[] = type === 'PRICE_UPDATE' ? PRICE_FIELDS : METADATA_FIELDS;
+    const results: Record<string, any>[] = [];
+    for (const shop of shops) {
+      const one: Record<string, any> = { shop_id: shop.shop_id, shop_code: shop.shop_code, shop_name: shop.name };
+      try {
+        const shopBody: Record<string, any> = { ...body };
+        if (barcode) {
+          const found = (await deps.withShopId(shop.shop_id, (c) => c.query(
+            `SELECT id FROM medicines WHERE lower(btrim(barcode)) = lower($1) LIMIT 2`, [barcode]))).rows;
+          if (found.length !== 1) {
+            results.push({ ...one, status: 'SKIPPED', reason: found.length ? 'more than one medicine has this barcode' : 'no medicine with this barcode' });
+            continue;
+          }
+          // Normalized exactly like the shop reads it (same SELECT), so the comparison is like for like.
+          const m: Record<string, any> = (await deps.withShopId(shop.shop_id, (c) => getMedicineById(found[0].id, c)))!;
+          shopBody.medicine_id = m.id;
+          // This shop's own current values (its cloud copy) are the expectation for this shop.
+          const exp = Object.fromEntries(fields.filter((f) => allowed.includes(f)).map((f) => [f, m[f] === undefined ? null : m[f]]));
+          if (Object.keys(exp).length) shopBody.expected = exp;
+        }
+        const q = await queueForShop(req, shop.shop_id, type, shopBody, seed, { fanout_group: seed, applied_to: 'ALL_SHOPS' });
+        results.push({ ...one, status: 'QUEUED', command_id: q.command_id, duplicate: q.duplicate, shop_online: q.shop_online, warning: q.warning });
+      } catch (err: any) {
+        results.push({ ...one, status: 'SKIPPED', reason: err instanceof HttpError ? err.message : 'cloud error' });
+      }
+    }
+    await deps.securityEvent(req, 'REMOTE_COMMAND_ALL_SHOPS', req.onlineUser.email, req.onlineUser.id, {
+      command_type: type, fanout_group: seed, queued: results.filter((x) => x.status === 'QUEUED').length, skipped: results.filter((x) => x.status === 'SKIPPED').length,
+    });
+    res.status(202);
+    return { command_type: type, fanout_group: seed, results };
   }));
 
   r.get('/admin/commands', requireAdmin, route('GET /admin/commands', async (req) => {
@@ -375,6 +599,98 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
       inventory: rt.inventory ?? null,
       commands: counts,
       controls: ctl,
+    };
+  }));
+
+  // ------------------------------------------------------------------ GLOBAL CONTROL CENTER
+  /**
+   * Per-shop health and business figures from the cloud copy, plus consolidated totals. A Global
+   * Administrator sees every active shop; a shop Administrator only their own. Each shop is computed
+   * in its own shop-scoped read-only transaction; one failing shop never hides the others.
+   */
+  r.get('/admin/overview', requireAdmin, route('GET /admin/overview', async (req) => {
+    const global = deps.isGlobalAdmin(req.onlineUser);
+    const shops = (await deps.withCloud((c) => (global
+      ? c.query('SELECT shop_id, shop_code, name, last_seen_at, last_event_at FROM giga_cloud.shops WHERE active ORDER BY shop_code, shop_id')
+      : c.query('SELECT shop_id, shop_code, name, last_seen_at, last_event_at FROM giga_cloud.shops WHERE shop_id = $1', [deps.shopId(req)])))).rows;
+    const out: Record<string, any>[] = [];
+    for (const s of shops) {
+      const row: Record<string, any> = { shop_id: s.shop_id, shop_code: s.shop_code, name: s.name };
+      try {
+        const rt = await runtimeRow(deps, s.shop_id);
+        const counts = await deps.withCloud((c) => commandCounts(c, s.shop_id));
+        const rejected7d = (await deps.withCloud((c) => c.query(
+          `SELECT COUNT(*)::int AS n FROM giga_cloud.commands WHERE shop_id = $1 AND status = 'REJECTED' AND acked_at > now() - interval '7 days'`, [s.shop_id]))).rows[0].n;
+        const m = await deps.withShopId(s.shop_id, async (c) => {
+          const sales = (await c.query(
+            `SELECT COUNT(*)::int AS n, COALESCE(SUM(total), 0)::float AS total FROM sales
+              WHERE date = (now() AT TIME ZONE 'Africa/Nairobi')::date AND status <> 'voided'`)).rows[0];
+          const stock = (await c.query(
+            `SELECT COUNT(*)::int AS total,
+                    COUNT(*) FILTER (WHERE status = 'active')::int AS active,
+                    COUNT(*) FILTER (WHERE status <> 'active')::int AS inactive,
+                    COALESCE(SUM(current_stock) FILTER (WHERE status = 'active'), 0)::bigint AS units,
+                    COALESCE(SUM(current_stock * COALESCE(purchase_price, 0)) FILTER (WHERE status = 'active'), 0)::float AS cost_value,
+                    COALESCE(SUM(current_stock * COALESCE(selling_price, 0)) FILTER (WHERE status = 'active'), 0)::float AS retail_value,
+                    COUNT(*) FILTER (WHERE status = 'active' AND current_stock <= 0)::int AS out_of_stock,
+                    COUNT(*) FILTER (WHERE status = 'active' AND current_stock > 0 AND current_stock <= COALESCE(reorder_level, 0))::int AS low_stock
+               FROM medicines`)).rows[0];
+          const expiry = (await c.query(
+            `SELECT COUNT(*) FILTER (WHERE expiry_date > CURRENT_DATE AND expiry_date <= CURRENT_DATE + 30)::int AS expiring_30d,
+                    COUNT(*) FILTER (WHERE expiry_date <= CURRENT_DATE)::int AS expired
+               FROM medicine_batches WHERE quantity_available > 0 AND expiry_date IS NOT NULL`)).rows[0];
+          const staff = (await c.query(`SELECT COUNT(*) FILTER (WHERE active)::int AS active FROM users WHERE email IS NOT NULL`)).rows[0];
+          return { sales, stock, expiry, staff };
+        });
+        Object.assign(row, {
+          online: rt ? rt.age_seconds <= HEARTBEAT_ONLINE_SECONDS : rt === null ? false : null,
+          last_heartbeat_at: rt?.reported_at ?? null,
+          heartbeat_age_seconds: rt?.age_seconds ?? null,
+          db_healthy: rt ? Boolean(rt.db_healthy) : null,
+          sync_healthy: rt ? Boolean(rt.worker_healthy) : null,
+          last_sync_at: rt?.last_sync_at ?? s.last_event_at ?? null,
+          app_version: rt?.app_version ?? null,
+          git_commit: rt?.git_commit ?? null,
+          sales_today: { count: m.sales.n, total: Math.round(m.sales.total * 100) / 100 },
+          catalogue: { total: m.stock.total, active: m.stock.active, inactive: m.stock.inactive },
+          stock_units: Number(m.stock.units),
+          stock_cost_value: Math.round(m.stock.cost_value * 100) / 100,
+          stock_retail_value: Math.round(m.stock.retail_value * 100) / 100,
+          low_stock: m.stock.low_stock,
+          out_of_stock: m.stock.out_of_stock,
+          expiring_30d: m.expiry.expiring_30d,
+          expired_with_stock: m.expiry.expired,
+          active_staff: m.staff.active,
+          pending_commands: Number(counts.pending) + Number(counts.delivered),
+          rejected_commands_7d: rejected7d,
+          error: null,
+        });
+      } catch (err: any) {
+        row.error = err instanceof HttpError ? err.message : 'Could not read this shop from the cloud copy.';
+      }
+      out.push(row);
+    }
+    const ok = out.filter((x) => !x.error);
+    const sum = (f: (x: any) => number) => Math.round(ok.reduce((t, x) => t + (Number(f(x)) || 0), 0) * 100) / 100;
+    return {
+      scope: global ? 'GLOBAL' : 'SHOP',
+      generated_at: new Date().toISOString(),
+      shops: out,
+      totals: {
+        shops: out.length,
+        shops_online: out.filter((x) => x.online === true).length,
+        sales_today_count: sum((x) => x.sales_today.count),
+        sales_today_total: sum((x) => x.sales_today.total),
+        stock_units: sum((x) => x.stock_units),
+        stock_cost_value: sum((x) => x.stock_cost_value),
+        stock_retail_value: sum((x) => x.stock_retail_value),
+        low_stock: sum((x) => x.low_stock),
+        out_of_stock: sum((x) => x.out_of_stock),
+        expiring_30d: sum((x) => x.expiring_30d),
+        active_staff: sum((x) => x.active_staff),
+        pending_commands: sum((x) => x.pending_commands),
+        rejected_commands_7d: sum((x) => x.rejected_commands_7d),
+      },
     };
   }));
 

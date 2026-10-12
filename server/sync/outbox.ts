@@ -34,7 +34,14 @@ export type SyncEventType =
   | 'CUSTOMER_UPSERTED'
   | 'EXPENSE_RECORDED'
   | 'SETTINGS_UPDATED'
-  | 'USER_UPSERTED';
+  | 'USER_UPSERTED'
+  // Cloud migration 006 and later only (deploy cloud 006 BEFORE a shop that can emit these).
+  | 'EXPENSE_UPDATED'
+  | 'EXPENSE_VOIDED'
+  | 'PURCHASE_DRAFTED'
+  | 'PURCHASE_UPDATED'
+  | 'PURCHASE_CANCELLED'
+  | 'BATCH_UPDATED';
 
 export interface SyncActor {
   user_id?: string | null;

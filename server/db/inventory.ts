@@ -743,3 +743,153 @@ export async function adminPhysicalStockCountTx(client: pg.PoolClient, params: A
   };
 }
 
+
+// ---------------------------------------------------------------------------
+// Batch administration (local Admin screens and remote commands share these)
+// ---------------------------------------------------------------------------
+export interface AdminCreateBatchParams extends StockActor {
+  medicine_id: string;
+  /** Caller-chosen id (a remote command announces it in advance). */
+  batch_id: string;
+  batch_number: string;
+  expiry_date?: string | null;
+  supplier_id?: string | null;
+  purchase_price?: number;
+  selling_price_override?: number | null;
+  /** Opening quantity: > 0 is recorded as an ADD_STOCK movement on the new batch. */
+  quantity: number;
+  notes?: string;
+}
+
+/** Creates a NEW batch (refused when the medicine already has that batch number). */
+export async function adminCreateBatchTx(client: pg.PoolClient, params: AdminCreateBatchParams) {
+  const medicineId = requireUuid(params.medicine_id, 'medicine_id');
+  const batchId = requireUuid(params.batch_id, 'batch_id');
+  const quantity = requireWholeNumber(params.quantity, 'quantity', { allowZero: true });
+  const batchNumber = (params.batch_number || '').trim().toUpperCase();
+  if (!batchNumber) throw new HttpError(400, 'Batch number is required.');
+  const expiryDate = normalizeExpiryDate(params.expiry_date);
+  const supplierId = params.supplier_id ? requireUuid(params.supplier_id, 'supplier_id') : null;
+
+  const deviceId = await resolveDeviceId(client, params.device_id);
+  const medicine = await lockMedicine(client, medicineId);
+  const clash = await client.query(
+    'SELECT id FROM medicine_batches WHERE (medicine_id = $1 AND UPPER(batch_number) = $2) OR id = $3 LIMIT 1',
+    [medicineId, batchNumber, batchId]
+  );
+  if (clash.rows[0]) throw new HttpError(409, `Batch ${batchNumber} already exists for this medicine; add stock to it instead.`);
+  if (supplierId && !(await client.query('SELECT 1 FROM suppliers WHERE id = $1', [supplierId])).rows[0]) {
+    throw new HttpError(404, 'Supplier not found.');
+  }
+  const ins = await client.query(`
+    INSERT INTO medicine_batches (
+      id, medicine_id, batch_number, supplier_id, quantity_received, quantity_available,
+      purchase_price, selling_price_override, expiry_date, expiry_status, received_date, status, created_by, created_at
+    ) VALUES ($1, $2, $3, $4, 0, 0, $5, $6, $7, $8, $9, 'exhausted', $10, CURRENT_TIMESTAMP)
+    RETURNING *
+  `, [
+    batchId, medicineId, batchNumber, supplierId, params.purchase_price ?? (Number(medicine.purchase_price) || 0),
+    params.selling_price_override ?? null, expiryDate, deriveExpiryStatus(expiryDate), localDateStr(), cleanUuid(params.user_id),
+  ]);
+  await insertAudit(client, {
+    action: 'ADMIN_CREATE_BATCH', entity: 'medicine_batch', entity_id: batchId,
+    new_value: { medicine_id: medicineId, batch_number: batchNumber, expiry_date: expiryDate, supplier_id: supplierId, opening_quantity: quantity, notes: params.notes },
+  }, params, deviceId);
+
+  if (quantity > 0) {
+    // The opening quantity is an ordinary audited stock movement (+ STOCK_ADDED event with the batch).
+    const added = await adminAddStockTx(client, { ...params, medicine_id: medicineId, quantity, batch_number: batchNumber, expiry_date: expiryDate });
+    return { success: true, batch: added.batch, medicine: added.medicine, movement: added.movement };
+  }
+  await enqueueSyncEvent(client, {
+    event_type: 'BATCH_UPDATED', entity_type: 'medicine_batch', entity_id: batchId, operation: 'CREATE',
+    data: async () => ({ batch: await rowJson(client, 'medicine_batches', batchId), command_id: params.command_id || null }),
+    actor: params, device_id: deviceId,
+  });
+  return { success: true, batch: toBatchDto(ins.rows[0], medicine.name), medicine: toMedicineStockDto(medicine), movement: null };
+}
+
+export interface AdminUpdateBatchParams extends StockActor {
+  medicine_id: string;
+  batch_id: string;
+  batch_number?: string;
+  supplier_id?: string | null;
+  purchase_price?: number;
+  selling_price_override?: number | null;
+  notes?: string | null;
+}
+
+/**
+ * Batch metadata only (quantity and expiry have their own audited operations). `check` receives the
+ * LOCKED row before anything changes (optimistic concurrency for remote edits).
+ */
+export async function adminUpdateBatchTx(client: pg.PoolClient, params: AdminUpdateBatchParams, check?: (current: Record<string, unknown>) => void) {
+  const medicineId = requireUuid(params.medicine_id, 'medicine_id');
+  const batchId = requireUuid(params.batch_id, 'batch_id');
+  const deviceId = await resolveDeviceId(client, params.device_id);
+  await lockMedicine(client, medicineId);
+  const before = await lockBatch(client, batchId, medicineId);
+  check?.(toBatchDto(before) as any);
+
+  const batchNumber = params.batch_number !== undefined ? params.batch_number.trim().toUpperCase() : undefined;
+  if (batchNumber !== undefined) {
+    if (!batchNumber) throw new HttpError(400, 'Batch number cannot be empty.');
+    const clash = await client.query('SELECT 1 FROM medicine_batches WHERE medicine_id = $1 AND UPPER(batch_number) = $2 AND id <> $3', [medicineId, batchNumber, batchId]);
+    if (clash.rows[0]) throw new HttpError(409, `Batch ${batchNumber} already exists for this medicine.`);
+  }
+  if (params.supplier_id && !(await client.query('SELECT 1 FROM suppliers WHERE id = $1', [params.supplier_id])).rows[0]) {
+    throw new HttpError(404, 'Supplier not found.');
+  }
+  const upd = await client.query(`
+    UPDATE medicine_batches SET
+      batch_number = COALESCE($2, batch_number),
+      supplier_id = CASE WHEN $3::boolean THEN $4::uuid ELSE supplier_id END,
+      purchase_price = COALESCE($5, purchase_price),
+      selling_price_override = CASE WHEN $6::boolean THEN $7::numeric ELSE selling_price_override END,
+      notes = CASE WHEN $8::boolean THEN $9 ELSE notes END,
+      updated_at = CURRENT_TIMESTAMP
+    WHERE id = $1 RETURNING *
+  `, [
+    batchId, batchNumber ?? null, params.supplier_id !== undefined, params.supplier_id ?? null, params.purchase_price ?? null,
+    params.selling_price_override !== undefined, params.selling_price_override ?? null, params.notes !== undefined, params.notes ?? null,
+  ]);
+  const saved = upd.rows[0];
+  await insertAudit(client, {
+    action: 'ADMIN_UPDATE_BATCH', entity: 'medicine_batch', entity_id: batchId,
+    previous_value: { batch_number: before.batch_number, supplier_id: before.supplier_id, purchase_price: before.purchase_price, selling_price_override: before.selling_price_override },
+    new_value: { batch_number: saved.batch_number, supplier_id: saved.supplier_id, purchase_price: saved.purchase_price, selling_price_override: saved.selling_price_override },
+  }, params, deviceId);
+  await enqueueSyncEvent(client, {
+    event_type: 'BATCH_UPDATED', entity_type: 'medicine_batch', entity_id: batchId, operation: 'UPDATE',
+    data: async () => ({ batch: await rowJson(client, 'medicine_batches', batchId), command_id: params.command_id || null }),
+    actor: params, device_id: deviceId,
+  });
+  return { success: true, batch: toBatchDto(saved) };
+}
+
+/**
+ * Takes a batch out of sale (status 'recalled': not sellable, not counted in current_stock) or puts
+ * it back (status re-derived from quantity and expiry). Quantities are unchanged: no movement.
+ */
+export async function adminSetBatchActiveTx(client: pg.PoolClient, params: StockActor & { medicine_id: string; batch_id: string; active: boolean; reason: string }) {
+  const medicineId = requireUuid(params.medicine_id, 'medicine_id');
+  const batchId = requireUuid(params.batch_id, 'batch_id');
+  const deviceId = await resolveDeviceId(client, params.device_id);
+  const medicine = await lockMedicine(client, medicineId);
+  const before = await lockBatch(client, batchId, medicineId);
+  const qty = Number(before.quantity_available) || 0;
+  const status = params.active ? deriveBatchStatus(qty, before.expiry_date) : 'recalled';
+  const upd = await client.query('UPDATE medicine_batches SET status = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *', [batchId, status]);
+  const updatedMedicine = await reconcileMedicineStock(client, medicineId);
+  await insertAudit(client, {
+    action: params.active ? 'ADMIN_BATCH_ACTIVATED' : 'ADMIN_BATCH_DEACTIVATED', entity: 'medicine_batch', entity_id: batchId,
+    previous_value: { status: before.status, current_stock: Number(medicine.current_stock) || 0 },
+    new_value: { status, reason: params.reason, current_stock: Number(updatedMedicine.current_stock) || 0 },
+  }, params, deviceId);
+  await enqueueSyncEvent(client, {
+    event_type: 'BATCH_UPDATED', entity_type: 'medicine_batch', entity_id: batchId, operation: params.active ? 'ACTIVATE' : 'DEACTIVATE',
+    data: async () => ({ batch: await rowJson(client, 'medicine_batches', batchId), command_id: params.command_id || null }),
+    actor: params, device_id: deviceId,
+  });
+  return { success: true, batch: toBatchDto(upd.rows[0], medicine.name), medicine: toMedicineStockDto(updatedMedicine) };
+}

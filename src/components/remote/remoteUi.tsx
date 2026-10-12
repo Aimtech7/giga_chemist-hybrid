@@ -9,6 +9,8 @@ export interface Draft {
   payload: Record<string, unknown>;
   lines: [string, string][];
   requestId: string;
+  /** Global Admin: queue one independent command per active shop instead of the selected shop only. */
+  allShops?: boolean;
 }
 
 export const ago = (iso: string | null | undefined, now = Date.now()) => {
@@ -100,6 +102,11 @@ export function describeResult(c: RemoteCommand): string | null {
   if ('active' in r && 'user_id' in r) return `${r.name}: account ${r.active ? 'ACTIVE' : 'DISABLED'}.`;
   if ('previous_role' in r) return `${r.name}: role ${r.previous_role} → ${r.role}.`;
   if ('updated' in r) return `Updated: ${(r.updated as string[]).join(', ')}.`;
+  if ('status' in r && 'purchase_id' in r) return `Purchase ${r.order_number}: ${r.status}.`;
+  if ('status' in r && 'expense_id' in r) return `Expense ${r.status} (${r.amount}).`;
+  if ('return_id' in r) return `Return ${r.status}${r.refund_amount != null ? `, refund ${r.refund_amount}` : ''}.`;
+  if ('sale_id' in r) return `Receipt ${r.receipt_number}: ${r.status}.`;
+  if ('sessions_revoked_at' in r) return `${r.name}: signed out of every shop terminal.`;
   if ('name' in r) return `Saved: ${r.name}.`;
   return null;
 }
@@ -124,6 +131,22 @@ export function describeRequest(c: RemoteCommand): string {
   else if (t === 'APP_UPDATE_APPROVE') what = `install ${String(p.target_commit).slice(0, 12)}`;
   else if (t === 'CATEGORY_UPSERT') what = String(p.name);
   else if (t === 'SETTINGS_UPDATE') what = Object.keys(p).join(', ');
-  else if (t === 'MEDICINE_METADATA_UPDATE') what = Object.keys(p).filter((k) => k !== 'medicine_id').join(', ');
-  return [target, what].filter(Boolean).join(' · ');
+  else if (t === 'MEDICINE_METADATA_UPDATE') what = Object.keys(p).filter((k) => !['medicine_id', 'expected', 'reason'].includes(k)).join(', ');
+  else if (t === 'MEDICINE_CREATE') what = `new: ${p.name}`;
+  else if (t.endsWith('_SET_ACTIVE')) what = p.active ? 'activate' : 'deactivate';
+  else if (t === 'BATCH_CREATE') what = `new batch ${p.batch_number} (${p.quantity ?? 0})`;
+  else if (t === 'BATCH_UPDATE') what = Object.keys(p).filter((k) => !['medicine_id', 'batch_id', 'expected', 'reason'].includes(k)).join(', ');
+  else if (t === 'SUPPLIER_CREATE' || t === 'CUSTOMER_CREATE') what = `new: ${p.name}`;
+  else if (t === 'SUPPLIER_UPDATE' || t === 'CUSTOMER_UPDATE') what = `${d.supplier_name || d.customer_name || ''} ${Object.keys(p).filter((k) => !k.endsWith('_id') && k !== 'expected' && k !== 'reason').join(', ')}`.trim();
+  else if (t === 'PURCHASE_CREATE' || t === 'PURCHASE_UPDATE_DRAFT') what = `${d.supplier_name || ''} ${d.lines ?? p.items?.length ?? ''} line(s)`.trim();
+  else if (t === 'PURCHASE_RECEIVE') what = `receive ${d.order_number || 'new delivery'}`;
+  else if (t === 'PURCHASE_CANCEL') what = `cancel ${d.order_number || ''}`;
+  else if (t === 'EXPENSE_CREATE') what = `${p.category} ${p.amount}`;
+  else if (t === 'EXPENSE_UPDATE') what = `${d.expense?.description || ''} ${Object.keys(p).filter((k) => !['expense_id', 'expected', 'reason'].includes(k)).join(', ')}`.trim();
+  else if (t === 'EXPENSE_VOID') what = `void ${d.expense?.description || ''}`;
+  else if (t === 'RETURN_APPROVE' || t === 'RETURN_REJECT') what = `${t === 'RETURN_APPROVE' ? 'approve' : 'reject'} receipt ${d.return?.receipt_number || ''}`;
+  else if (t === 'SALE_VOID') what = `void receipt ${d.sale?.receipt_number || ''}`;
+  else if (t === 'USER_SESSION_REVOKE') what = 'sign out everywhere';
+  const shop = d.target_shop?.shop_code ? `[${d.target_shop.shop_code}]` : '';
+  return [shop, target, what].filter(Boolean).join(' · ');
 }

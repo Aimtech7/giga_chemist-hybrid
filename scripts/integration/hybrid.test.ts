@@ -408,10 +408,13 @@ export async function hybridTests(ctx: Ctx, env: HybridEnv) {
   const remR = await waitFinal(rem);
   check(remR?.status === 'APPLIED' && (await batchQty()) === q1 - 5 && remR.result?.delta === -5, `STOCK_REMOVE applied (-5 -> ${await batchQty()})`, remR);
 
-  // 13d STOCK_SET issued while the shop is offline; a sale happens before it is applied.
+  // 13d STOCK_SET issued while the shop is offline; a sale happens before it is applied. The count
+  // carries the quantity the Administrator saw: the sale changed it, so the count is REJECTED
+  // (optimistic concurrency) instead of silently erasing the cashier's movement.
   await emu.stop();
   await sleep(1500);
-  const setCmd = await issue('STOCK_SET', { medicine_id: med, batch_id: batchId, quantity: 50, reason: 'ITEST shelf count' });
+  const seenQty = await batchQty();
+  const setCmd = await issue('STOCK_SET', { medicine_id: med, batch_id: batchId, quantity: 50, reason: 'ITEST shelf count', expected_quantity: seenQty });
   const offSale = await sell(ctx.cashierToken, 2);
   await sleep(3000);
   check(offSale.status === 201, 'POS keeps selling while the shop is offline', offSale.status);
@@ -420,14 +423,18 @@ export async function hybridTests(ctx: Ctx, env: HybridEnv) {
   const beforeSet = await batchQty();
   await emu.restart();
   const setR = await waitFinal(setCmd);
-  check(setR?.status === 'APPLIED', 'command APPLIED once the shop reconnects', setR);
-  check((await batchQty()) === 50 && setR?.result?.previous_quantity === beforeSet && setR?.result?.delta === 50 - beforeSet,
-    `STOCK_SET uses the quantity locked at apply time (${beforeSet} -> 50, delta ${setR?.result?.delta})`, setR?.result);
+  check(setR?.status === 'REJECTED' && /CONFLICT/.test(setR.error || '') && (await batchQty()) === beforeSet && beforeSet === seenQty - 2,
+    `stale STOCK_SET REJECTED on reconnect (saw ${seenQty}, shop had ${beforeSet}); the offline sale is kept`, setR);
+  // Re-issued against the current quantity: applied, the movement records the real delta.
+  const setCmd2 = await issue('STOCK_SET', { medicine_id: med, batch_id: batchId, quantity: 50, reason: 'ITEST shelf count', expected_quantity: beforeSet });
+  const setR2 = await waitFinal(setCmd2);
+  check(setR2?.status === 'APPLIED' && (await batchQty()) === 50 && setR2?.result?.previous_quantity === beforeSet && setR2?.result?.delta === 50 - beforeSet,
+    `re-issued STOCK_SET applied (${beforeSet} -> 50, delta ${setR2?.result?.delta})`, setR2?.result);
   check(await n(`SELECT COUNT(*) n FROM inventory_movements WHERE batch_id = $1 AND movement_type = 'PHYSICAL_STOCK_COUNT' AND notes LIKE '%ITEST shelf count%' AND adjustment_quantity = $2`, [batchId, 50 - beforeSet]) === 1,
     'physical-count movement records the computed delta');
-  const setEv = await waitFor(async () => (await pool.query(`SELECT status FROM sync_events WHERE event_type = 'PHYSICAL_COUNT' AND payload->'data'->>'command_id' = $1`, [setCmd])).rows, (r) => r[0]?.status === 'SYNCED');
+  const setEv = await waitFor(async () => (await pool.query(`SELECT status FROM sync_events WHERE event_type = 'PHYSICAL_COUNT' AND payload->'data'->>'command_id' = $1`, [setCmd2])).rows, (r) => r[0]?.status === 'SYNCED');
   check(setEv.length === 1 && setEv[0].status === 'SYNCED', 'PHYSICAL_COUNT event synced back to the cloud');
-  const again13 = await issue('STOCK_SET', { medicine_id: med, batch_id: batchId, quantity: 50, reason: 'ITEST shelf count' }, `dup-${setCmd}`);
+  const again13 = await issue('STOCK_SET', { medicine_id: med, batch_id: batchId, quantity: 50, reason: 'ITEST shelf count', expected_quantity: 50 }, `dup-${setCmd2}`);
   await waitFinal(again13);
   check((await batchQty()) === 50, 'a second identical count is harmless (sets 50 again, no drift)');
 

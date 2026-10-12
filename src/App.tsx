@@ -28,6 +28,7 @@ import { UserManagement } from './components/users/UserManagement';
 import { AuditLogViewer } from './components/audit/AuditLogViewer';
 import { SettingsView } from './components/settings/SettingsView';
 import { RemoteAdminPanel } from './components/remote/RemoteAdminPanel';
+import { OnlineAdminModule } from './components/remote/OnlineAdminModule';
 import { getServerMode } from './services/remoteAdmin';
 import type { PharmacySettings, User } from './types';
 
@@ -215,14 +216,15 @@ export default function App() {
     return () => window.removeEventListener(SESSION_EXPIRED_EVENT, onExpired);
   }, []);
 
-  // Online app (Vercel): there is no till online, so the Administrator lands on Remote Admin.
+  // Online app (Vercel): there is no till online, so the Administrator lands on the Global Control Center.
   useEffect(() => {
     if (currentUser?.role !== 'ADMIN') return;
     void getServerMode().then((mode) => {
       setServerMode(mode);
-      if (mode === 'online') setCurrentModule((m) => (m === 'pos' ? 'remote' : m));
+      if (mode === 'online') setCurrentModule((m) => (m === 'pos' || m === 'stocktake' ? 'dashboard' : m));
     });
   }, [currentUser]);
+  const onlineAdmin = serverMode === 'online' && currentUser?.role === 'ADMIN';
 
   if (!isInitialized || !settings) {
     return (
@@ -293,6 +295,11 @@ export default function App() {
       onLogout={handleLogout}
       onViewLandingPage={navigateToLanding}
     >
+      {/* ONLINE ADMINISTRATOR: Global Control Center modules (commands to the selected shop only) */}
+      {onlineAdmin && canAccessModule(currentUser, currentModule) && (
+        <OnlineAdminModule module={currentModule} currentUser={currentUser} settings={settings} />
+      )}
+      {!onlineAdmin && (<>
       {/* EXECUTIVE & OPERATIONAL DASHBOARD */}
       {currentModule === 'dashboard' && (
         <Dashboard currentUser={currentUser} settings={settings} onNavigate={handleSelectModule} />
@@ -389,6 +396,8 @@ export default function App() {
       {currentModule === 'remote' && canAccessModule(currentUser, 'remote') && (
         <RemoteAdminPanel currentUser={currentUser} settings={settings} />
       )}
+
+      </>)}
 
       {/* Login Modal */}
       <LoginModal

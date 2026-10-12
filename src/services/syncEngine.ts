@@ -246,6 +246,11 @@ export async function syncFromLocalApiToDexie(): Promise<boolean> {
   // Online app: the cache holds ONE shop's data. A different selected shop starts from an empty cache,
   // so rows of the previous shop can never be shown under the new shop's name.
   await purgeIfShopChanged();
+  // "All Shops" (Global Admin) is a consolidated view: no single shop's data is cached at all.
+  if (shopCacheKey() === 'ALL') {
+    setCatalogState({ status: 'error', shop_key: 'ALL', error: 'All Shops is selected: choose one shop to see its catalogue.' });
+    return false;
+  }
 
   // Keyed bulkPut: re-hydration overwrites cached rows with the server version, never duplicates.
   await load('Categories', '/api/categories', (rows) => putAll(db.categories, rows));
@@ -334,6 +339,10 @@ export function replaceCatalog(): Promise<boolean> {
 }
 
 async function replaceCatalogFor(key: string): Promise<boolean> {
+  if (key === 'ALL') {
+    setCatalogState({ status: 'error', shop_key: key, error: 'All Shops is selected: choose one shop to see its catalogue.' });
+    return false;
+  }
   setCatalogState({ status: 'loading', shop_key: key, error: null });
   const fail = (msg: string, err?: any) => {
     console.error(`[SyncEngine] ${msg}`, err?.message || err || '');

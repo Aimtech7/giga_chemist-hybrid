@@ -81,7 +81,8 @@ export const ExpenseList: React.FC<ExpenseListProps> = ({ currentUser, settings 
     downloadCSV(`giga-chemist-expenses-${new Date().toISOString().split('T')[0]}.csv`, headers, rows);
   };
 
-  const totalExpenses = expenses.reduce((sum, e) => sum + e.amount, 0);
+  // Voided expenses stay listed (audit) but never count, exactly like the server reports.
+  const totalExpenses = expenses.filter((e) => e.status !== 'voided').reduce((sum, e) => sum + e.amount, 0);
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden bg-slate-50">
@@ -152,12 +153,12 @@ export const ExpenseList: React.FC<ExpenseListProps> = ({ currentUser, settings 
                 </tr>
               ) : (
                 expenses.map((exp) => (
-                  <tr key={exp.id} className="hover:bg-slate-50 transition">
+                  <tr key={exp.id} className={`hover:bg-slate-50 transition ${exp.status === 'voided' ? 'opacity-60 line-through' : ''}`} title={exp.status === 'voided' ? `Voided: ${exp.void_reason || ''}` : undefined}>
                     <td className="py-2 px-3 font-mono text-slate-600">{exp.date}</td>
                     <td className="py-2 px-3 text-slate-800 font-medium">
                       {exp.category}
                     </td>
-                    <td className="py-2 px-3 text-slate-700">{exp.description}</td>
+                    <td className="py-2 px-3 text-slate-700">{exp.description}{exp.status === 'voided' && <span className="ml-1 no-underline text-[10px] font-bold text-rose-700">VOIDED</span>}</td>
                     <td className="py-2 px-3 text-right font-mono font-bold text-slate-900">
                       {settings.currency} {exp.amount.toFixed(2)}
                     </td>

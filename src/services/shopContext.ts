@@ -55,6 +55,25 @@ export function getOnlineAccount(): OnlineAccount | null {
 }
 export const isGlobalAdminAccount = () => getOnlineAccount()?.type === 'GLOBAL_ADMIN';
 
+// ---------------------------------------------------------------- "All Shops" (Global Admin, read-only)
+const SCOPE_KEY = 'giga_online_scope';
+/**
+ * True while a Global Administrator views ALL SHOPS: a consolidated, READ-ONLY view. Requests then
+ * carry X-GIGA-SCOPE: ALL (the server refuses shop-scoped writes) and no shop's catalogue is cached.
+ */
+export function isAllShopsScope(): boolean {
+  const s = read<{ scope: string; user_id: string | null }>(SCOPE_KEY);
+  return Boolean(s && s.scope === 'ALL' && s.user_id === currentUserId() && isGlobalAdminAccount());
+}
+export function setAllShopsScope(on: boolean): void {
+  write(SCOPE_KEY, on ? { scope: 'ALL', user_id: currentUserId() } : null);
+  try {
+    window.dispatchEvent(new CustomEvent(SHOP_CHANGED_EVENT));
+  } catch {
+    /* non-browser */
+  }
+}
+
 // ---------------------------------------------------------------- selected shop
 export function getSelectedShop(): ShopRef | null {
   const s = read<ShopRef & { user_id: string | null }>(SELECTED_KEY);
@@ -66,6 +85,7 @@ export function selectedShopId(): string | null {
 }
 export function setSelectedShop(shop: ShopRef | null): void {
   write(SELECTED_KEY, shop ? { shop_id: shop.shop_id, shop_code: shop.shop_code, name: shop.name, user_id: currentUserId() } : null);
+  if (shop) write(SCOPE_KEY, null); // choosing a shop leaves the All Shops view
   try {
     window.dispatchEvent(new CustomEvent(SHOP_CHANGED_EVENT));
   } catch {
@@ -90,12 +110,13 @@ export function currentShopLabel(): string {
  * shops therefore never share a cache key, even though neither selects a shop.
  */
 export function shopCacheKey(): string {
+  if (isAllShopsScope()) return 'ALL'; // never holds any one shop's catalogue
   return selectedShopId() || getOnlineAccount()?.shop_id || 'default';
 }
 
 // Another tab switched shop: reload so this tab never shows one shop's data under another's name.
 if (typeof window !== 'undefined') {
   window.addEventListener('storage', (e) => {
-    if (e.key === SELECTED_KEY && e.oldValue !== e.newValue) window.location.reload();
+    if ((e.key === SELECTED_KEY || e.key === SCOPE_KEY) && e.oldValue !== e.newValue) window.location.reload();
   });
 }

@@ -116,9 +116,14 @@ CREATE TRIGGER trg_protect_last_global_admin BEFORE UPDATE OR DELETE ON giga_clo
     FOR EACH ROW EXECUTE FUNCTION giga_cloud.protect_last_global_admin();
 
 -- 3. Command types ---------------------------------------------------------------
+-- Re-runnable after a LATER migration widened the list (006+): then that list is kept, never narrowed.
 DO $$
 DECLARE c TEXT;
 BEGIN
+    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'giga_cloud.commands'::regclass AND contype = 'c'
+               AND pg_get_constraintdef(oid) LIKE '%USER_SESSION_REVOKE%') THEN
+        RETURN;
+    END IF;
     FOR c IN
         SELECT conname FROM pg_constraint
         WHERE conrelid = 'giga_cloud.commands'::regclass AND contype = 'c'
@@ -126,12 +131,12 @@ BEGIN
     LOOP
         EXECUTE format('ALTER TABLE giga_cloud.commands DROP CONSTRAINT %I', c);
     END LOOP;
-END $$;
-ALTER TABLE giga_cloud.commands ADD CONSTRAINT commands_command_type_check CHECK (command_type IN (
+    ALTER TABLE giga_cloud.commands ADD CONSTRAINT commands_command_type_check CHECK (command_type IN (
     'PRICE_UPDATE', 'MEDICINE_METADATA_UPDATE', 'CATEGORY_UPSERT', 'SETTINGS_UPDATE',
     'STOCK_ADD', 'STOCK_REMOVE', 'STOCK_SET', 'BATCH_EXPIRY_UPDATE',
     'USER_SET_ACTIVE', 'USER_ROLE_UPDATE', 'APP_UPDATE_APPROVE',
     'USER_CREATE', 'USER_CREDENTIAL_REFRESH'));
+END $$;
 CREATE INDEX IF NOT EXISTS idx_gc_commands_open_user ON giga_cloud.commands (shop_id, (payload ->> 'user_id'))
     WHERE status IN ('PENDING', 'DELIVERED');
 

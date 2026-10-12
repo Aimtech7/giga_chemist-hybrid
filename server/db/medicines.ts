@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import type pg from 'pg';
-import { pgPool, HttpError, requireUuid, withTransaction, roundMoney } from './client';
+import { pgPool, HttpError, requireUuid, withTransaction, roundMoney, cleanUuid } from './client';
 import { recordAuditLog } from './audit';
 import { enqueueSyncEvent, medicineJson } from '../sync/outbox';
 import type { Medicine, UserRole } from '../../src/types';
@@ -133,55 +133,69 @@ function uniqueViolation(err: any, what: string): never {
 
 /** ADMIN: creates a medicine. Stock always starts at 0 — it is added via Add Stock / Physical Count. */
 export async function createMedicine(data: Partial<Medicine>, actor: MedicineActor): Promise<Medicine> {
-  const name = text(data.name, 255);
-  if (!name) throw new HttpError(400, 'Medicine name is required.');
-  const selling = optionalMoney(data.selling_price, 'Selling price');
-  if (selling === undefined || selling <= 0) throw new HttpError(400, 'Selling price must be greater than zero.');
-  const purchase = optionalMoney(data.purchase_price, 'Purchase price') ?? 0;
-
+  validateNewMedicine(data);
   return withTransaction(async (client) => {
-    const categoryId = await resolveCategoryId(client, data.category);
-    const id = crypto.randomUUID();
-    await assertBarcodeFree(client, text(data.barcode, 100));
-    try {
-      await client.query(
-        `INSERT INTO medicines (
-           id, name, generic_name, brand_name, sku, barcode, category_id, medicine_type,
-           dosage_strength, dosage_form, manufacturer, description,
-           purchase_price, selling_price, wholesale_price, min_selling_price,
-           current_stock, reorder_level, unit, prescription_required, status, version,
-           created_by, updated_by
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,0,$17,$18,$19,'active',1,$20,$20)`,
-        [
-          id, name, text(data.generic_name, 255) || name, text(data.brand_name, 255) || null,
-          text(data.sku, 100) || `SKU-${id.slice(0, 8).toUpperCase()}`,
-          text(data.barcode, 100) || `GC${id.replace(/-/g, '').slice(0, 12).toUpperCase()}`,
-          categoryId, text(data.medicine_type, 100) || null,
-          text(data.dosage_strength, 100) || '', text(data.dosage_form, 100) || 'Tablet',
-          text(data.manufacturer, 255) || null, text(data.description, 2000) || null,
-          purchase, selling,
-          optionalWholesale(data.wholesale_price) ?? null,
-          optionalMoney(data.min_selling_price, 'Minimum selling price') ?? selling,
-          optionalWholeNumber(data.reorder_level, 'Reorder level') ?? 20,
-          text(data.unit, 50) || 'Unit', Boolean(data.prescription_required),
-          actor.user_id,
-        ]
-      );
-    } catch (err) {
-      uniqueViolation(err, 'This barcode');
-    }
-    const saved = (await getMedicineById(id, client))!;
-    await recordAuditLog(
-      { ...actor, action: 'CREATE_MEDICINE', entity: 'medicine', entity_id: id, new_value: saved },
-      client
-    );
+    const saved = await createMedicineTx(client, crypto.randomUUID(), data, actor);
     await enqueueSyncEvent(client, {
-      event_type: 'MEDICINE_CREATED', entity_type: 'medicine', entity_id: id, operation: 'CREATE',
-      data: async () => ({ medicine: await medicineJson(client, id) }),
+      event_type: 'MEDICINE_CREATED', entity_type: 'medicine', entity_id: saved.id, operation: 'CREATE',
+      data: async () => ({ medicine: await medicineJson(client, saved.id) }),
       actor,
     });
     return saved;
   });
+}
+
+function validateNewMedicine(data: Partial<Medicine>) {
+  const name = text(data.name, 255);
+  if (!name) throw new HttpError(400, 'Medicine name is required.');
+  const selling = optionalMoney(data.selling_price, 'Selling price');
+  if (selling === undefined || selling <= 0) throw new HttpError(400, 'Selling price must be greater than zero.');
+  return { name, selling, purchase: optionalMoney(data.purchase_price, 'Purchase price') ?? 0 };
+}
+
+/**
+ * createMedicine on the caller's transaction with a caller-chosen id (a remote command announces its
+ * id in advance). Audited here; the caller enqueues the outbox event.
+ */
+export async function createMedicineTx(client: pg.PoolClient, id: string, data: Partial<Medicine>, actor: MedicineActor): Promise<Medicine> {
+  const { name, selling, purchase } = validateNewMedicine(data);
+  const exists = await client.query('SELECT 1 FROM medicines WHERE id = $1', [id]);
+  if (exists.rows[0]) throw new HttpError(409, 'A medicine with this id already exists in the shop.');
+  const categoryId = await resolveCategoryId(client, data.category);
+  await assertBarcodeFree(client, text(data.barcode, 100));
+  try {
+    await client.query(
+      `INSERT INTO medicines (
+         id, name, generic_name, brand_name, sku, barcode, category_id, medicine_type,
+         dosage_strength, dosage_form, manufacturer, description,
+         purchase_price, selling_price, wholesale_price, min_selling_price,
+         current_stock, reorder_level, unit, prescription_required, status, version,
+         created_by, updated_by
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,0,$17,$18,$19,'active',1,$20,$20)`,
+      [
+        id, name, text(data.generic_name, 255) || name, text(data.brand_name, 255) || null,
+        text(data.sku, 100) || `SKU-${id.slice(0, 8).toUpperCase()}`,
+        text(data.barcode, 100) || `GC${id.replace(/-/g, '').slice(0, 12).toUpperCase()}`,
+        categoryId, text(data.medicine_type, 100) || null,
+        text(data.dosage_strength, 100) || '', text(data.dosage_form, 100) || 'Tablet',
+        text(data.manufacturer, 255) || null, text(data.description, 2000) || null,
+        purchase, selling,
+        optionalWholesale(data.wholesale_price) ?? null,
+        optionalMoney(data.min_selling_price, 'Minimum selling price') ?? selling,
+        optionalWholeNumber(data.reorder_level, 'Reorder level') ?? 20,
+        text(data.unit, 50) || 'Unit', Boolean(data.prescription_required),
+        cleanUuid(actor.user_id),
+      ]
+    );
+  } catch (err) {
+    uniqueViolation(err, 'This barcode');
+  }
+  const saved = (await getMedicineById(id, client))!;
+  await recordAuditLog(
+    { ...actor, action: 'CREATE_MEDICINE', entity: 'medicine', entity_id: id, new_value: saved },
+    client
+  );
+  return saved;
 }
 
 /**
@@ -236,7 +250,7 @@ export async function updateMedicineDetailsTx(client: pg.PoolClient, id: string,
         text(data.dosage_form, 100) || null, text(data.manufacturer, 255) ?? null,
         text(data.description, 2000) ?? null, text(data.unit, 50) || null,
         data.prescription_required !== undefined ? Boolean(data.prescription_required) : null,
-        status ?? null, actor.user_id,
+        status ?? null, cleanUuid(actor.user_id),
       ]
     );
   } catch (err) {
@@ -304,7 +318,7 @@ export async function applyPricingUpdate(
        reorder_level = COALESCE($6, reorder_level), updated_by = $7,
        version = version + 1, updated_at = CURRENT_TIMESTAMP
      WHERE id = $1`,
-    [id, selling ?? null, purchase ?? null, minSelling ?? null, wholesale ?? null, reorder ?? null, actor.user_id, wholesale !== undefined]
+    [id, selling ?? null, purchase ?? null, minSelling ?? null, wholesale ?? null, reorder ?? null, cleanUuid(actor.user_id), wholesale !== undefined]
   );
   const saved = (await getMedicineById(id, client))!;
 

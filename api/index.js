@@ -262,9 +262,10 @@ function isValidUuid(id) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id.trim());
 }
 var HttpError = class extends Error {
-  constructor(status, message) {
+  constructor(status, message, details) {
     super(message);
     this.status = status;
+    if (details) this.details = details;
   }
 };
 function requireUuid(id, field) {
@@ -433,9 +434,10 @@ async function getSalesReport(rangeIn, scope, q = pgPool) {
   if (scope.includeCost) {
     const ex = await q.query(
       `SELECT e.id, to_char(e.date, 'YYYY-MM-DD') AS date, e.category, e.description, e.payment_method, e.amount,
-              COALESCE(u.name, '') AS user_name
+              COALESCE(u.name, e.created_by_name, '') AS user_name
          FROM expenses e LEFT JOIN users u ON u.id = e.user_id
-        WHERE e.date BETWEEN $1::date AND $2::date ORDER BY e.date DESC, e.created_at DESC`,
+        WHERE e.date BETWEEN $1::date AND $2::date AND COALESCE(e.status, 'posted') <> 'voided'
+        ORDER BY e.date DESC, e.created_at DESC`,
       [start, end]
     );
     expenses = ex.rows.map((e) => ({ ...e, amount: cents(e.amount) }));
@@ -445,7 +447,8 @@ async function getSalesReport(rangeIn, scope, q = pgPool) {
     }
     const pu = (await q.query(
       `SELECT COUNT(*)::int AS n, COALESCE(SUM(total_amount), 0) AS total FROM purchases
-        WHERE COALESCE(received_date, order_date) BETWEEN $1::date AND $2::date`,
+        WHERE COALESCE(received_date, order_date) BETWEEN $1::date AND $2::date
+          AND COALESCE(status, 'received') = 'received'`,
       [start, end]
     )).rows[0];
     purchases = { count: pu.n, total: cents(pu.total) };
@@ -794,6 +797,10 @@ async function getAllMedicines(q = pgPool) {
   const res = await q.query(`${MEDICINE_SELECT} ORDER BY m.name ASC`);
   return res.rows.map(toMedicine);
 }
+async function getMedicineById(id, q = pgPool) {
+  const res = await q.query(`${MEDICINE_SELECT} WHERE m.id = $1`, [requireUuid(id, "medicine id")]);
+  return res.rows[0] ? toMedicine(res.rows[0]) : null;
+}
 
 // server/db/batches.ts
 var BATCH_SELECT = `
@@ -855,7 +862,7 @@ var RETURN_SELECT = `
          r.refund_amount::float AS refund_amount, r.requested_refund::float AS requested_refund,
          r.approved_quantity, r.restocked, r.reason, r.action, r.status,
          r.user_id, u.name AS user_name, r.device_id, r.created_at,
-         r.reviewed_by, rv.name AS reviewed_by_name, r.reviewed_at, r.review_notes,
+         r.reviewed_by, COALESCE(rv.name, r.reviewed_by_name) AS reviewed_by_name, r.reviewed_at, r.review_notes,
          s.date AS sale_date, s.time AS sale_time, s.status AS sale_status, s.price_mode AS sale_price_mode,
          COALESCE(s.discount_percent, 0)::float AS sale_discount_percent,
          c.name AS customer_name,
@@ -951,6 +958,7 @@ function toCustomer(r) {
     credit_balance: Number(r.credit_balance) || 0,
     total_spent: Number(r.total_spent) || 0,
     last_visit: r.last_visit ? new Date(r.last_visit).toISOString() : void 0,
+    active: r.active !== false,
     created_at: r.created_at ? new Date(r.created_at).toISOString() : ""
   };
 }
@@ -985,7 +993,7 @@ async function getAllSuppliers(q = pgPool) {
 var PURCHASE_SELECT = `
   SELECT p.id, p.branch_id, p.order_number, p.invoice_number, p.supplier_id, s.name AS supplier_name,
          p.order_date, p.received_date, p.status, COALESCE(p.total_amount, 0)::float AS total_amount,
-         p.payment_status, p.notes, p.created_by, u.name AS created_by_name, p.created_at
+         p.payment_status, p.notes, p.cancel_reason, p.created_by, u.name AS created_by_name, p.created_at
   FROM purchases p
   LEFT JOIN suppliers s ON p.supplier_id = s.id
   LEFT JOIN users u ON p.created_by = u.id`;
@@ -1019,7 +1027,7 @@ async function hydratePurchases(q, rows) {
     id: r.id,
     branch_id: r.branch_id || void 0,
     order_number: r.order_number,
-    invoice_number: r.invoice_number,
+    invoice_number: r.invoice_number || "",
     supplier_id: r.supplier_id,
     supplier_name: r.supplier_name || "Supplier",
     order_date: r.order_date || "",
@@ -1028,6 +1036,7 @@ async function hydratePurchases(q, rows) {
     total_amount: Number(r.total_amount) || 0,
     payment_status: r.payment_status || "unpaid",
     notes: r.notes || "",
+    cancel_reason: r.cancel_reason || void 0,
     items: byPurchase.get(r.id) || [],
     created_by: r.created_by_name || "Admin",
     created_at: r.created_at ? new Date(r.created_at).toISOString() : "",
@@ -1050,8 +1059,11 @@ function toExpense(r) {
     payment_method: r.payment_method,
     reference: r.reference || void 0,
     user_id: r.user_id,
-    user_name: r.user_name || "Staff",
+    user_name: r.user_name || r.created_by_name || "Staff",
     date: r.date || "",
+    status: r.status === "voided" ? "voided" : "posted",
+    void_reason: r.void_reason || void 0,
+    voided_at: r.voided_at ? new Date(r.voided_at).toISOString() : void 0,
     sync_status: "synced",
     created_at: r.created_at ? new Date(r.created_at).toISOString() : ""
   };
@@ -1110,6 +1122,16 @@ import crypto2 from "crypto";
 import express2 from "express";
 
 // server/sync/commandSchema.ts
+var HIGH_CONFLICT_TYPES = [
+  "STOCK_ADD",
+  "STOCK_REMOVE",
+  "STOCK_SET",
+  "BATCH_CREATE",
+  "PURCHASE_RECEIVE",
+  "RETURN_APPROVE",
+  "SALE_VOID"
+];
+var ALL_SHOPS_TYPES = ["PRICE_UPDATE", "MEDICINE_METADATA_UPDATE", "CATEGORY_UPSERT", "SETTINGS_UPDATE"];
 var STOCK_REMOVE_REASONS = ["Damaged", "Expired", "Lost", "Physical stock correction", "Other"];
 var MAX_STOCK_QUANTITY = 1e6;
 var ASSIGNABLE_ROLES = ["ADMIN", "CASHIER"];
@@ -1128,9 +1150,32 @@ var METADATA_FIELDS = [
   "sku",
   "barcode",
   "reorder_level",
-  "status"
+  "status",
+  "medicine_type"
 ];
-var SETTINGS_FIELDS = ["pharmacy_name", "tagline", "address", "phone", "email", "receipt_header", "receipt_footer"];
+var SETTINGS_FIELDS = [
+  "pharmacy_name",
+  "tagline",
+  "address",
+  "phone",
+  "email",
+  "receipt_header",
+  "receipt_footer",
+  "currency",
+  "tax_rate",
+  "tax_enabled",
+  "printer_type",
+  "auto_print_receipt",
+  "low_stock_threshold",
+  "expiry_warning_days"
+];
+var SUPPLIER_FIELDS = ["name", "contact_person", "phone", "email", "address", "tax_pin"];
+var CUSTOMER_FIELDS = ["name", "phone", "email", "address", "notes"];
+var EXPENSE_FIELDS = ["category", "description", "amount", "payment_method", "reference", "date"];
+var EXPENSE_CATEGORIES = ["Rent", "Electricity", "Internet", "Salaries", "Transport", "Maintenance", "Supplies", "Miscellaneous"];
+var EXPENSE_PAYMENT_METHODS = ["Cash", "M-Pesa", "Card", "Bank"];
+var BATCH_FIELDS = ["batch_number", "supplier_id", "purchase_price", "selling_price_override", "notes"];
+var RETURN_DISPOSITIONS = ["quarantine", "damaged", "dispose"];
 var TEXT_LIMITS = {
   name: 255,
   generic_name: 255,
@@ -1143,13 +1188,19 @@ var TEXT_LIMITS = {
   category: 100,
   sku: 100,
   barcode: 100,
+  medicine_type: 100,
   pharmacy_name: 255,
   tagline: 255,
-  address: 500,
+  address: 2e3,
   phone: 50,
   email: 255,
   receipt_header: 1e3,
-  receipt_footer: 1e3
+  receipt_footer: 1e3,
+  currency: 10,
+  contact_person: 255,
+  tax_pin: 50,
+  notes: 2e3,
+  reference: 100
 };
 function obj(payload) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new HttpError(400, "payload must be an object.");
@@ -1163,22 +1214,22 @@ function uuid(v, field) {
   if (typeof v !== "string" || !isValidUuid(v)) throw new HttpError(400, `${field} must be a valid UUID.`);
   return v.trim().toLowerCase();
 }
-function wholeNumber(v, field, min) {
+function wholeNumber(v, field, min, max = MAX_STOCK_QUANTITY) {
   const n = typeof v === "string" && v.trim() !== "" ? Number(v) : v;
-  if (typeof n !== "number" || !Number.isInteger(n) || n < min || n > MAX_STOCK_QUANTITY) {
-    throw new HttpError(400, `${field} must be a whole number from ${min} to ${MAX_STOCK_QUANTITY}.`);
+  if (typeof n !== "number" || !Number.isInteger(n) || n < min || n > max) {
+    throw new HttpError(400, `${field} must be a whole number from ${min} to ${max}.`);
   }
   return n;
 }
-function reasonText(v, required) {
+function reasonText(v, required, field = "reason") {
   if (v === void 0 || v === null || typeof v === "string" && !v.trim()) {
-    if (required) throw new HttpError(400, "reason is required.");
+    if (required) throw new HttpError(400, `${field} is required.`);
     return null;
   }
-  if (typeof v !== "string") throw new HttpError(400, "reason must be text.");
+  if (typeof v !== "string") throw new HttpError(400, `${field} must be text.`);
   const t = v.trim().replace(/\s+/g, " ");
-  if (t.length < 3) throw new HttpError(400, "reason must be at least 3 characters.");
-  return t.slice(0, 200);
+  if (t.length < 3) throw new HttpError(400, `${field} must be at least 3 characters.`);
+  return t.slice(0, 500);
 }
 function batchNumber(v) {
   if (typeof v !== "string" || !v.trim()) throw new HttpError(400, "batch_number must be text.");
@@ -1186,7 +1237,7 @@ function batchNumber(v) {
   if (t.length > 100 || !/^[A-Z0-9._\-/ ]+$/.test(t)) throw new HttpError(400, "batch_number may contain letters, digits, space, . _ - / (max 100).");
   return t;
 }
-function expiry(v, field = "expiry_date") {
+function date(v, field = "expiry_date") {
   if (v === null || v === void 0 || typeof v === "string" && !v.trim()) return null;
   if (typeof v !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(v.trim())) throw new HttpError(400, `${field} must be YYYY-MM-DD or empty.`);
   const d = /* @__PURE__ */ new Date(`${v.trim()}T00:00:00Z`);
@@ -1194,79 +1245,252 @@ function expiry(v, field = "expiry_date") {
   return v.trim();
 }
 function money(v, field, nullable) {
-  if (v === null && nullable) return null;
+  if ((v === null || v === "") && nullable) return null;
   const n = typeof v === "string" && v.trim() !== "" ? Number(v) : v;
   if (typeof n !== "number" || !Number.isFinite(n) || n < 0 || n > 1e8) throw new HttpError(400, `${field} must be a non-negative amount.`);
   return Math.round(n * 100) / 100;
 }
+function bool(v, field) {
+  if (typeof v !== "boolean") throw new HttpError(400, `${field} must be true or false.`);
+  return v;
+}
+function text(v, field, opts = {}) {
+  if (v === null && opts.clearable) return "";
+  if (typeof v !== "string") throw new HttpError(400, `${field} must be text.`);
+  const t = v.trim();
+  if (!t && opts.required) throw new HttpError(400, `${field} cannot be empty.`);
+  return t.slice(0, TEXT_LIMITS[field] || 255);
+}
+function email(v, field = "email") {
+  const t = text(v, field, { clearable: true }) ?? "";
+  if (t && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(t)) throw new HttpError(400, `${field} must be a valid email address or empty.`);
+  return t.toLowerCase();
+}
+function expectedOf(v, allowed, what) {
+  if (v === void 0 || v === null) return void 0;
+  if (typeof v !== "object" || Array.isArray(v)) throw new HttpError(400, `${what}.expected must be an object.`);
+  const out = {};
+  for (const [k, val] of Object.entries(v)) {
+    if (!allowed.includes(k)) throw new HttpError(400, `${what}.expected does not allow: ${k}.`);
+    if (val !== null && !["string", "number", "boolean"].includes(typeof val)) throw new HttpError(400, `${what}.expected.${k} must be a plain value.`);
+    out[k] = val;
+  }
+  return Object.keys(out).length ? out : void 0;
+}
+function expectedQuantity(v, required) {
+  if (v === void 0 || v === null || v === "") {
+    if (required) throw new HttpError(400, "expected_quantity (the batch quantity you are looking at) is required for a physical count.");
+    return void 0;
+  }
+  return wholeNumber(v, "expected_quantity", 0);
+}
+function withReason(out, v, required = false) {
+  const r = reasonText(v, required);
+  if (r) out.reason = r;
+  return out;
+}
+function medicineFields(p, out) {
+  for (const f of METADATA_FIELDS) {
+    if (p[f] === void 0) continue;
+    if (f === "prescription_required") out[f] = bool(p[f], f);
+    else if (f === "reorder_level") out[f] = wholeNumber(p[f], "reorder_level", 0);
+    else if (f === "status") {
+      if (p[f] !== "active" && p[f] !== "inactive") throw new HttpError(400, 'status must be "active" or "inactive".');
+      out[f] = p[f];
+    } else {
+      const t = text(p[f], f, { required: f === "name" });
+      if ((f === "sku" || f === "barcode") && t && !/^[A-Za-z0-9._\-/]+$/.test(t)) throw new HttpError(400, `${f} may contain letters, digits and . _ - / only.`);
+      if ((f === "sku" || f === "barcode") && !t) throw new HttpError(400, `${f} cannot be cleared remotely.`);
+      out[f] = t;
+    }
+  }
+  return out;
+}
+function priceFields(p, out) {
+  for (const f of PRICE_FIELDS) if (p[f] !== void 0) out[f] = money(p[f], f, f === "wholesale_price");
+  if (out.wholesale_price === 0) throw new HttpError(400, "wholesale_price must be greater than zero (empty = no wholesale price).");
+  return out;
+}
+function purchaseItems(v) {
+  if (!Array.isArray(v) || v.length === 0) throw new HttpError(400, "items must be a non-empty list.");
+  if (v.length > 500) throw new HttpError(400, "Too many lines in one purchase (max 500).");
+  return v.map((raw, i) => {
+    const it = obj(raw);
+    onlyKeys(it, ["medicine_id", "batch_number", "expiry_date", "manufacturing_date", "quantity", "purchase_price"], `items[${i}]`);
+    return {
+      medicine_id: uuid(it.medicine_id, `items[${i}].medicine_id`),
+      batch_number: batchNumber(it.batch_number),
+      expiry_date: date(it.expiry_date, `items[${i}].expiry_date`),
+      manufacturing_date: date(it.manufacturing_date, `items[${i}].manufacturing_date`),
+      quantity: wholeNumber(it.quantity, `items[${i}].quantity`, 1),
+      purchase_price: money(it.purchase_price, `items[${i}].purchase_price`, false)
+    };
+  });
+}
+function paymentStatus(v) {
+  if (v === void 0 || v === null || v === "") return void 0;
+  if (!["paid", "partial", "unpaid"].includes(String(v))) throw new HttpError(400, "payment_status must be paid, partial or unpaid.");
+  return String(v);
+}
+function partialFields(p, fields, required = []) {
+  const out = {};
+  for (const f of fields) {
+    if (p[f] === void 0) continue;
+    out[f] = f === "email" ? email(p[f]) : text(p[f], f, { required: required.includes(f), clearable: !required.includes(f) });
+  }
+  return out;
+}
+function expenseFields(p, creating) {
+  const out = {};
+  if (p.category !== void 0 || creating) {
+    if (!EXPENSE_CATEGORIES.includes(p.category)) throw new HttpError(400, `category must be one of ${EXPENSE_CATEGORIES.join(", ")}.`);
+    out.category = p.category;
+  }
+  if (p.description !== void 0 || creating) out.description = text(p.description, "description", { required: true });
+  if (p.amount !== void 0 || creating) {
+    const a = money(p.amount, "amount", false);
+    if (a <= 0) throw new HttpError(400, "amount must be greater than zero.");
+    out.amount = a;
+  }
+  if (p.payment_method !== void 0) {
+    if (!EXPENSE_PAYMENT_METHODS.includes(p.payment_method)) throw new HttpError(400, `payment_method must be one of ${EXPENSE_PAYMENT_METHODS.join(", ")}.`);
+    out.payment_method = p.payment_method;
+  }
+  if (p.reference !== void 0) out.reference = text(p.reference, "reference", { clearable: true });
+  if (p.date !== void 0) out.date = date(p.date, "date");
+  return out;
+}
+function settingsFields(p) {
+  const out = {};
+  for (const f of SETTINGS_FIELDS) {
+    if (p[f] === void 0) continue;
+    if (f === "tax_enabled" || f === "auto_print_receipt") out[f] = bool(p[f], f);
+    else if (f === "tax_rate") {
+      const n = Number(p[f]);
+      if (!Number.isFinite(n) || n < 0 || n > 100) throw new HttpError(400, "tax_rate must be between 0 and 100.");
+      out[f] = Math.round(n * 100) / 100;
+    } else if (f === "low_stock_threshold" || f === "expiry_warning_days") out[f] = wholeNumber(p[f], f, 0, 3650);
+    else if (f === "printer_type") {
+      if (p[f] !== "58mm" && p[f] !== "80mm") throw new HttpError(400, "printer_type must be 58mm or 80mm.");
+      out[f] = p[f];
+    } else {
+      if (typeof p[f] !== "string") throw new HttpError(400, `${f} must be text.`);
+      out[f] = p[f].trim().slice(0, TEXT_LIMITS[f] || 255);
+    }
+  }
+  if (out.pharmacy_name === "") throw new HttpError(400, "pharmacy_name cannot be empty.");
+  if (out.currency === "") throw new HttpError(400, "currency cannot be empty.");
+  return out;
+}
 function validateCommandPayload(type, payload) {
   const p = obj(payload);
   switch (type) {
+    // ------------------------------------------------------------------ stock (movements / counts)
     case "STOCK_ADD": {
-      onlyKeys(p, ["medicine_id", "batch_id", "batch_number", "expiry_date", "quantity", "reason"], "STOCK_ADD");
+      onlyKeys(p, ["medicine_id", "batch_id", "batch_number", "expiry_date", "quantity", "reason", "expected_quantity"], "STOCK_ADD");
       const out = { medicine_id: uuid(p.medicine_id, "medicine_id"), quantity: wholeNumber(p.quantity, "quantity", 1), reason: reasonText(p.reason, true) };
       if (p.batch_id !== void 0 && p.batch_id !== null && p.batch_id !== "") {
         if (p.batch_number || p.expiry_date) throw new HttpError(400, "Give either batch_id (existing batch) or batch_number + expiry_date (new batch), not both.");
         out.batch_id = uuid(p.batch_id, "batch_id");
+        const eq = expectedQuantity(p.expected_quantity, false);
+        if (eq !== void 0) out.expected_quantity = eq;
       } else {
+        if (p.expected_quantity !== void 0 && p.expected_quantity !== null) throw new HttpError(400, "expected_quantity needs batch_id.");
         out.batch_number = batchNumber(p.batch_number);
-        out.expiry_date = expiry(p.expiry_date);
+        out.expiry_date = date(p.expiry_date);
       }
       return out;
     }
     case "STOCK_REMOVE": {
-      onlyKeys(p, ["medicine_id", "batch_id", "quantity", "reason", "notes"], "STOCK_REMOVE");
+      onlyKeys(p, ["medicine_id", "batch_id", "quantity", "reason", "notes", "expected_quantity"], "STOCK_REMOVE");
       if (!STOCK_REMOVE_REASONS.includes(p.reason)) throw new HttpError(400, `reason must be one of: ${STOCK_REMOVE_REASONS.join(", ")}.`);
-      const notes = reasonText(p.notes, p.reason === "Other");
-      return { medicine_id: uuid(p.medicine_id, "medicine_id"), batch_id: uuid(p.batch_id, "batch_id"), quantity: wholeNumber(p.quantity, "quantity", 1), reason: p.reason, notes };
+      const notes = reasonText(p.notes, p.reason === "Other", "notes");
+      const out = { medicine_id: uuid(p.medicine_id, "medicine_id"), batch_id: uuid(p.batch_id, "batch_id"), quantity: wholeNumber(p.quantity, "quantity", 1), reason: p.reason, notes };
+      const eq = expectedQuantity(p.expected_quantity, false);
+      if (eq !== void 0) out.expected_quantity = eq;
+      return out;
     }
     case "STOCK_SET": {
-      onlyKeys(p, ["medicine_id", "batch_id", "batch_number", "quantity", "reason"], "STOCK_SET");
-      const out = { medicine_id: uuid(p.medicine_id, "medicine_id"), quantity: wholeNumber(p.quantity, "quantity", 0), reason: reasonText(p.reason, true) };
+      onlyKeys(p, ["medicine_id", "batch_id", "batch_number", "quantity", "reason", "expected_quantity"], "STOCK_SET");
+      const out = {
+        medicine_id: uuid(p.medicine_id, "medicine_id"),
+        quantity: wholeNumber(p.quantity, "quantity", 0),
+        reason: reasonText(p.reason, true),
+        expected_quantity: expectedQuantity(p.expected_quantity, true)
+      };
       if (p.batch_id) out.batch_id = uuid(p.batch_id, "batch_id");
       else out.batch_number = batchNumber(p.batch_number);
       return out;
     }
     case "BATCH_EXPIRY_UPDATE": {
-      onlyKeys(p, ["medicine_id", "batch_id", "expiry_date", "reason"], "BATCH_EXPIRY_UPDATE");
+      onlyKeys(p, ["medicine_id", "batch_id", "expiry_date", "reason", "expected_expiry_date"], "BATCH_EXPIRY_UPDATE");
       if (!("expiry_date" in p)) throw new HttpError(400, "expiry_date is required (empty = unknown expiry).");
-      return { medicine_id: uuid(p.medicine_id, "medicine_id"), batch_id: uuid(p.batch_id, "batch_id"), expiry_date: expiry(p.expiry_date), reason: reasonText(p.reason, false) };
-    }
-    case "PRICE_UPDATE": {
-      onlyKeys(p, ["medicine_id", "reason", ...PRICE_FIELDS], "PRICE_UPDATE");
-      const out = { medicine_id: uuid(p.medicine_id, "medicine_id") };
-      for (const f of PRICE_FIELDS) if (p[f] !== void 0) out[f] = money(p[f], f, f === "wholesale_price");
-      if (Object.keys(out).length === 1) throw new HttpError(400, `PRICE_UPDATE needs at least one of: ${PRICE_FIELDS.join(", ")}.`);
-      const r = reasonText(p.reason, false);
-      if (r) out.reason = r;
+      const out = { medicine_id: uuid(p.medicine_id, "medicine_id"), batch_id: uuid(p.batch_id, "batch_id"), expiry_date: date(p.expiry_date), reason: reasonText(p.reason, false) };
+      if ("expected_expiry_date" in p) out.expected_expiry_date = date(p.expected_expiry_date, "expected_expiry_date");
       return out;
+    }
+    // ------------------------------------------------------------------ batches
+    case "BATCH_CREATE": {
+      onlyKeys(p, ["medicine_id", "batch_id", "batch_number", "expiry_date", "supplier_id", "purchase_price", "selling_price_override", "quantity", "reason"], "BATCH_CREATE");
+      const out = {
+        medicine_id: uuid(p.medicine_id, "medicine_id"),
+        batch_id: uuid(p.batch_id, "batch_id"),
+        batch_number: batchNumber(p.batch_number),
+        expiry_date: date(p.expiry_date),
+        quantity: wholeNumber(p.quantity ?? 0, "quantity", 0)
+      };
+      if (p.supplier_id) out.supplier_id = uuid(p.supplier_id, "supplier_id");
+      if (p.purchase_price !== void 0 && p.purchase_price !== null && p.purchase_price !== "") out.purchase_price = money(p.purchase_price, "purchase_price", false);
+      if (p.selling_price_override !== void 0 && p.selling_price_override !== null && p.selling_price_override !== "") {
+        out.selling_price_override = money(p.selling_price_override, "selling_price_override", false);
+      }
+      return withReason(out, p.reason);
+    }
+    case "BATCH_UPDATE": {
+      onlyKeys(p, ["medicine_id", "batch_id", "reason", "expected", ...BATCH_FIELDS], "BATCH_UPDATE");
+      const out = { medicine_id: uuid(p.medicine_id, "medicine_id"), batch_id: uuid(p.batch_id, "batch_id") };
+      if (p.batch_number !== void 0) out.batch_number = batchNumber(p.batch_number);
+      if (p.supplier_id !== void 0) out.supplier_id = p.supplier_id === null || p.supplier_id === "" ? null : uuid(p.supplier_id, "supplier_id");
+      if (p.purchase_price !== void 0) out.purchase_price = money(p.purchase_price, "purchase_price", false);
+      if (p.selling_price_override !== void 0) out.selling_price_override = money(p.selling_price_override, "selling_price_override", true);
+      if (p.notes !== void 0) out.notes = text(p.notes, "notes", { clearable: true });
+      if (Object.keys(out).length === 2) throw new HttpError(400, `BATCH_UPDATE needs at least one of: ${BATCH_FIELDS.join(", ")}.`);
+      const exp = expectedOf(p.expected, BATCH_FIELDS, "BATCH_UPDATE");
+      if (exp) out.expected = exp;
+      return withReason(out, p.reason);
+    }
+    case "BATCH_SET_ACTIVE": {
+      onlyKeys(p, ["medicine_id", "batch_id", "active", "reason"], "BATCH_SET_ACTIVE");
+      return { medicine_id: uuid(p.medicine_id, "medicine_id"), batch_id: uuid(p.batch_id, "batch_id"), active: bool(p.active, "active"), reason: reasonText(p.reason, true) };
+    }
+    // ------------------------------------------------------------------ medicines / prices
+    case "PRICE_UPDATE": {
+      onlyKeys(p, ["medicine_id", "reason", "expected", ...PRICE_FIELDS], "PRICE_UPDATE");
+      const out = priceFields(p, { medicine_id: uuid(p.medicine_id, "medicine_id") });
+      if (Object.keys(out).length === 1) throw new HttpError(400, `PRICE_UPDATE needs at least one of: ${PRICE_FIELDS.join(", ")}.`);
+      const exp = expectedOf(p.expected, PRICE_FIELDS, "PRICE_UPDATE");
+      if (exp) out.expected = exp;
+      return withReason(out, p.reason);
     }
     case "MEDICINE_METADATA_UPDATE": {
-      onlyKeys(p, ["medicine_id", "reason", ...METADATA_FIELDS], "MEDICINE_METADATA_UPDATE");
-      const out = { medicine_id: uuid(p.medicine_id, "medicine_id") };
-      for (const f of METADATA_FIELDS) {
-        if (p[f] === void 0) continue;
-        if (f === "prescription_required") {
-          if (typeof p[f] !== "boolean") throw new HttpError(400, "prescription_required must be true or false.");
-          out[f] = p[f];
-        } else if (f === "reorder_level") {
-          out[f] = wholeNumber(p[f], "reorder_level", 0);
-        } else if (f === "status") {
-          if (p[f] !== "active" && p[f] !== "inactive") throw new HttpError(400, 'status must be "active" or "inactive".');
-          out[f] = p[f];
-        } else {
-          if (typeof p[f] !== "string") throw new HttpError(400, `${f} must be text.`);
-          const t = p[f].trim();
-          if (f === "name" && !t) throw new HttpError(400, "name cannot be empty.");
-          if ((f === "sku" || f === "barcode") && t && !/^[A-Za-z0-9._\-/]+$/.test(t)) throw new HttpError(400, `${f} may contain letters, digits and . _ - / only.`);
-          if ((f === "sku" || f === "barcode") && !t) throw new HttpError(400, `${f} cannot be cleared remotely.`);
-          out[f] = t.slice(0, TEXT_LIMITS[f] || 255);
-        }
-      }
+      onlyKeys(p, ["medicine_id", "reason", "expected", ...METADATA_FIELDS], "MEDICINE_METADATA_UPDATE");
+      const out = medicineFields(p, { medicine_id: uuid(p.medicine_id, "medicine_id") });
       if (Object.keys(out).length === 1) throw new HttpError(400, `MEDICINE_METADATA_UPDATE needs at least one of: ${METADATA_FIELDS.join(", ")}.`);
-      const r = reasonText(p.reason, false);
-      if (r) out.reason = r;
-      return out;
+      const exp = expectedOf(p.expected, METADATA_FIELDS, "MEDICINE_METADATA_UPDATE");
+      if (exp) out.expected = exp;
+      return withReason(out, p.reason);
+    }
+    case "MEDICINE_CREATE": {
+      onlyKeys(p, ["medicine_id", "reason", ...METADATA_FIELDS, ...PRICE_FIELDS], "MEDICINE_CREATE");
+      if (p.status !== void 0) throw new HttpError(400, "A new medicine is always created active.");
+      if (p.name === void 0) throw new HttpError(400, "name is required.");
+      const out = priceFields(p, medicineFields(p, { medicine_id: uuid(p.medicine_id, "medicine_id") }));
+      if (!out.selling_price || out.selling_price <= 0) throw new HttpError(400, "selling_price must be greater than zero.");
+      return withReason(out, p.reason);
+    }
+    case "MEDICINE_SET_ACTIVE": {
+      onlyKeys(p, ["medicine_id", "active", "reason"], "MEDICINE_SET_ACTIVE");
+      return { medicine_id: uuid(p.medicine_id, "medicine_id"), active: bool(p.active, "active"), reason: reasonText(p.reason, true) };
     }
     case "CATEGORY_UPSERT": {
       onlyKeys(p, ["name", "description"], "CATEGORY_UPSERT");
@@ -1277,25 +1501,139 @@ function validateCommandPayload(type, payload) {
     }
     case "SETTINGS_UPDATE": {
       onlyKeys(p, SETTINGS_FIELDS, "SETTINGS_UPDATE");
-      const out = {};
-      for (const f of SETTINGS_FIELDS) {
-        if (p[f] === void 0) continue;
-        if (typeof p[f] !== "string") throw new HttpError(400, `${f} must be text.`);
-        out[f] = p[f].trim().slice(0, TEXT_LIMITS[f] || 255);
-      }
-      if (out.pharmacy_name === "") throw new HttpError(400, "pharmacy_name cannot be empty.");
+      const out = settingsFields(p);
       if (Object.keys(out).length === 0) throw new HttpError(400, `SETTINGS_UPDATE needs at least one of: ${SETTINGS_FIELDS.join(", ")}.`);
       return out;
     }
+    // ------------------------------------------------------------------ suppliers / customers
+    case "SUPPLIER_CREATE": {
+      onlyKeys(p, ["supplier_id", ...SUPPLIER_FIELDS], "SUPPLIER_CREATE");
+      if (p.name === void 0) throw new HttpError(400, "name is required.");
+      return { supplier_id: uuid(p.supplier_id, "supplier_id"), ...partialFields(p, SUPPLIER_FIELDS, ["name"]) };
+    }
+    case "SUPPLIER_UPDATE": {
+      onlyKeys(p, ["supplier_id", "reason", "expected", ...SUPPLIER_FIELDS], "SUPPLIER_UPDATE");
+      const out = { supplier_id: uuid(p.supplier_id, "supplier_id"), ...partialFields(p, SUPPLIER_FIELDS, ["name"]) };
+      if (Object.keys(out).length === 1) throw new HttpError(400, `SUPPLIER_UPDATE needs at least one of: ${SUPPLIER_FIELDS.join(", ")}.`);
+      const exp = expectedOf(p.expected, SUPPLIER_FIELDS, "SUPPLIER_UPDATE");
+      if (exp) out.expected = exp;
+      return withReason(out, p.reason);
+    }
+    case "SUPPLIER_SET_ACTIVE": {
+      onlyKeys(p, ["supplier_id", "active", "reason"], "SUPPLIER_SET_ACTIVE");
+      return { supplier_id: uuid(p.supplier_id, "supplier_id"), active: bool(p.active, "active"), reason: reasonText(p.reason, true) };
+    }
+    case "CUSTOMER_CREATE": {
+      onlyKeys(p, ["customer_id", ...CUSTOMER_FIELDS], "CUSTOMER_CREATE");
+      if (p.name === void 0) throw new HttpError(400, "name is required.");
+      return { customer_id: uuid(p.customer_id, "customer_id"), ...partialFields(p, CUSTOMER_FIELDS, ["name"]) };
+    }
+    case "CUSTOMER_UPDATE": {
+      onlyKeys(p, ["customer_id", "reason", "expected", ...CUSTOMER_FIELDS], "CUSTOMER_UPDATE");
+      const out = { customer_id: uuid(p.customer_id, "customer_id"), ...partialFields(p, CUSTOMER_FIELDS, ["name"]) };
+      if (Object.keys(out).length === 1) throw new HttpError(400, `CUSTOMER_UPDATE needs at least one of: ${CUSTOMER_FIELDS.join(", ")}.`);
+      const exp = expectedOf(p.expected, CUSTOMER_FIELDS, "CUSTOMER_UPDATE");
+      if (exp) out.expected = exp;
+      return withReason(out, p.reason);
+    }
+    case "CUSTOMER_SET_ACTIVE": {
+      onlyKeys(p, ["customer_id", "active", "reason"], "CUSTOMER_SET_ACTIVE");
+      return { customer_id: uuid(p.customer_id, "customer_id"), active: bool(p.active, "active"), reason: reasonText(p.reason, true) };
+    }
+    // ------------------------------------------------------------------ purchases
+    case "PURCHASE_CREATE": {
+      onlyKeys(p, ["purchase_id", "supplier_id", "invoice_number", "payment_status", "notes", "items"], "PURCHASE_CREATE");
+      const out = { purchase_id: uuid(p.purchase_id, "purchase_id"), supplier_id: uuid(p.supplier_id, "supplier_id"), items: purchaseItems(p.items) };
+      if (p.invoice_number) out.invoice_number = text(p.invoice_number, "invoice_number");
+      const ps = paymentStatus(p.payment_status);
+      if (ps) out.payment_status = ps;
+      if (p.notes) out.notes = text(p.notes, "notes");
+      return out;
+    }
+    case "PURCHASE_UPDATE_DRAFT": {
+      onlyKeys(p, ["purchase_id", "supplier_id", "invoice_number", "payment_status", "notes", "items"], "PURCHASE_UPDATE_DRAFT");
+      const out = { purchase_id: uuid(p.purchase_id, "purchase_id") };
+      if (p.supplier_id !== void 0) out.supplier_id = uuid(p.supplier_id, "supplier_id");
+      if (p.invoice_number !== void 0) out.invoice_number = text(p.invoice_number, "invoice_number", { clearable: true });
+      const ps = paymentStatus(p.payment_status);
+      if (ps) out.payment_status = ps;
+      if (p.notes !== void 0) out.notes = text(p.notes, "notes", { clearable: true });
+      if (p.items !== void 0) out.items = purchaseItems(p.items);
+      if (Object.keys(out).length === 1) throw new HttpError(400, "PURCHASE_UPDATE_DRAFT needs at least one change.");
+      return out;
+    }
+    case "PURCHASE_RECEIVE": {
+      onlyKeys(p, ["purchase_id", "supplier_id", "invoice_number", "payment_status", "notes", "items"], "PURCHASE_RECEIVE");
+      const out = { purchase_id: uuid(p.purchase_id, "purchase_id") };
+      const ps = paymentStatus(p.payment_status);
+      if (ps) out.payment_status = ps;
+      if (p.items !== void 0) {
+        out.supplier_id = uuid(p.supplier_id, "supplier_id");
+        out.invoice_number = text(p.invoice_number, "invoice_number", { required: true });
+        out.items = purchaseItems(p.items);
+        if (p.notes) out.notes = text(p.notes, "notes");
+      } else {
+        if (p.supplier_id !== void 0 || p.notes !== void 0) throw new HttpError(400, "Receiving a pending purchase takes only purchase_id, invoice_number and payment_status.");
+        if (p.invoice_number) out.invoice_number = text(p.invoice_number, "invoice_number");
+      }
+      return out;
+    }
+    case "PURCHASE_CANCEL": {
+      onlyKeys(p, ["purchase_id", "reason"], "PURCHASE_CANCEL");
+      return { purchase_id: uuid(p.purchase_id, "purchase_id"), reason: reasonText(p.reason, true) };
+    }
+    // ------------------------------------------------------------------ expenses
+    case "EXPENSE_CREATE": {
+      onlyKeys(p, ["expense_id", ...EXPENSE_FIELDS], "EXPENSE_CREATE");
+      return { expense_id: uuid(p.expense_id, "expense_id"), payment_method: "Cash", ...expenseFields(p, true) };
+    }
+    case "EXPENSE_UPDATE": {
+      onlyKeys(p, ["expense_id", "reason", "expected", ...EXPENSE_FIELDS], "EXPENSE_UPDATE");
+      const out = { expense_id: uuid(p.expense_id, "expense_id"), ...expenseFields(p, false) };
+      if (Object.keys(out).length === 1) throw new HttpError(400, `EXPENSE_UPDATE needs at least one of: ${EXPENSE_FIELDS.join(", ")}.`);
+      const exp = expectedOf(p.expected, EXPENSE_FIELDS, "EXPENSE_UPDATE");
+      if (exp) out.expected = exp;
+      return withReason(out, p.reason);
+    }
+    case "EXPENSE_VOID": {
+      onlyKeys(p, ["expense_id", "reason"], "EXPENSE_VOID");
+      return { expense_id: uuid(p.expense_id, "expense_id"), reason: reasonText(p.reason, true) };
+    }
+    // ------------------------------------------------------------------ returns / sales
+    case "RETURN_APPROVE": {
+      onlyKeys(p, ["return_id", "restock", "disposition", "notes"], "RETURN_APPROVE");
+      const restock = bool(p.restock, "restock");
+      const out = { return_id: uuid(p.return_id, "return_id"), restock };
+      if (!restock) {
+        const d = p.disposition ?? "quarantine";
+        if (!RETURN_DISPOSITIONS.includes(d)) throw new HttpError(400, `disposition must be one of ${RETURN_DISPOSITIONS.join(", ")} when not restocking.`);
+        out.disposition = d;
+      } else if (p.disposition !== void 0) throw new HttpError(400, "disposition is only used when restock is false.");
+      const notes = reasonText(p.notes, false, "notes");
+      if (notes) out.notes = notes;
+      return out;
+    }
+    case "RETURN_REJECT": {
+      onlyKeys(p, ["return_id", "reason"], "RETURN_REJECT");
+      return { return_id: uuid(p.return_id, "return_id"), reason: reasonText(p.reason, true) };
+    }
+    case "SALE_VOID": {
+      onlyKeys(p, ["sale_id", "reason"], "SALE_VOID");
+      return { sale_id: uuid(p.sale_id, "sale_id"), reason: reasonText(p.reason, true) };
+    }
+    // ------------------------------------------------------------------ staff
     case "USER_SET_ACTIVE": {
       onlyKeys(p, ["user_id", "active", "reason"], "USER_SET_ACTIVE");
-      if (typeof p.active !== "boolean") throw new HttpError(400, "active must be true or false.");
-      return { user_id: uuid(p.user_id, "user_id"), active: p.active, reason: reasonText(p.reason, true) };
+      return { user_id: uuid(p.user_id, "user_id"), active: bool(p.active, "active"), reason: reasonText(p.reason, true) };
     }
     case "USER_ROLE_UPDATE": {
       onlyKeys(p, ["user_id", "role", "reason"], "USER_ROLE_UPDATE");
       if (!ASSIGNABLE_ROLES.includes(p.role)) throw new HttpError(400, `role must be one of: ${ASSIGNABLE_ROLES.join(", ")}.`);
       return { user_id: uuid(p.user_id, "user_id"), role: p.role, reason: reasonText(p.reason, true) };
+    }
+    case "USER_SESSION_REVOKE": {
+      onlyKeys(p, ["user_id", "reason"], "USER_SESSION_REVOKE");
+      return { user_id: uuid(p.user_id, "user_id"), reason: reasonText(p.reason, false) };
     }
     // Credentials are NEVER in a command: the shop fetches the password hash for this one account
     // through the shop-authenticated gc_fetch_user_credential while the command is open.
@@ -1304,14 +1642,14 @@ function validateCommandPayload(type, payload) {
       if (!ASSIGNABLE_ROLES.includes(p.role)) throw new HttpError(400, `role must be one of: ${ASSIGNABLE_ROLES.join(", ")}.`);
       const name2 = typeof p.name === "string" ? p.name.trim() : "";
       if (!name2 || name2.length > 255) throw new HttpError(400, "name is required (max 255 characters).");
-      const email2 = typeof p.email === "string" ? p.email.trim().toLowerCase() : "";
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email2) || email2.length > 255) throw new HttpError(400, "A valid email address is required.");
+      const mail = typeof p.email === "string" ? p.email.trim().toLowerCase() : "";
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(mail) || mail.length > 255) throw new HttpError(400, "A valid email address is required.");
       let username2 = null;
       if (p.username !== void 0 && p.username !== null && p.username !== "") {
         username2 = typeof p.username === "string" ? p.username.trim().toLowerCase() : "";
         if (!/^[a-z0-9][a-z0-9._-]{2,49}$/.test(username2)) throw new HttpError(400, "username must be 3-50 characters: letters, digits, dot, underscore or hyphen.");
       }
-      return { user_id: uuid(p.user_id, "user_id"), name: name2, email: email2, username: username2, role: p.role, credential_version: wholeNumber(p.credential_version, "credential_version", 1) };
+      return { user_id: uuid(p.user_id, "user_id"), name: name2, email: mail, username: username2, role: p.role, credential_version: wholeNumber(p.credential_version, "credential_version", 1) };
     }
     case "USER_CREDENTIAL_REFRESH": {
       onlyKeys(p, ["user_id", "credential_version", "reason"], "USER_CREDENTIAL_REFRESH");
@@ -1327,6 +1665,31 @@ function validateCommandPayload(type, payload) {
       throw new HttpError(400, `Unsupported command type "${type}".`);
   }
 }
+function commandEntity(type, payload) {
+  const p = payload || {};
+  const pick = [
+    ["batch_id", "batch"],
+    ["medicine_id", "medicine"],
+    ["supplier_id", "supplier"],
+    ["customer_id", "customer"],
+    ["purchase_id", "purchase"],
+    ["expense_id", "expense"],
+    ["return_id", "return"],
+    ["sale_id", "sale"],
+    ["user_id", "user"]
+  ];
+  if (type.startsWith("PURCHASE_") && p.purchase_id) return { entity: "purchase", entity_id: p.purchase_id };
+  for (const [key, entity] of pick) if (typeof p[key] === "string") return { entity, entity_id: p[key] };
+  return null;
+}
+function commandExpectation(payload) {
+  const p = payload || {};
+  const out = {};
+  if (p.expected && typeof p.expected === "object") Object.assign(out, p.expected);
+  if (p.expected_quantity !== void 0) out.quantity = p.expected_quantity;
+  if (p.expected_expiry_date !== void 0) out.expiry_date = p.expected_expiry_date;
+  return Object.keys(out).length ? out : null;
+}
 
 // server/online/remoteAdmin.ts
 var ACTIONS = {
@@ -1340,8 +1703,48 @@ var ACTIONS = {
   settings: "SETTINGS_UPDATE",
   "user-active": "USER_SET_ACTIVE",
   "user-role": "USER_ROLE_UPDATE",
-  "app-update": "APP_UPDATE_APPROVE"
+  "app-update": "APP_UPDATE_APPROVE",
+  // Full-write Global Admin (cloud migration 006)
+  "medicine-create": "MEDICINE_CREATE",
+  "medicine-active": "MEDICINE_SET_ACTIVE",
+  "batch-create": "BATCH_CREATE",
+  "batch-update": "BATCH_UPDATE",
+  "batch-active": "BATCH_SET_ACTIVE",
+  "supplier-create": "SUPPLIER_CREATE",
+  "supplier-update": "SUPPLIER_UPDATE",
+  "supplier-active": "SUPPLIER_SET_ACTIVE",
+  "customer-create": "CUSTOMER_CREATE",
+  "customer-update": "CUSTOMER_UPDATE",
+  "customer-active": "CUSTOMER_SET_ACTIVE",
+  "purchase-create": "PURCHASE_CREATE",
+  "purchase-update": "PURCHASE_UPDATE_DRAFT",
+  "purchase-receive": "PURCHASE_RECEIVE",
+  "purchase-cancel": "PURCHASE_CANCEL",
+  "expense-create": "EXPENSE_CREATE",
+  "expense-update": "EXPENSE_UPDATE",
+  "expense-void": "EXPENSE_VOID",
+  "return-approve": "RETURN_APPROVE",
+  "return-reject": "RETURN_REJECT",
+  "sale-void": "SALE_VOID",
+  "user-session-revoke": "USER_SESSION_REVOKE"
 };
+var CREATE_ID_FIELD = {
+  MEDICINE_CREATE: "medicine_id",
+  BATCH_CREATE: "batch_id",
+  SUPPLIER_CREATE: "supplier_id",
+  CUSTOMER_CREATE: "customer_id",
+  PURCHASE_CREATE: "purchase_id",
+  EXPENSE_CREATE: "expense_id"
+};
+function derivedUuid(seed) {
+  const h = crypto2.createHash("sha256").update(seed).digest();
+  h[6] = h[6] & 15 | 64;
+  h[8] = h[8] & 63 | 128;
+  const x = h.subarray(0, 16).toString("hex");
+  return `${x.slice(0, 8)}-${x.slice(8, 12)}-${x.slice(12, 16)}-${x.slice(16, 20)}-${x.slice(20, 32)}`;
+}
+var SCOPE_HEADER = "x-giga-scope";
+var isAllShopsScope = (req) => String(req.headers[SCOPE_HEADER] || "").trim().toUpperCase() === "ALL";
 var HEARTBEAT_ONLINE_SECONDS = Math.max(60, Number(process.env.HEARTBEAT_ONLINE_SECONDS) || 180);
 var CONTACT_WINDOW_SECONDS = 150;
 var hits = /* @__PURE__ */ new Map();
@@ -1367,9 +1770,16 @@ function safeError(e) {
   return e.replace(/postgres(ql)?:\/\/\S+/gi, "[hidden]").slice(0, 500);
 }
 function toCommand(r) {
+  const entity = commandEntity(r.command_type, r.payload);
   return {
     command_id: r.command_id,
+    shop_id: r.shop_id ?? null,
     command_type: r.command_type,
+    entity: entity?.entity ?? null,
+    entity_id: entity?.entity_id ?? null,
+    idempotency_key: r.idempotency_key ?? null,
+    expected: commandExpectation(r.payload),
+    high_conflict: HIGH_CONFLICT_TYPES.includes(r.command_type),
     status: r.status,
     payload: r.payload,
     display: r.display ?? null,
@@ -1388,17 +1798,25 @@ function toCommand(r) {
 function clientIp(req) {
   return String(req.headers["x-forwarded-for"] || req.ip || "").split(",")[0].trim().slice(0, 100);
 }
-async function contextFor(deps, req, type, p) {
+async function contextFor(withShop2, type, p) {
   const display = {};
-  await deps.withShop(req, async (c) => {
-    if (p.medicine_id) {
-      const m = (await c.query(
+  const creates = CREATE_ID_FIELD[type] ?? (type === "PURCHASE_RECEIVE" && p.items ? "purchase_id" : null);
+  const one = async (c, sql, params, missing) => {
+    const row = (await c.query(sql, params)).rows[0];
+    if (!row) throw new HttpError(404, missing);
+    return row;
+  };
+  await withShop2(async (c) => {
+    if (p.medicine_id && creates !== "medicine_id") {
+      const m = await one(
+        c,
         `SELECT name, current_stock, selling_price, wholesale_price, min_selling_price, purchase_price, reorder_level, status FROM medicines WHERE id = $1`,
-        [p.medicine_id]
-      )).rows[0];
-      if (!m) throw new HttpError(404, "Medicine not found in the cloud copy of this shop (has the shop synced it yet?).");
+        [p.medicine_id],
+        "Medicine not found in the cloud copy of this shop (has the shop synced it yet?)."
+      );
       display.medicine_name = m.name;
       display.cloud_stock_before = Number(m.current_stock);
+      display.medicine_status_before = m.status;
       if (type === "PRICE_UPDATE") {
         display.prices_before = {
           selling_price: Number(m.selling_price),
@@ -1408,27 +1826,68 @@ async function contextFor(deps, req, type, p) {
         };
       }
     }
-    if (p.batch_id) {
-      const b = (await c.query(
-        "SELECT batch_number, quantity_available, expiry_date FROM medicine_batches WHERE id = $1 AND medicine_id = $2",
-        [p.batch_id, p.medicine_id]
-      )).rows[0];
-      if (!b) throw new HttpError(404, "Batch not found for this medicine in the cloud copy.");
+    if (p.batch_id && creates !== "batch_id") {
+      const b = await one(
+        c,
+        "SELECT batch_number, quantity_available, expiry_date, status FROM medicine_batches WHERE id = $1 AND medicine_id = $2",
+        [p.batch_id, p.medicine_id],
+        "Batch not found for this medicine in the cloud copy."
+      );
       display.batch_number = b.batch_number;
       display.batch_quantity_before = Number(b.quantity_available);
       display.expiry_before = b.expiry_date ? new Date(b.expiry_date).toISOString().slice(0, 10) : null;
+      display.batch_status_before = b.status;
     }
     if (p.user_id) {
-      const u = (await c.query("SELECT name, role, active FROM users WHERE id = $1 AND email IS NOT NULL", [p.user_id])).rows[0];
-      if (!u) throw new HttpError(404, "Staff account not found in the cloud copy of this shop.");
+      const u = await one(c, "SELECT name, role, active FROM users WHERE id = $1 AND email IS NOT NULL", [p.user_id], "Staff account not found in the cloud copy of this shop.");
       display.user_name = u.name;
       display.role_before = u.role;
       display.active_before = u.active;
     }
+    if (p.supplier_id && creates !== "supplier_id") {
+      const v = await one(c, "SELECT name, status FROM suppliers WHERE id = $1", [p.supplier_id], "Supplier not found in the cloud copy of this shop.");
+      display.supplier_name = v.name;
+      display.supplier_status_before = v.status;
+    }
+    if (p.customer_id && creates !== "customer_id") {
+      const v = await one(c, "SELECT name, active FROM customers WHERE id = $1", [p.customer_id], "Customer not found in the cloud copy of this shop.");
+      display.customer_name = v.name;
+      display.customer_active_before = v.active;
+    }
+    if (p.purchase_id && creates !== "purchase_id") {
+      const v = await one(
+        c,
+        "SELECT order_number, invoice_number, status, total_amount FROM purchases WHERE id = $1",
+        [p.purchase_id],
+        "Purchase not found in the cloud copy of this shop."
+      );
+      display.order_number = v.order_number;
+      display.purchase_status_before = v.status;
+      display.purchase_total_before = v.total_amount === null ? null : Number(v.total_amount);
+    }
+    if (Array.isArray(p.items)) {
+      const ids = [...new Set(p.items.map((i) => i.medicine_id))];
+      const n = (await c.query("SELECT COUNT(*)::int AS n FROM medicines WHERE id = ANY($1::uuid[])", [ids])).rows[0].n;
+      if (n !== ids.length) throw new HttpError(404, "A purchase line names a medicine that is not in the cloud copy of this shop.");
+      display.lines = p.items.length;
+      display.total = Math.round(p.items.reduce((sum, i) => sum + i.quantity * i.purchase_price, 0) * 100) / 100;
+    }
+    if (p.expense_id && creates !== "expense_id") {
+      const v = await one(c, "SELECT description, amount, category, status FROM expenses WHERE id = $1", [p.expense_id], "Expense not found in the cloud copy of this shop.");
+      display.expense = { description: v.description, amount: Number(v.amount), category: v.category, status: v.status };
+    }
+    if (p.return_id) {
+      const v = await one(c, "SELECT receipt_number, quantity, status, requested_refund FROM returns WHERE id = $1", [p.return_id], "Return not found in the cloud copy of this shop.");
+      display.return = { receipt_number: v.receipt_number, quantity: Number(v.quantity), status: v.status, requested_refund: v.requested_refund === null ? null : Number(v.requested_refund) };
+    }
+    if (p.sale_id) {
+      const v = await one(c, "SELECT receipt_number, total, status, date FROM sales WHERE id = $1", [p.sale_id], "Sale not found in the cloud copy of this shop.");
+      display.sale = { receipt_number: v.receipt_number, total: Number(v.total), status: v.status, date: v.date };
+    }
   });
   return display;
 }
-var COMMAND_COLUMNS = `command_id, command_type, status, payload, created_at, created_by, source, delivered_at, delivery_count, acked_at, result, error`;
+var COMMAND_COLUMNS = `command_id, shop_id, idempotency_key, command_type, status, payload, created_at, created_by, source, delivered_at, delivery_count, acked_at, result, error`;
 async function commandQuery(deps, where, params, tail = "") {
   try {
     return (await deps.withCloud((c) => c.query(`SELECT ${COMMAND_COLUMNS}, display FROM giga_cloud.commands WHERE ${where} ${tail}`, params))).rows;
@@ -1484,19 +1943,31 @@ function buildRemoteAdminRouter(deps) {
   r.get("/admin/commands/options", requireAdmin2, (_req, res) => {
     res.json({ actions: Object.keys(ACTIONS), stock_remove_reasons: STOCK_REMOVE_REASONS, assignable_roles: ASSIGNABLE_ROLES });
   });
-  r.post("/admin/commands/:action", requireAdmin2, commandRateLimit, route2("POST /admin/commands", async (req, res) => {
-    const type = ACTIONS[String(req.params.action)];
-    if (!type) throw new HttpError(404, `Unknown remote action "${req.params.action}".`);
-    const shopId = deps.shopId(req);
+  async function shopOnline(shopId) {
+    const rt = await runtimeRow(deps, shopId);
+    if (rt) return rt.age_seconds <= HEARTBEAT_ONLINE_SECONDS;
+    if (rt === null) return false;
+    const shop = (await deps.withCloud((c) => c.query(
+      `SELECT (last_seen_at IS NOT NULL AND last_seen_at > now() - make_interval(secs => $2)) AS in_contact FROM giga_cloud.shops WHERE shop_id = $1`,
+      [shopId, CONTACT_WINDOW_SECONDS]
+    ))).rows[0];
+    return shop ? Boolean(shop.in_contact) : null;
+  }
+  async function queueForShop(req, shopId, type, bodyIn, seed, extraDisplay = {}) {
     const ctl = await deps.getRemoteControl(shopId, true);
     if (!ctl.remote_writes_enabled) throw new HttpError(423, "Remote changes are disabled (emergency switch). Re-enable them under Security.");
-    const body = req.body && typeof req.body === "object" && !Array.isArray(req.body) ? { ...req.body } : {};
-    const requestId = body.request_id;
-    delete body.request_id;
+    const u = req.onlineUser;
+    let body = bodyIn;
+    const createField = CREATE_ID_FIELD[type] ?? (type === "PURCHASE_RECEIVE" && Array.isArray(body.items) ? "purchase_id" : void 0);
+    if (createField) {
+      if (body[createField] !== void 0) throw new HttpError(400, `${createField} of a new record is assigned by the server; do not send it.`);
+      body = { ...body, [createField]: seed ? derivedUuid(`${u.id}:${seed}:${type}:${shopId}`) : crypto2.randomUUID() };
+    }
     const payload = validateCommandPayload(type, body);
-    const display = await contextFor(deps, req, type, payload);
+    const display = await contextFor((fn) => deps.withShopId(shopId, fn), type, payload);
     const target = (await deps.withCloud((c) => c.query("SELECT shop_code, name FROM giga_cloud.shops WHERE shop_id = $1", [shopId]))).rows[0];
     display.target_shop = { shop_id: shopId, shop_code: target?.shop_code ?? null, name: target?.name ?? null };
+    Object.assign(display, extraDisplay);
     if (type === "APP_UPDATE_APPROVE") {
       const rt = await runtimeRow(deps, shopId);
       const available = rt?.update_state?.available_commit;
@@ -1506,8 +1977,10 @@ function buildRemoteAdminRouter(deps) {
       display.current_commit = rt.update_state.current_commit ?? null;
       display.available_version = rt.update_state.available_version ?? null;
     }
-    const u = req.onlineUser;
-    const key = `online:${u.id}:${isValidUuid(requestId) ? String(requestId).toLowerCase() : crypto2.randomUUID()}`;
+    const online = await shopOnline(shopId);
+    const highConflict = HIGH_CONFLICT_TYPES.includes(type);
+    if (online === false) display.queued_while_shop_offline = true;
+    const key = `online:${u.id}:${seed ? `${seed}${extraDisplay.fanout_group ? `:${shopId}` : ""}` : crypto2.randomUUID()}`;
     let row;
     try {
       row = (await deps.withCloud((c) => c.query(
@@ -1519,23 +1992,108 @@ function buildRemoteAdminRouter(deps) {
       if (err?.code === "PT404") throw new HttpError(409, "The shop is not registered (or inactive) in the cloud.");
       if (err?.code === "PT409") throw new HttpError(409, "This request id was already used for another command.");
       if (err?.code === "PT423") throw new HttpError(423, "Remote changes are disabled (emergency switch).");
-      if (err?.code === "42883" || err?.code === "23514" || err?.code === "42703") {
+      if (err?.code === "23514") throw new HttpError(503, `The cloud does not accept ${type} yet (apply cloud migration 006).`);
+      if (err?.code === "42883" || err?.code === "42703") {
         throw new HttpError(503, "Remote administration is not fully enabled in the cloud yet (apply cloud migrations 003 and 004).");
       }
       throw err;
     }
-    console.log(`[Online] ${u.email} queued ${type} ${row.command_id}${row.duplicate ? " (replayed request)" : ""}`);
-    res.status(202);
+    let entity = commandEntity(type, payload);
+    if (row.duplicate) {
+      const orig = (await commandQuery(deps, "command_id = $1", [row.command_id]))[0];
+      if (orig) entity = commandEntity(orig.command_type, orig.payload);
+    }
+    console.log(`[Online] ${u.email} queued ${type} ${row.command_id} for shop ${target?.shop_code || shopId}${row.duplicate ? " (replayed request)" : ""}`);
+    const offlineWarning = highConflict ? "The shop computer is OFFLINE. This stock/financial change waits as PENDING and is re-checked against the shop live data when it arrives; it may be REJECTED if anything changed meanwhile." : "The shop computer is offline: the change waits as PENDING and is applied when the shop reconnects.";
     return {
       command_id: row.command_id,
       command_type: type,
       shop_id: shopId,
       shop_code: target?.shop_code ?? null,
+      shop_name: target?.name ?? null,
+      entity: entity?.entity ?? null,
+      entity_id: entity?.entity_id ?? null,
       status: row.status,
       created_at: row.created_at,
       duplicate: row.duplicate,
+      shop_online: online,
+      warning: online === false ? offlineWarning : null,
       message: "Remote change queued. It is applied when the shop computer picks it up; watch the status."
     };
+  }
+  const requestSeed = (requestId) => typeof requestId === "string" && isValidUuid(requestId) ? requestId.toLowerCase() : null;
+  r.post("/admin/commands/:action", requireAdmin2, commandRateLimit, route2("POST /admin/commands", async (req, res) => {
+    const type = ACTIONS[String(req.params.action)];
+    if (!type) throw new HttpError(404, `Unknown remote action "${req.params.action}".`);
+    if (isAllShopsScope(req)) {
+      throw new HttpError(409, 'All Shops is a read-only view. Select one shop to change it, or use "Apply to all shops" where it is offered.', { code: "ALL_SHOPS_READ_ONLY" });
+    }
+    const body = req.body && typeof req.body === "object" && !Array.isArray(req.body) ? { ...req.body } : {};
+    const seed = requestSeed(body.request_id);
+    delete body.request_id;
+    const out = await queueForShop(req, deps.shopId(req), type, body, seed);
+    res.status(202);
+    return out;
+  }));
+  r.post("/admin/all-shops/commands/:action", requireAdmin2, commandRateLimit, route2("POST /admin/all-shops/commands", async (req, res) => {
+    if (!deps.isGlobalAdmin(req.onlineUser)) throw new HttpError(403, "Forbidden: only a Global Administrator can apply a change to all shops.");
+    const type = ACTIONS[String(req.params.action)];
+    if (!type || !ALL_SHOPS_TYPES.includes(type)) {
+      throw new HttpError(400, `"${req.params.action}" cannot be applied to all shops (allowed: prices, medicine details, categories, settings).`);
+    }
+    const body = req.body && typeof req.body === "object" && !Array.isArray(req.body) ? { ...req.body } : {};
+    const seed = requestSeed(body.request_id) || crypto2.randomUUID();
+    delete body.request_id;
+    const sourceShop = typeof body.source_shop_id === "string" ? body.source_shop_id.toLowerCase() : "";
+    delete body.source_shop_id;
+    delete body.expected;
+    validateCommandPayload(type, body);
+    const shops = (await deps.withCloud((c) => c.query("SELECT shop_id, shop_code, name FROM giga_cloud.shops WHERE active ORDER BY shop_code, shop_id"))).rows;
+    let barcode = null;
+    if (body.medicine_id) {
+      if (!isValidUuid(sourceShop) || !shops.some((x) => x.shop_id === sourceShop)) {
+        throw new HttpError(400, "source_shop_id (the shop whose medicine you selected) is required and must be an active shop.");
+      }
+      const src = (await deps.withShopId(sourceShop, (c) => c.query("SELECT name, barcode FROM medicines WHERE id = $1", [body.medicine_id]))).rows[0];
+      if (!src) throw new HttpError(404, "Medicine not found in the source shop.");
+      barcode = typeof src.barcode === "string" && src.barcode.trim() ? src.barcode.trim() : null;
+      if (!barcode) throw new HttpError(409, "This medicine has no barcode, so it cannot be matched in other shops. Change each shop separately.");
+    }
+    const fields = Object.keys(body).filter((k) => !["medicine_id", "reason"].includes(k));
+    const allowed = type === "PRICE_UPDATE" ? PRICE_FIELDS : METADATA_FIELDS;
+    const results = [];
+    for (const shop of shops) {
+      const one = { shop_id: shop.shop_id, shop_code: shop.shop_code, shop_name: shop.name };
+      try {
+        const shopBody = { ...body };
+        if (barcode) {
+          const found = (await deps.withShopId(shop.shop_id, (c) => c.query(
+            `SELECT id FROM medicines WHERE lower(btrim(barcode)) = lower($1) LIMIT 2`,
+            [barcode]
+          ))).rows;
+          if (found.length !== 1) {
+            results.push({ ...one, status: "SKIPPED", reason: found.length ? "more than one medicine has this barcode" : "no medicine with this barcode" });
+            continue;
+          }
+          const m = await deps.withShopId(shop.shop_id, (c) => getMedicineById(found[0].id, c));
+          shopBody.medicine_id = m.id;
+          const exp = Object.fromEntries(fields.filter((f) => allowed.includes(f)).map((f) => [f, m[f] === void 0 ? null : m[f]]));
+          if (Object.keys(exp).length) shopBody.expected = exp;
+        }
+        const q = await queueForShop(req, shop.shop_id, type, shopBody, seed, { fanout_group: seed, applied_to: "ALL_SHOPS" });
+        results.push({ ...one, status: "QUEUED", command_id: q.command_id, duplicate: q.duplicate, shop_online: q.shop_online, warning: q.warning });
+      } catch (err) {
+        results.push({ ...one, status: "SKIPPED", reason: err instanceof HttpError ? err.message : "cloud error" });
+      }
+    }
+    await deps.securityEvent(req, "REMOTE_COMMAND_ALL_SHOPS", req.onlineUser.email, req.onlineUser.id, {
+      command_type: type,
+      fanout_group: seed,
+      queued: results.filter((x) => x.status === "QUEUED").length,
+      skipped: results.filter((x) => x.status === "SKIPPED").length
+    });
+    res.status(202);
+    return { command_type: type, fanout_group: seed, results };
   }));
   r.get("/admin/commands", requireAdmin2, route2("GET /admin/commands", async (req) => {
     const limit = Math.min(Math.max(Number(req.query.limit) || 30, 1), 200);
@@ -1643,6 +2201,94 @@ function buildRemoteAdminRouter(deps) {
       inventory: rt.inventory ?? null,
       commands: counts,
       controls: ctl
+    };
+  }));
+  r.get("/admin/overview", requireAdmin2, route2("GET /admin/overview", async (req) => {
+    const global = deps.isGlobalAdmin(req.onlineUser);
+    const shops = (await deps.withCloud((c) => global ? c.query("SELECT shop_id, shop_code, name, last_seen_at, last_event_at FROM giga_cloud.shops WHERE active ORDER BY shop_code, shop_id") : c.query("SELECT shop_id, shop_code, name, last_seen_at, last_event_at FROM giga_cloud.shops WHERE shop_id = $1", [deps.shopId(req)]))).rows;
+    const out = [];
+    for (const s of shops) {
+      const row = { shop_id: s.shop_id, shop_code: s.shop_code, name: s.name };
+      try {
+        const rt = await runtimeRow(deps, s.shop_id);
+        const counts = await deps.withCloud((c) => commandCounts(c, s.shop_id));
+        const rejected7d = (await deps.withCloud((c) => c.query(
+          `SELECT COUNT(*)::int AS n FROM giga_cloud.commands WHERE shop_id = $1 AND status = 'REJECTED' AND acked_at > now() - interval '7 days'`,
+          [s.shop_id]
+        ))).rows[0].n;
+        const m = await deps.withShopId(s.shop_id, async (c) => {
+          const sales = (await c.query(
+            `SELECT COUNT(*)::int AS n, COALESCE(SUM(total), 0)::float AS total FROM sales
+              WHERE date = (now() AT TIME ZONE 'Africa/Nairobi')::date AND status <> 'voided'`
+          )).rows[0];
+          const stock = (await c.query(
+            `SELECT COUNT(*)::int AS total,
+                    COUNT(*) FILTER (WHERE status = 'active')::int AS active,
+                    COUNT(*) FILTER (WHERE status <> 'active')::int AS inactive,
+                    COALESCE(SUM(current_stock) FILTER (WHERE status = 'active'), 0)::bigint AS units,
+                    COALESCE(SUM(current_stock * COALESCE(purchase_price, 0)) FILTER (WHERE status = 'active'), 0)::float AS cost_value,
+                    COALESCE(SUM(current_stock * COALESCE(selling_price, 0)) FILTER (WHERE status = 'active'), 0)::float AS retail_value,
+                    COUNT(*) FILTER (WHERE status = 'active' AND current_stock <= 0)::int AS out_of_stock,
+                    COUNT(*) FILTER (WHERE status = 'active' AND current_stock > 0 AND current_stock <= COALESCE(reorder_level, 0))::int AS low_stock
+               FROM medicines`
+          )).rows[0];
+          const expiry = (await c.query(
+            `SELECT COUNT(*) FILTER (WHERE expiry_date > CURRENT_DATE AND expiry_date <= CURRENT_DATE + 30)::int AS expiring_30d,
+                    COUNT(*) FILTER (WHERE expiry_date <= CURRENT_DATE)::int AS expired
+               FROM medicine_batches WHERE quantity_available > 0 AND expiry_date IS NOT NULL`
+          )).rows[0];
+          const staff = (await c.query(`SELECT COUNT(*) FILTER (WHERE active)::int AS active FROM users WHERE email IS NOT NULL`)).rows[0];
+          return { sales, stock, expiry, staff };
+        });
+        Object.assign(row, {
+          online: rt ? rt.age_seconds <= HEARTBEAT_ONLINE_SECONDS : rt === null ? false : null,
+          last_heartbeat_at: rt?.reported_at ?? null,
+          heartbeat_age_seconds: rt?.age_seconds ?? null,
+          db_healthy: rt ? Boolean(rt.db_healthy) : null,
+          sync_healthy: rt ? Boolean(rt.worker_healthy) : null,
+          last_sync_at: rt?.last_sync_at ?? s.last_event_at ?? null,
+          app_version: rt?.app_version ?? null,
+          git_commit: rt?.git_commit ?? null,
+          sales_today: { count: m.sales.n, total: Math.round(m.sales.total * 100) / 100 },
+          catalogue: { total: m.stock.total, active: m.stock.active, inactive: m.stock.inactive },
+          stock_units: Number(m.stock.units),
+          stock_cost_value: Math.round(m.stock.cost_value * 100) / 100,
+          stock_retail_value: Math.round(m.stock.retail_value * 100) / 100,
+          low_stock: m.stock.low_stock,
+          out_of_stock: m.stock.out_of_stock,
+          expiring_30d: m.expiry.expiring_30d,
+          expired_with_stock: m.expiry.expired,
+          active_staff: m.staff.active,
+          pending_commands: Number(counts.pending) + Number(counts.delivered),
+          rejected_commands_7d: rejected7d,
+          error: null
+        });
+      } catch (err) {
+        row.error = err instanceof HttpError ? err.message : "Could not read this shop from the cloud copy.";
+      }
+      out.push(row);
+    }
+    const ok = out.filter((x) => !x.error);
+    const sum = (f) => Math.round(ok.reduce((t, x) => t + (Number(f(x)) || 0), 0) * 100) / 100;
+    return {
+      scope: global ? "GLOBAL" : "SHOP",
+      generated_at: (/* @__PURE__ */ new Date()).toISOString(),
+      shops: out,
+      totals: {
+        shops: out.length,
+        shops_online: out.filter((x) => x.online === true).length,
+        sales_today_count: sum((x) => x.sales_today.count),
+        sales_today_total: sum((x) => x.sales_today.total),
+        stock_units: sum((x) => x.stock_units),
+        stock_cost_value: sum((x) => x.stock_cost_value),
+        stock_retail_value: sum((x) => x.stock_retail_value),
+        low_stock: sum((x) => x.low_stock),
+        out_of_stock: sum((x) => x.out_of_stock),
+        expiring_30d: sum((x) => x.expiring_30d),
+        active_staff: sum((x) => x.active_staff),
+        pending_commands: sum((x) => x.pending_commands),
+        rejected_commands_7d: sum((x) => x.rejected_commands_7d)
+      }
     };
   }));
   r.get("/admin/alerts", requireAdmin2, route2("GET /admin/alerts", async (req) => {
@@ -1800,18 +2446,18 @@ function buildRemoteAdminRouter(deps) {
     deps.clearRemoteControlCache(deps.shopId(req));
     return deps.getRemoteControl(deps.shopId(req), true);
   }
-  const bool2 = (v, name2) => {
+  const bool3 = (v, name2) => {
     if (typeof v !== "boolean") throw new HttpError(400, `${name2} must be true or false.`);
     return v;
   };
   r.post("/admin/security/remote-writes", requireAdmin2, securityRateLimit, route2("POST /admin/security/remote-writes", async (req) => {
-    const enabled = bool2(req.body?.enabled, "enabled");
+    const enabled = bool3(req.body?.enabled, "enabled");
     const out = await setControl(req, { remote_writes_enabled: enabled });
     await deps.securityEvent(req, enabled ? "REMOTE_WRITES_ENABLED" : "REMOTE_WRITES_DISABLED", req.onlineUser.email, req.onlineUser.id);
     return out;
   }));
   r.post("/admin/security/maintenance", requireAdmin2, securityRateLimit, route2("POST /admin/security/maintenance", async (req) => {
-    const enabled = bool2(req.body?.enabled, "enabled");
+    const enabled = bool3(req.body?.enabled, "enabled");
     const message = typeof req.body?.message === "string" ? req.body.message.trim().slice(0, 300) || null : null;
     const out = await setControl(req, { maintenance_mode: enabled, maintenance_message: message });
     await deps.securityEvent(req, enabled ? "MAINTENANCE_ON" : "MAINTENANCE_OFF", req.onlineUser.email, req.onlineUser.id);
@@ -1837,7 +2483,7 @@ function buildRemoteAdminRouter(deps) {
   }));
   r.post("/admin/security/online-users/:id/active", requireAdmin2, securityRateLimit, route2("POST /admin/security/online-users/:id/active", async (req) => {
     if (!isValidUuid(req.params.id)) throw new HttpError(400, "Account id must be a UUID.");
-    const active = bool2(req.body?.active, "active");
+    const active = bool3(req.body?.active, "active");
     const shopId = deps.shopId(req);
     const out = await deps.withCloud(async (c) => {
       await c.query("BEGIN");
@@ -1885,7 +2531,7 @@ function password(v) {
   if (v.length > 200) throw new HttpError(400, "Password is too long.");
   return v;
 }
-function email(v) {
+function email2(v) {
   const e = typeof v === "string" ? v.trim().toLowerCase() : "";
   if (!EMAIL_RE.test(e) || e.length > 255) throw new HttpError(400, "A valid email address is required.");
   return e;
@@ -1905,7 +2551,7 @@ function role(v) {
   if (typeof v !== "string" || !ASSIGNABLE_ROLES.includes(v)) throw new HttpError(400, `Role must be one of: ${ASSIGNABLE_ROLES.join(", ")}.`);
   return v;
 }
-function bool(v, field) {
+function bool2(v, field) {
   if (typeof v !== "boolean") throw new HttpError(400, `${field} must be true or false.`);
   return v;
 }
@@ -2010,7 +2656,7 @@ function buildUserAdminRouter(deps) {
   }));
   r.post("/admin/accounts/shop-users", requireGlobalAdmin, route2("POST /admin/accounts/shop-users", async (req, res) => {
     const b = req.body || {};
-    const data = { name: name(b.name), email: email(b.email), username: username(b.username), role: role(b.role) };
+    const data = { name: name(b.name), email: email2(b.email), username: username(b.username), role: role(b.role) };
     const hash = hashCredential(password(b.password)).combined;
     const shopId = deps.shopId(req);
     const localUserId = crypto3.randomUUID();
@@ -2076,7 +2722,7 @@ function buildUserAdminRouter(deps) {
     return body;
   }));
   r.post("/admin/accounts/shop-users/:localUserId/active", requireGlobalAdmin, route2("POST shop-user active", async (req) => {
-    const active = bool(req.body?.active, "active");
+    const active = bool2(req.body?.active, "active");
     const reason = typeof req.body?.reason === "string" && req.body.reason.trim() ? req.body.reason : active ? "Reactivated by Global Administrator" : "Deactivated by Global Administrator";
     const out = await tx(deps, async (c) => {
       const { shopId, identity, profile } = await shopUser(c, req, req.params.localUserId);
@@ -2142,21 +2788,29 @@ function buildUserAdminRouter(deps) {
     return body;
   }));
   r.post("/admin/accounts/shop-users/:localUserId/revoke-sessions", requireGlobalAdmin, route2("POST shop-user revoke", async (req) => {
+    const reason = typeof req.body?.reason === "string" && req.body.reason.trim() ? req.body.reason : "Sessions revoked by Global Administrator";
     const out = await tx(deps, async (c) => {
-      const { shopId, identity } = await shopUser(c, req, req.params.localUserId);
-      if (!identity) throw new HttpError(409, "This staff member has no online login.");
-      await c.query("UPDATE giga_cloud.online_users SET token_version = token_version + 1, updated_at = now() WHERE id = $1", [identity.id]);
-      return { local_user_id: identity.local_user_id, email: identity.email, shopId };
+      const { shopId, identity, profile } = await shopUser(c, req, req.params.localUserId);
+      if (identity) await c.query("UPDATE giga_cloud.online_users SET token_version = token_version + 1, updated_at = now() WHERE id = $1", [identity.id]);
+      const localUserId = req.params.localUserId.toLowerCase();
+      const command = await queue(c, req, shopId, "USER_SESSION_REVOKE", { user_id: localUserId, reason }, { user_name: profile?.name || identity?.name });
+      return { local_user_id: localUserId, email: profile?.email || identity?.email, shopId, online: Boolean(identity), command };
     });
-    await deps.securityEvent(req, "SESSIONS_REVOKED", req.onlineUser.email, req.onlineUser.id, { target_local_user_id: out.local_user_id, target_email: out.email, shop_id: out.shopId });
-    return { local_user_id: out.local_user_id, sessions_revoked: true };
+    await deps.securityEvent(
+      req,
+      "SESSIONS_REVOKED",
+      req.onlineUser.email,
+      req.onlineUser.id,
+      { target_local_user_id: out.local_user_id, target_email: out.email, shop_id: out.shopId, command_id: out.command.command_id }
+    );
+    return { local_user_id: out.local_user_id, sessions_revoked: true, online_sessions_revoked: out.online, shop_sessions: out.command };
   }));
   r.delete("/admin/accounts/shop-users/:localUserId", requireGlobalAdmin, (_req, res) => {
     res.status(409).json({ error: "Shop staff accounts are never deleted (historical records reference them). Deactivate the account instead.", code: "DEACTIVATE_INSTEAD" });
   });
   r.post("/admin/accounts/global-admins", requireGlobalAdmin, route2("POST global-admin", async (req, res) => {
     const b = req.body || {};
-    const data = { name: name(b.name), email: email(b.email) };
+    const data = { name: name(b.name), email: email2(b.email) };
     const hash = hashCredential(password(b.password)).combined;
     const account = await tx(deps, async (c) => {
       if ((await c.query("SELECT 1 FROM giga_cloud.online_users WHERE lower(email) = $1", [data.email])).rows[0]) {
@@ -2179,7 +2833,7 @@ function buildUserAdminRouter(deps) {
     return row;
   }
   r.post("/admin/accounts/global-admins/:id/active", requireGlobalAdmin, route2("POST global-admin active", async (req) => {
-    const active = bool(req.body?.active, "active");
+    const active = bool2(req.body?.active, "active");
     const row = await tx(deps, async (c) => {
       const target = await globalAdmin(c, req.params.id);
       return (await c.query(
@@ -2455,14 +3109,14 @@ function clearRemoteControlCache(shopId) {
   if (shopId === void 0) controlCache.clear();
   else controlCache.delete(String(shopId || ""));
 }
-async function securityEvent(req, action, email2, userId, details = {}) {
+async function securityEvent(req, action, email3, userId, details = {}) {
   try {
     await withCloud((c) => c.query(
       `INSERT INTO giga_cloud.online_audit (shop_id, online_user_id, user_email, action, details, client_ip, user_agent) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
       [
         req.shopId || getOnlineConfig().shopId,
         userId,
-        email2 ? email2.slice(0, 200) : null,
+        email3 ? email3.slice(0, 200) : null,
         action,
         JSON.stringify(details),
         String(req.headers["x-forwarded-for"] || req.ip || "").split(",")[0].trim().slice(0, 100),
@@ -2491,7 +3145,8 @@ function send(res, err, label) {
   }
   const status = typeof err?.status === "number" ? err.status : 500;
   if (status >= 500) console.error(`[Online] ${label} failed:`, err?.message || err);
-  res.status(status).json({ error: status >= 500 && !(err instanceof HttpError) ? "Cloud database error." : err.message });
+  const code = err instanceof HttpError && typeof err.details?.code === "string" ? { code: err.details.code } : {};
+  res.status(status).json({ error: status >= 500 && !(err instanceof HttpError) ? "Cloud database error." : err.message, ...code });
 }
 var route = (label, fn) => async (req, res) => {
   try {
@@ -2507,6 +3162,11 @@ function buildOnlineRouter() {
   r.use(authenticate);
   r.use(resolveShop);
   r.use(maintenanceGate);
+  r.use((req, res, next) => {
+    if (req.method === "GET" || req.method === "HEAD" || !isAllShopsScope(req)) return next();
+    if (req.path.startsWith("/admin/all-shops/") || req.path.startsWith("/admin/accounts/global-admins") || req.path.startsWith("/auth/")) return next();
+    res.status(409).json({ error: "All Shops is a read-only view. Select one shop to change it.", code: "ALL_SHOPS_READ_ONLY" });
+  });
   r.get("/health", async (_req, res) => {
     const cfg = getOnlineConfig();
     const base = { status: "online", system: "GIGA CHEMIST POS API", mode: "online", app_mode: "online", version, timestamp: Date.now(), read_only: true, remote_admin_commands: true };
@@ -2631,6 +3291,7 @@ function buildOnlineRouter() {
   r.use(buildRemoteAdminRouter({
     shopId: requestShop,
     withShop: (req, fn) => withShop(requestShop(req), fn),
+    withShopId: withShop,
     withCloud,
     requireAdmin,
     route,

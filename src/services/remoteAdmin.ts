@@ -20,11 +20,42 @@ export type RemoteAction =
   | 'settings'
   | 'user-active'
   | 'user-role'
-  | 'app-update';
+  | 'app-update'
+  // Full-write Global Admin
+  | 'medicine-create'
+  | 'medicine-active'
+  | 'batch-create'
+  | 'batch-update'
+  | 'batch-active'
+  | 'supplier-create'
+  | 'supplier-update'
+  | 'supplier-active'
+  | 'customer-create'
+  | 'customer-update'
+  | 'customer-active'
+  | 'purchase-create'
+  | 'purchase-update'
+  | 'purchase-receive'
+  | 'purchase-cancel'
+  | 'expense-create'
+  | 'expense-update'
+  | 'expense-void'
+  | 'return-approve'
+  | 'return-reject'
+  | 'sale-void'
+  | 'user-session-revoke';
+
+/** Actions a Global Administrator may apply to ALL shops (one independent command per shop). */
+export const ALL_SHOPS_ACTIONS: RemoteAction[] = ['price-update', 'medicine-update', 'category', 'settings'];
 
 export interface RemoteCommand {
   command_id: string;
   command_type: string;
+  shop_id?: string | null;
+  entity?: string | null;
+  entity_id?: string | null;
+  expected?: Record<string, unknown> | null;
+  high_conflict?: boolean;
   status: CommandStatus;
   payload: Record<string, any>;
   display?: Record<string, any> | null;
@@ -44,9 +75,25 @@ export interface QueuedCommand {
   status: CommandStatus;
   created_at: string;
   duplicate: boolean;
+  shop_id?: string;
+  shop_code?: string | null;
+  shop_name?: string | null;
+  /** The record the command is about (a create command: the id the new record will have). */
+  entity?: string | null;
+  entity_id?: string | null;
+  shop_online?: boolean | null;
+  /** Set when the shop is offline (stronger wording for stock / financial changes). */
+  warning?: string | null;
+}
+
+export interface AllShopsResult {
+  command_type: string;
+  fanout_group: string;
+  results: { shop_id: string; shop_code: string | null; shop_name: string | null; status: 'QUEUED' | 'SKIPPED'; command_id?: string; reason?: string; warning?: string | null }[];
 }
 
 export interface RemoteStatus {
+  shop_id?: string;
   shop_registered: boolean;
   shop_active: boolean;
   shop_code: string | null;
@@ -94,8 +141,53 @@ export function queueRemoteCommand(action: RemoteAction, payload: Record<string,
 
 export const createRequestId = newRequestId;
 
+/**
+ * APPLY TO ALL SHOPS: the server queues one independent command per active shop (a medicine is matched
+ * in each shop by barcode; shops without it are reported SKIPPED). Global Administrator only.
+ */
+export function queueAllShopsCommand(action: RemoteAction, payload: Record<string, unknown>, sourceShopId: string | null, requestId: string = newRequestId()) {
+  return apiFetch<AllShopsResult>(`/api/admin/all-shops/commands/${action}`, {
+    method: 'POST', body: { ...payload, ...(sourceShopId ? { source_shop_id: sourceShopId } : {}), request_id: requestId },
+  });
+}
+
+export interface ShopOverview {
+  shop_id: string;
+  shop_code: string | null;
+  name: string | null;
+  online: boolean | null;
+  last_heartbeat_at: string | null;
+  heartbeat_age_seconds: number | null;
+  db_healthy: boolean | null;
+  sync_healthy: boolean | null;
+  last_sync_at: string | null;
+  app_version: string | null;
+  git_commit: string | null;
+  sales_today: { count: number; total: number };
+  catalogue: { total: number; active: number; inactive: number };
+  stock_units: number;
+  stock_cost_value: number;
+  stock_retail_value: number;
+  low_stock: number;
+  out_of_stock: number;
+  expiring_30d: number;
+  expired_with_stock: number;
+  active_staff: number;
+  pending_commands: number;
+  rejected_commands_7d: number;
+  error: string | null;
+}
+export interface Overview {
+  scope: 'GLOBAL' | 'SHOP';
+  generated_at: string;
+  shops: ShopOverview[];
+  totals: Record<string, number>;
+}
+export const getOverview = () => apiFetch<Overview>('/api/admin/overview');
+
 export const getRemoteCommand = (id: string) => apiFetch<RemoteCommand>(`/api/admin/commands/${encodeURIComponent(id)}`);
-export const listRemoteCommands = (limit = 30) => apiFetch<{ commands: RemoteCommand[] }>(`/api/admin/commands?limit=${limit}`);
+export const listRemoteCommands = (limit = 30, status?: string) =>
+  apiFetch<{ commands: RemoteCommand[] }>(`/api/admin/commands?limit=${limit}${status ? `&status=${encodeURIComponent(status)}` : ''}`);
 export const getRemoteStatus = () => apiFetch<RemoteStatus>('/api/admin/remote-status');
 
 // ---------------------------------------------------------------- server mode (online vs shop)
@@ -129,6 +221,28 @@ export const COMMAND_LABELS: Record<string, string> = {
   APP_UPDATE_APPROVE: 'Software update approval',
   USER_CREATE: 'New staff account',
   USER_CREDENTIAL_REFRESH: 'Staff password reset',
+  MEDICINE_CREATE: 'New medicine',
+  MEDICINE_SET_ACTIVE: 'Medicine on/off',
+  BATCH_CREATE: 'New batch',
+  BATCH_UPDATE: 'Batch details',
+  BATCH_SET_ACTIVE: 'Batch on/off',
+  SUPPLIER_CREATE: 'New supplier',
+  SUPPLIER_UPDATE: 'Supplier details',
+  SUPPLIER_SET_ACTIVE: 'Supplier on/off',
+  CUSTOMER_CREATE: 'New customer',
+  CUSTOMER_UPDATE: 'Customer details',
+  CUSTOMER_SET_ACTIVE: 'Customer on/off',
+  PURCHASE_CREATE: 'New purchase (pending)',
+  PURCHASE_UPDATE_DRAFT: 'Edit pending purchase',
+  PURCHASE_RECEIVE: 'Receive purchase',
+  PURCHASE_CANCEL: 'Cancel purchase',
+  EXPENSE_CREATE: 'New expense',
+  EXPENSE_UPDATE: 'Correct expense',
+  EXPENSE_VOID: 'Void expense',
+  RETURN_APPROVE: 'Approve return',
+  RETURN_REJECT: 'Reject return',
+  SALE_VOID: 'Void sale',
+  USER_SESSION_REVOKE: 'Sign out staff everywhere',
 };
 
 // ---------------------------------------------------------------- health, alerts, insights, security

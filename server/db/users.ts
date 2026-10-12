@@ -137,10 +137,35 @@ export async function getUserById(id: string): Promise<User | null> {
   return res.rows[0] ? toUser(res.rows[0]) : null;
 }
 
-/** Fresh identity for an authenticated request: role and active flag come from the DB, not the token. */
-export async function getActiveUserForSession(id: string): Promise<User | null> {
+let sessionRevocationSupported: boolean | null = null;
+
+/**
+ * Fresh identity for an authenticated request: role and active flag come from the DB, not the token.
+ * A token issued (iat, seconds) before users.sessions_revoked_at (migration 017; set by a remote
+ * USER_SESSION_REVOKE) is refused, so revoking signs the account out of every shop terminal.
+ */
+export async function getActiveUserForSession(id: string, issuedAt?: number): Promise<User | null> {
   const user = await getUserById(id);
-  return user && user.active ? user : null;
+  if (!user || !user.active) return null;
+  if (issuedAt !== undefined && sessionRevocationSupported !== false) {
+    try {
+      const r = await pgPool.query('SELECT EXTRACT(EPOCH FROM sessions_revoked_at)::bigint AS at FROM users WHERE id = $1', [id]);
+      sessionRevocationSupported = true;
+      const at = r.rows[0]?.at;
+      if (at !== null && at !== undefined && Number(issuedAt) < Number(at)) return null;
+    } catch (err: any) {
+      if (err?.code !== '42703') throw err;
+      sessionRevocationSupported = false; // migration 017 not applied yet: no revocation marker exists
+    }
+  }
+  return user;
+}
+
+/** Signs one account out of every shop terminal (tokens issued before now are refused). */
+export async function revokeUserSessionsTx(client: pg.PoolClient, userId: string): Promise<string> {
+  const r = await client.query('UPDATE users SET sessions_revoked_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING sessions_revoked_at', [userId]);
+  if (!r.rows[0]) throw new HttpError(404, 'This user does not exist in the shop.');
+  return new Date(r.rows[0].sessions_revoked_at).toISOString();
 }
 
 // ---------------------------------------------------------------------------

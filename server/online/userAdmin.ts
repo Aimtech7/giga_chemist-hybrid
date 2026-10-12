@@ -259,15 +259,20 @@ export function buildUserAdminRouter(deps: UserAdminDeps) {
     return body;
   }));
 
+  // Signs a staff member out EVERYWHERE: online sessions at once (token_version) and every shop
+  // terminal through a USER_SESSION_REVOKE command (applied by the shop, like any staff change).
   r.post('/admin/accounts/shop-users/:localUserId/revoke-sessions', requireGlobalAdmin, route('POST shop-user revoke', async (req) => {
+    const reason = typeof req.body?.reason === 'string' && req.body.reason.trim() ? req.body.reason : 'Sessions revoked by Global Administrator';
     const out = await tx(deps, async (c) => {
-      const { shopId, identity } = await shopUser(c, req, req.params.localUserId);
-      if (!identity) throw new HttpError(409, 'This staff member has no online login.');
-      await c.query('UPDATE giga_cloud.online_users SET token_version = token_version + 1, updated_at = now() WHERE id = $1', [identity.id]);
-      return { local_user_id: identity.local_user_id, email: identity.email, shopId };
+      const { shopId, identity, profile } = await shopUser(c, req, req.params.localUserId);
+      if (identity) await c.query('UPDATE giga_cloud.online_users SET token_version = token_version + 1, updated_at = now() WHERE id = $1', [identity.id]);
+      const localUserId = req.params.localUserId.toLowerCase();
+      const command = await queue(c, req, shopId, 'USER_SESSION_REVOKE', { user_id: localUserId, reason }, { user_name: profile?.name || identity?.name });
+      return { local_user_id: localUserId, email: profile?.email || identity?.email, shopId, online: Boolean(identity), command };
     });
-    await deps.securityEvent(req, 'SESSIONS_REVOKED', req.onlineUser.email, req.onlineUser.id, { target_local_user_id: out.local_user_id, target_email: out.email, shop_id: out.shopId });
-    return { local_user_id: out.local_user_id, sessions_revoked: true };
+    await deps.securityEvent(req, 'SESSIONS_REVOKED', req.onlineUser.email, req.onlineUser.id,
+      { target_local_user_id: out.local_user_id, target_email: out.email, shop_id: out.shopId, command_id: out.command.command_id });
+    return { local_user_id: out.local_user_id, sessions_revoked: true, online_sessions_revoked: out.online, shop_sessions: out.command };
   }));
 
   // "Remove" a staff member = deactivate: historical sales, audits and movements keep the identity.

@@ -1,29 +1,42 @@
 import type pg from 'pg';
 import { HttpError, isValidUuid, withTransaction } from '../db/client';
 import { recordAuditLog } from '../db/audit';
-import { applyPricingUpdate, updateMedicineDetailsTx, type MedicineActor } from '../db/medicines';
+import { assertExpected, assertExpectedQuantity } from '../db/concurrency';
+import { applyPricingUpdate, createMedicineTx, getMedicineById, updateMedicineDetailsTx, type MedicineActor } from '../db/medicines';
 import { updatePharmacySettingsTx } from '../db/settings';
-import { adminAddStockTx, adminEditBatchExpiryTx, adminPhysicalStockCountTx, adminRemoveStockTx, type StockActor } from '../db/inventory';
+import {
+  adminAddStockTx, adminCreateBatchTx, adminEditBatchExpiryTx, adminPhysicalStockCountTx, adminRemoveStockTx,
+  adminSetBatchActiveTx, adminUpdateBatchTx, type StockActor,
+} from '../db/inventory';
+import { createSupplierTx, setSupplierActiveTx, updateSupplierTx } from '../db/suppliers';
+import { createCustomerTx, setCustomerActiveTx, updateCustomerTx } from '../db/customers';
+import { recordExpenseTx, updateExpenseTx, voidExpenseTx } from '../db/expenses';
+import { cancelPurchaseTx, createDraftPurchaseTx, receiveDraftPurchaseTx, receivePurchaseOrderTx, updateDraftPurchaseTx } from '../db/purchases';
+import { approveReturnTx, rejectReturnTx } from '../db/returns';
+import { voidSaleTx, type SaleActor } from '../db/sales';
 import { enqueueSyncEvent, medicineJson, userJson } from './outbox';
 import { getShopIdentity } from './identity';
 import { COMMAND_TYPES, validateCommandPayload } from './commandSchema';
-import { updateUserTx, unusablePinHash } from '../db/users';
+import { revokeUserSessionsTx, updateUserTx, unusablePinHash } from '../db/users';
 import type { FetchedCredential } from './credentials';
 import { readUpdateState } from '../ops/runtime';
 
 /**
- * Inbound cloud -> shop commands. Conservative by design:
+ * Inbound cloud -> shop commands: the ONE write path of remote (online) administration.
  *   - only the command types below exist; anything else is REJECTED
  *   - every command is validated, then applied in ONE PostgreSQL transaction together with its
  *     sync_inbound_commands row (idempotency) and an audit row
+ *   - handlers call the SAME transactional functions as the shop's own screens (server/db/*Tx):
+ *     no business rule is implemented twice
  *   - stock commands (STOCK_ADD / STOCK_REMOVE / STOCK_SET) are movements or a physical count of
- *     one batch, applied through the SAME functions as the shop's Admin stock screens: rows locked,
- *     batch updated, medicine reconciled, inventory movement + audit + outbox event written in this
- *     transaction. A command never writes current_stock directly, never touches sale_items.
- *   - STOCK_REMOVE can never make a batch negative (rejected instead); STOCK_SET applies the count
- *     against the quantity locked at apply time (the movement delta is computed here)
- *   - price/metadata/settings commands never silently overwrite a local change that has not
- *     reached the cloud yet
+ *     one batch: rows locked, batch updated, medicine reconciled, inventory movement + audit + outbox
+ *     event written in this transaction. A command never writes current_stock directly, never
+ *     touches sale_items, never edits a completed sale.
+ *   - OPTIMISTIC CONCURRENCY: `expected` / `expected_quantity` (what the Administrator saw) are
+ *     compared with the LOCKED row; any difference rejects the command (CONFLICT) instead of
+ *     overwriting newer local activity. A rejection's result carries the shop's current values.
+ *   - without `expected`, price/metadata/settings commands still refuse to overwrite a local change
+ *     that has not reached the cloud yet
  */
 export interface CloudCommand {
   command_id: string;
@@ -42,7 +55,7 @@ export interface CloudCommand {
 }
 
 /** Commands about one staff account (payload.user_id). */
-const USER_COMMANDS = ['USER_SET_ACTIVE', 'USER_ROLE_UPDATE', 'USER_CREATE', 'USER_CREDENTIAL_REFRESH'];
+const USER_COMMANDS = ['USER_SET_ACTIVE', 'USER_ROLE_UPDATE', 'USER_CREATE', 'USER_CREDENTIAL_REFRESH', 'USER_SESSION_REVOKE'];
 export const CREDENTIAL_COMMANDS = ['USER_CREATE', 'USER_CREDENTIAL_REFRESH'];
 
 /** (version, timestamp) ordering shared with the cloud: true when a is strictly newer than b. */
@@ -72,7 +85,7 @@ export interface CommandOutcome {
  * The local actor for a cloud command. user_id null: audit / movement user_id columns reference
  * shop staff, and a remote (online) Admin is not a shop account; the person is recorded by name.
  */
-function cloudActor(cmd: CloudCommand): MedicineActor & StockActor {
+function cloudActor(cmd: CloudCommand): MedicineActor & StockActor & SaleActor {
   const who = typeof cmd.created_by === 'string' && cmd.created_by.trim() ? cmd.created_by.trim().slice(0, 120) : '';
   return {
     user_id: null as unknown as string,
@@ -83,21 +96,27 @@ function cloudActor(cmd: CloudCommand): MedicineActor & StockActor {
   };
 }
 
-/** Business fields only (the optional free-text reason stays in the command / audit record). */
-function fieldsOf(p: Record<string, any>): Record<string, unknown> {
-  const { medicine_id: _m, reason: _r, ...rest } = p;
-  return rest;
+/** Business fields only (ids, reasons and concurrency expectations stay in the command / audit). */
+function fieldsOf(p: Record<string, any>, ...drop: string[]): Record<string, any> {
+  const out: Record<string, any> = {};
+  for (const [k, v] of Object.entries(p)) {
+    if (!['reason', 'expected', 'expected_quantity', 'expected_expiry_date', ...drop].includes(k)) out[k] = v;
+  }
+  return out;
 }
 
 function remoteNote(cmd: CloudCommand, text: string | null): string {
   return `Remote admin ${cloudActor(cmd).user_name}: ${text || 'no reason given'}`.slice(0, 500);
 }
 
-/** A batch named by id must belong to the medicine named in the same command. */
+/** Recorded with every audit row a command writes, so the shop audit trail names the command. */
+const ref = (cmd: CloudCommand, p: Record<string, any> = {}) => ({ command_id: cmd.command_id, ...(p.reason ? { reason: p.reason } : {}) });
+
+/** A batch named by id must belong to the medicine named in the same command. Locks it. */
 async function batchOfMedicine(client: pg.PoolClient, batchId: string, medicineId: string) {
-  const r = await client.query('SELECT id, batch_number FROM medicine_batches WHERE id = $1 AND medicine_id = $2', [batchId, medicineId]);
+  const r = await client.query('SELECT * FROM medicine_batches WHERE id = $1 AND medicine_id = $2 FOR UPDATE', [batchId, medicineId]);
   if (!r.rows[0]) throw new HttpError(404, 'This batch does not exist for this medicine in the shop.');
-  return r.rows[0] as { id: string; batch_number: string };
+  return r.rows[0] as { id: string; batch_number: string; quantity_available: number; expiry_date: string | null };
 }
 
 /** LOCAL UNSYNCED CHANGES are never overwritten silently: refuse while one is still queued. */
@@ -115,45 +134,72 @@ async function assertNoUnsyncedMedicineChange(client: pg.PoolClient, medicineId:
   }
 }
 
-async function lockExistingMedicine(client: pg.PoolClient, medicineId: string) {
+/**
+ * Locks the medicine, then checks concurrency: field expectations when the Administrator sent them
+ * (precise), otherwise the conservative "no unsynced local change" rule.
+ */
+async function lockMedicineForEdit(client: pg.PoolClient, medicineId: string, expected: Record<string, unknown> | undefined) {
   const r = await client.query('SELECT id FROM medicines WHERE id = $1 FOR UPDATE', [medicineId]);
   if (!r.rows[0]) throw new HttpError(404, `Medicine ${medicineId} does not exist in this shop.`);
+  const current = (await getMedicineById(medicineId, client))!;
+  if (expected) assertExpected(current as any, expected, `"${current.name}"`);
+  else await assertNoUnsyncedMedicineChange(client, medicineId);
+  return current;
+}
+
+async function medicineEvent(client: pg.PoolClient, cmd: CloudCommand, type: 'MEDICINE_UPDATED' | 'MEDICINE_PRICE_CHANGED' | 'MEDICINE_CREATED', medicineId: string) {
+  await enqueueSyncEvent(client, {
+    event_type: type, entity_type: 'medicine', entity_id: medicineId, operation: 'CLOUD_COMMAND',
+    data: async () => ({ medicine: await medicineJson(client, medicineId), command_id: cmd.command_id }),
+    actor: cloudActor(cmd),
+  });
 }
 
 type Handler = (client: pg.PoolClient, cmd: CloudCommand) => Promise<Record<string, unknown>>;
 
 const HANDLERS: Record<string, Handler> = {
+  // ---------------------------------------------------------------- medicines / prices
   // Changes the CURRENT price only. sale_items keep their own price snapshot (never rewritten).
   async PRICE_UPDATE(client, cmd) {
     const p = validateCommandPayload('PRICE_UPDATE', cmd.payload);
-    const medicineId = p.medicine_id;
-    const fields = fieldsOf(p);
-    const actor = cloudActor(cmd);
-    await lockExistingMedicine(client, medicineId);
-    await assertNoUnsyncedMedicineChange(client, medicineId);
-    const saved = await applyPricingUpdate(client, medicineId, fields as any, actor);
-    await enqueueSyncEvent(client, {
-      event_type: 'MEDICINE_PRICE_CHANGED', entity_type: 'medicine', entity_id: medicineId, operation: 'CLOUD_COMMAND',
-      data: async () => ({ medicine: await medicineJson(client, medicineId), command_id: cmd.command_id }),
-      actor,
-    });
-    return { medicine_id: medicineId, selling_price: saved.selling_price, wholesale_price: saved.wholesale_price, min_selling_price: saved.min_selling_price };
+    const before = await lockMedicineForEdit(client, p.medicine_id, p.expected);
+    const saved = await applyPricingUpdate(client, p.medicine_id, fieldsOf(p, 'medicine_id') as any, cloudActor(cmd));
+    await medicineEvent(client, cmd, 'MEDICINE_PRICE_CHANGED', p.medicine_id);
+    return {
+      medicine_id: p.medicine_id, selling_price: saved.selling_price, wholesale_price: saved.wholesale_price, min_selling_price: saved.min_selling_price,
+      purchase_price: saved.purchase_price,
+      previous: { selling_price: before.selling_price, wholesale_price: before.wholesale_price, min_selling_price: before.min_selling_price, purchase_price: before.purchase_price },
+    };
   },
 
   async MEDICINE_METADATA_UPDATE(client, cmd) {
     const p = validateCommandPayload('MEDICINE_METADATA_UPDATE', cmd.payload);
-    const medicineId = p.medicine_id;
-    const fields = fieldsOf(p);
-    const actor = cloudActor(cmd);
-    await lockExistingMedicine(client, medicineId);
-    await assertNoUnsyncedMedicineChange(client, medicineId);
-    const saved = await updateMedicineDetailsTx(client, medicineId, fields as any, actor);
-    await enqueueSyncEvent(client, {
-      event_type: 'MEDICINE_UPDATED', entity_type: 'medicine', entity_id: medicineId, operation: 'CLOUD_COMMAND',
-      data: async () => ({ medicine: await medicineJson(client, medicineId), command_id: cmd.command_id }),
-      actor,
-    });
-    return { medicine_id: medicineId, name: saved.name, category: saved.category };
+    await lockMedicineForEdit(client, p.medicine_id, p.expected);
+    const saved = await updateMedicineDetailsTx(client, p.medicine_id, fieldsOf(p, 'medicine_id') as any, cloudActor(cmd));
+    await medicineEvent(client, cmd, 'MEDICINE_UPDATED', p.medicine_id);
+    return { medicine_id: p.medicine_id, name: saved.name, category: saved.category, status: saved.status };
+  },
+
+  // New catalogue item (stock 0). Its id was chosen by the online API, so a re-delivery is a duplicate.
+  async MEDICINE_CREATE(client, cmd) {
+    const p = validateCommandPayload('MEDICINE_CREATE', cmd.payload);
+    const saved = await createMedicineTx(client, p.medicine_id, fieldsOf(p, 'medicine_id') as any, cloudActor(cmd));
+    await medicineEvent(client, cmd, 'MEDICINE_CREATED', p.medicine_id);
+    return { medicine_id: saved.id, name: saved.name, sku: saved.sku, barcode: saved.barcode, selling_price: saved.selling_price, created: true };
+  },
+
+  // "Remove" a medicine = inactive. History (sales, movements, batches) is never deleted.
+  async MEDICINE_SET_ACTIVE(client, cmd) {
+    const p = validateCommandPayload('MEDICINE_SET_ACTIVE', cmd.payload);
+    // Status is set explicitly (idempotent), so no unsynced-change refusal: an empty expectation.
+    const before = await lockMedicineForEdit(client, p.medicine_id, {});
+    const saved = await updateMedicineDetailsTx(client, p.medicine_id, { status: p.active ? 'active' : 'inactive' } as any, cloudActor(cmd));
+    await recordAuditLog({
+      ...cloudActor(cmd), action: p.active ? 'REMOTE_MEDICINE_ACTIVATED' : 'REMOTE_MEDICINE_DEACTIVATED', entity: 'medicine', entity_id: p.medicine_id,
+      previous_value: { status: before.status }, new_value: { status: saved.status, ...ref(cmd, p) },
+    } as any, client);
+    await medicineEvent(client, cmd, 'MEDICINE_UPDATED', p.medicine_id);
+    return { medicine_id: p.medicine_id, name: saved.name, previous_status: before.status, status: saved.status };
   },
 
   async CATEGORY_UPSERT(client, cmd) {
@@ -182,6 +228,7 @@ const HANDLERS: Record<string, Handler> = {
   async STOCK_ADD(client, cmd) {
     const p = validateCommandPayload('STOCK_ADD', cmd.payload);
     const batch = p.batch_id ? await batchOfMedicine(client, p.batch_id, p.medicine_id) : null;
+    if (batch) assertExpectedQuantity(Number(batch.quantity_available), p.expected_quantity, `batch ${batch.batch_number}`);
     const out = await adminAddStockTx(client, {
       ...cloudActor(cmd),
       medicine_id: p.medicine_id,
@@ -200,7 +247,8 @@ const HANDLERS: Record<string, Handler> = {
   // Movement: -quantity; REJECTED when the batch holds less than that at apply time (never negative).
   async STOCK_REMOVE(client, cmd) {
     const p = validateCommandPayload('STOCK_REMOVE', cmd.payload);
-    await batchOfMedicine(client, p.batch_id, p.medicine_id);
+    const batch = await batchOfMedicine(client, p.batch_id, p.medicine_id);
+    assertExpectedQuantity(Number(batch.quantity_available), p.expected_quantity, `batch ${batch.batch_number}`);
     const out = await adminRemoveStockTx(client, {
       ...cloudActor(cmd),
       medicine_id: p.medicine_id,
@@ -216,11 +264,23 @@ const HANDLERS: Record<string, Handler> = {
     };
   },
 
-  // Physical count of one batch: the counted quantity replaces the quantity LOCKED NOW (sales made
-  // while the command was pending are included); the movement records the actual delta.
+  // Physical count of one batch. expected_quantity is MANDATORY: when the batch quantity locked now
+  // differs from what the Administrator saw (a sale happened meanwhile) the count is REJECTED, so a
+  // stale count can never erase a cashier's movement.
   async STOCK_SET(client, cmd) {
     const p = validateCommandPayload('STOCK_SET', cmd.payload);
-    if (p.batch_id) await batchOfMedicine(client, p.batch_id, p.medicine_id);
+    let current = 0;
+    let label = `batch ${p.batch_number || ''}`.trim();
+    if (p.batch_id) {
+      const b = await batchOfMedicine(client, p.batch_id, p.medicine_id);
+      current = Number(b.quantity_available);
+      label = `batch ${b.batch_number}`;
+    } else {
+      const b = (await client.query('SELECT quantity_available FROM medicine_batches WHERE medicine_id = $1 AND UPPER(batch_number) = $2 FOR UPDATE',
+        [p.medicine_id, p.batch_number])).rows[0];
+      current = b ? Number(b.quantity_available) : 0;
+    }
+    assertExpectedQuantity(current, p.expected_quantity, label);
     const out = await adminPhysicalStockCountTx(client, {
       ...cloudActor(cmd),
       medicine_id: p.medicine_id,
@@ -237,12 +297,140 @@ const HANDLERS: Record<string, Handler> = {
 
   async BATCH_EXPIRY_UPDATE(client, cmd) {
     const p = validateCommandPayload('BATCH_EXPIRY_UPDATE', cmd.payload);
-    await batchOfMedicine(client, p.batch_id, p.medicine_id);
+    const batch = await batchOfMedicine(client, p.batch_id, p.medicine_id);
+    if ('expected_expiry_date' in p) assertExpected({ expiry_date: batch.expiry_date }, { expiry_date: p.expected_expiry_date }, `batch ${batch.batch_number}`);
     const out = await adminEditBatchExpiryTx(client, { ...cloudActor(cmd), batch_id: p.batch_id, expiry_date: p.expiry_date });
     return {
       medicine_id: p.medicine_id, batch_id: p.batch_id, batch_number: out.batch.batch_number,
       expiry_date: out.batch.expiry_date || null, batch_status: out.batch.status, current_stock: out.medicine.current_stock,
     };
+  },
+
+  // ---------------------------------------------------------------- batches
+  async BATCH_CREATE(client, cmd) {
+    const p = validateCommandPayload('BATCH_CREATE', cmd.payload);
+    const out = await adminCreateBatchTx(client, { ...cloudActor(cmd), ...fieldsOf(p) as any, notes: remoteNote(cmd, p.reason || 'new batch') });
+    return {
+      medicine_id: p.medicine_id, batch_id: out.batch.id, batch_number: out.batch.batch_number, quantity: out.batch.quantity_available,
+      expiry_date: out.batch.expiry_date || null, current_stock: out.medicine.current_stock, movement_id: out.movement?.id ?? null,
+    };
+  },
+
+  async BATCH_UPDATE(client, cmd) {
+    const p = validateCommandPayload('BATCH_UPDATE', cmd.payload);
+    const out = await adminUpdateBatchTx(client, { ...cloudActor(cmd), ...fieldsOf(p) as any },
+      (current) => assertExpected(current, p.expected, 'this batch'));
+    return { medicine_id: p.medicine_id, batch_id: p.batch_id, batch_number: out.batch.batch_number, supplier_id: out.batch.supplier_id || null,
+      purchase_price: out.batch.purchase_price, selling_price_override: out.batch.selling_price_override ?? null };
+  },
+
+  // Out of sale = status 'recalled' (quantity kept, not sellable, not counted in stock).
+  async BATCH_SET_ACTIVE(client, cmd) {
+    const p = validateCommandPayload('BATCH_SET_ACTIVE', cmd.payload);
+    const out = await adminSetBatchActiveTx(client, { ...cloudActor(cmd), medicine_id: p.medicine_id, batch_id: p.batch_id, active: p.active, reason: p.reason });
+    return { medicine_id: p.medicine_id, batch_id: p.batch_id, batch_number: out.batch.batch_number, batch_status: out.batch.status, current_stock: out.medicine.current_stock };
+  },
+
+  // ---------------------------------------------------------------- suppliers / customers
+  async SUPPLIER_CREATE(client, cmd) {
+    const p = validateCommandPayload('SUPPLIER_CREATE', cmd.payload);
+    const s = await createSupplierTx(client, p.supplier_id, fieldsOf(p, 'supplier_id'), cloudActor(cmd), ref(cmd));
+    return { supplier_id: s.id, name: s.name, status: s.status, created: true };
+  },
+  async SUPPLIER_UPDATE(client, cmd) {
+    const p = validateCommandPayload('SUPPLIER_UPDATE', cmd.payload);
+    const s = await updateSupplierTx(client, p.supplier_id, fieldsOf(p, 'supplier_id'), cloudActor(cmd), { partial: true, expected: p.expected, extra: ref(cmd, p) });
+    return { supplier_id: s.id, name: s.name, status: s.status };
+  },
+  async SUPPLIER_SET_ACTIVE(client, cmd) {
+    const p = validateCommandPayload('SUPPLIER_SET_ACTIVE', cmd.payload);
+    const s = await setSupplierActiveTx(client, p.supplier_id, p.active, p.reason, cloudActor(cmd), ref(cmd));
+    return { supplier_id: s.id, name: s.name, status: s.status };
+  },
+  async CUSTOMER_CREATE(client, cmd) {
+    const p = validateCommandPayload('CUSTOMER_CREATE', cmd.payload);
+    const c = await createCustomerTx(client, p.customer_id, fieldsOf(p, 'customer_id'), cloudActor(cmd), ref(cmd));
+    return { customer_id: c.id, name: c.name, created: true };
+  },
+  async CUSTOMER_UPDATE(client, cmd) {
+    const p = validateCommandPayload('CUSTOMER_UPDATE', cmd.payload);
+    const c = await updateCustomerTx(client, p.customer_id, fieldsOf(p, 'customer_id'), cloudActor(cmd), { partial: true, expected: p.expected, extra: ref(cmd, p) });
+    return { customer_id: c.id, name: c.name };
+  },
+  async CUSTOMER_SET_ACTIVE(client, cmd) {
+    const p = validateCommandPayload('CUSTOMER_SET_ACTIVE', cmd.payload);
+    const c = await setCustomerActiveTx(client, p.customer_id, p.active, p.reason, cloudActor(cmd), ref(cmd));
+    return { customer_id: c.id, name: c.name, active: c.active };
+  },
+
+  // ---------------------------------------------------------------- purchases
+  async PURCHASE_CREATE(client, cmd) {
+    const p = validateCommandPayload('PURCHASE_CREATE', cmd.payload);
+    const pur = await createDraftPurchaseTx(client, p.purchase_id, fieldsOf(p, 'purchase_id') as any, cloudActor(cmd), ref(cmd));
+    return { purchase_id: pur.id, order_number: pur.order_number, status: pur.status, total_amount: pur.total_amount, lines: pur.items.length };
+  },
+  async PURCHASE_UPDATE_DRAFT(client, cmd) {
+    const p = validateCommandPayload('PURCHASE_UPDATE_DRAFT', cmd.payload);
+    const pur = await updateDraftPurchaseTx(client, p.purchase_id, fieldsOf(p, 'purchase_id') as any, cloudActor(cmd), ref(cmd));
+    return { purchase_id: pur.id, order_number: pur.order_number, status: pur.status, total_amount: pur.total_amount, lines: pur.items.length };
+  },
+  // Stock in, batches, movements, purchase state and audit: one transaction (this one).
+  async PURCHASE_RECEIVE(client, cmd) {
+    const p = validateCommandPayload('PURCHASE_RECEIVE', cmd.payload);
+    const actor = cloudActor(cmd);
+    let out;
+    if (p.items) {
+      const exists = await client.query('SELECT status FROM purchases WHERE id = $1', [p.purchase_id]);
+      if (exists.rows[0]) throw new HttpError(409, `This purchase already exists (status ${exists.rows[0].status}); receive it without items.`);
+      out = await receivePurchaseOrderTx(client, p.purchase_id, fieldsOf(p, 'purchase_id') as any, actor, ref(cmd));
+    } else {
+      out = await receiveDraftPurchaseTx(client, p.purchase_id, { invoice_number: p.invoice_number, payment_status: p.payment_status }, actor, ref(cmd));
+    }
+    return {
+      purchase_id: out.purchase.id, order_number: out.purchase.order_number, status: out.purchase.status, invoice_number: out.purchase.invoice_number,
+      total_amount: out.purchase.total_amount, medicines: out.medicines.map((m: any) => ({ id: m.id, current_stock: m.current_stock })),
+    };
+  },
+  async PURCHASE_CANCEL(client, cmd) {
+    const p = validateCommandPayload('PURCHASE_CANCEL', cmd.payload);
+    const pur = await cancelPurchaseTx(client, p.purchase_id, p.reason, cloudActor(cmd), ref(cmd));
+    return { purchase_id: pur.id, order_number: pur.order_number, status: pur.status };
+  },
+
+  // ---------------------------------------------------------------- expenses (never deleted)
+  async EXPENSE_CREATE(client, cmd) {
+    const p = validateCommandPayload('EXPENSE_CREATE', cmd.payload);
+    const e = await recordExpenseTx(client, p.expense_id, fieldsOf(p, 'expense_id') as any, cloudActor(cmd), ref(cmd));
+    return { expense_id: e.id, amount: e.amount, category: e.category, date: e.date, status: e.status };
+  },
+  async EXPENSE_UPDATE(client, cmd) {
+    const p = validateCommandPayload('EXPENSE_UPDATE', cmd.payload);
+    const e = await updateExpenseTx(client, p.expense_id, fieldsOf(p, 'expense_id') as any, cloudActor(cmd), { expected: p.expected, extra: ref(cmd, p) });
+    return { expense_id: e.id, amount: e.amount, category: e.category, date: e.date, status: e.status };
+  },
+  async EXPENSE_VOID(client, cmd) {
+    const p = validateCommandPayload('EXPENSE_VOID', cmd.payload);
+    const e = await voidExpenseTx(client, p.expense_id, p.reason, cloudActor(cmd), ref(cmd));
+    return { expense_id: e.id, amount: e.amount, status: e.status };
+  },
+
+  // ---------------------------------------------------------------- returns / sales (history kept)
+  // Only an approved return affects stock, refunds and reports (same workflow as the shop).
+  async RETURN_APPROVE(client, cmd) {
+    const p = validateCommandPayload('RETURN_APPROVE', cmd.payload);
+    const out = await approveReturnTx(client, p.return_id, { restock: p.restock, disposition: p.restock ? 'return_to_stock' : p.disposition, notes: p.notes ?? null }, cloudActor(cmd));
+    return { return_id: p.return_id, status: 'APPROVED', refund_amount: out.refund_amount, restocked: p.restock, current_stock: out.medicine.current_stock };
+  },
+  async RETURN_REJECT(client, cmd) {
+    const p = validateCommandPayload('RETURN_REJECT', cmd.payload);
+    await rejectReturnTx(client, p.return_id, p.reason, cloudActor(cmd));
+    return { return_id: p.return_id, status: 'REJECTED' };
+  },
+  // A completed sale is never edited: a void reverses its stock and marks it voided, audited.
+  async SALE_VOID(client, cmd) {
+    const p = validateCommandPayload('SALE_VOID', cmd.payload);
+    const out = await voidSaleTx(client, p.sale_id, p.reason, cloudActor(cmd));
+    return { sale_id: p.sale_id, receipt_number: out.sale.receipt_number, status: out.sale.status, batches_restocked: out.batches.length };
   },
 
   // ---------------------------------------------------------------- shop staff (no credentials)
@@ -268,6 +456,18 @@ const HANDLERS: Record<string, Handler> = {
       previous_value: { role: before.role }, new_value: { role: saved.role, reason: p.reason, command_id: cmd.command_id },
     } as any, client);
     return { user_id: p.user_id, name: saved.name, previous_role: before.role, role: saved.role };
+  },
+
+  // Signs the account out of every shop terminal (its tokens issued before now are refused).
+  async USER_SESSION_REVOKE(client, cmd) {
+    const p = validateCommandPayload('USER_SESSION_REVOKE', cmd.payload);
+    const before = await lockUser(client, p.user_id);
+    const at = await revokeUserSessionsTx(client, p.user_id);
+    await recordAuditLog({
+      ...cloudActor(cmd), action: 'REMOTE_USER_SESSIONS_REVOKED', entity: 'user', entity_id: p.user_id,
+      new_value: { name: before.name, revoked_at: at, reason: p.reason, command_id: cmd.command_id },
+    } as any, client);
+    return { user_id: p.user_id, name: before.name, sessions_revoked_at: at };
   },
 
   // A staff account created by an online Global Administrator. The password HASH comes from the
@@ -368,6 +568,16 @@ if (SUPPORTED_COMMANDS.length !== COMMAND_TYPES.length || !COMMAND_TYPES.every((
   throw new Error('Cloud command handlers are out of step with COMMAND_TYPES.');
 }
 
+/** Keys whose VALUES must never be stored (a malformed / hostile command may carry them; it is rejected anyway). */
+const SECRET_KEY = /^(password|password_hash|pin|pin_hash|token|jwt|jwt_secret|sync_shop_token|secret|api_key|credential|hash)$/i;
+
+/** Copy of a payload safe to store in sync_inbound_commands and the audit trail: secret-named values redacted. */
+export function redactSecrets(v: unknown, depth = 0): unknown {
+  if (depth > 8 || v === null || typeof v !== 'object') return v;
+  if (Array.isArray(v)) return v.map((x) => redactSecrets(x, depth + 1));
+  return Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([k, x]) => [k, SECRET_KEY.test(k) ? '[REDACTED]' : redactSecrets(x, depth + 1)]));
+}
+
 /** Deterministic database refusals (invalid data, constraint) are a rejection, not a retry. */
 function isDataError(err: any): boolean {
   return typeof err?.code === 'string' && /^(22|23)/.test(err.code);
@@ -375,8 +585,8 @@ function isDataError(err: any): boolean {
 
 /**
  * Validates and applies one command exactly once. Business validation failures become REJECTED
- * (recorded, acknowledged, audited). Infrastructure errors (database down) propagate so the
- * command is retried on the next cycle.
+ * (recorded, acknowledged, audited; a CONFLICT carries the shop's current values in `result`).
+ * Infrastructure errors (database down) propagate so the command is retried on the next cycle.
  */
 export async function applyCloudCommand(cmd: CloudCommand): Promise<CommandOutcome> {
   if (!cmd || typeof cmd.command_id !== 'string' || !isValidUuid(cmd.command_id)) {
@@ -416,6 +626,7 @@ export async function applyCloudCommand(cmd: CloudCommand): Promise<CommandOutco
       error = err instanceof HttpError
         ? err.message.slice(0, 2000)
         : `The shop database refused this change as invalid data (code ${err.code}).`;
+      result = err instanceof HttpError && err.details ? { rejected: true, ...err.details } : null;
     }
 
     // A refused staff command left the cloud's immediate value (active / role / password) ahead of
@@ -433,7 +644,7 @@ export async function applyCloudCommand(cmd: CloudCommand): Promise<CommandOutco
       `INSERT INTO sync_inbound_commands (command_id, idempotency_key, shop_id, command_type, payload, status, result, error, applied_at)
        VALUES ($1, $2, $3, $4, $5, $6::text, $7, $8, CASE WHEN $6::text = 'APPLIED' THEN CURRENT_TIMESTAMP END)`,
       [cmd.command_id, key, isValidUuid(cmd.shop_id) ? cmd.shop_id : identity.shop_id, String(cmd.command_type).slice(0, 60),
-       JSON.stringify(cmd.payload ?? null), status, result ? JSON.stringify(result) : null, error]
+       JSON.stringify(redactSecrets(cmd.payload ?? null)), status, result ? JSON.stringify(result) : null, error]
     );
     await recordAuditLog(
       {
@@ -444,10 +655,11 @@ export async function applyCloudCommand(cmd: CloudCommand): Promise<CommandOutco
         action: status === 'APPLIED' ? 'CLOUD_COMMAND_APPLIED' : 'CLOUD_COMMAND_REJECTED',
         entity: 'cloud_command',
         entity_id: cmd.command_id,
-        new_value: { command_type: cmd.command_type, payload: cmd.payload ?? null, created_by: cmd.created_by ?? null, result, error },
+        new_value: { command_type: cmd.command_type, payload: redactSecrets(cmd.payload ?? null), created_by: cmd.created_by ?? null, result, error },
       },
       client
     );
     return { command_id: cmd.command_id, status, result, error, duplicate: false };
   });
 }
+

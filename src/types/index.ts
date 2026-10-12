@@ -295,6 +295,7 @@ export interface Purchase {
   total_amount: number;
   payment_status: 'paid' | 'partial' | 'unpaid';
   notes?: string;
+  cancel_reason?: string;
   created_by: string;
   created_at: string;
   sync_status: SyncStatus;
@@ -381,6 +382,8 @@ export interface Customer {
   credit_balance: number;
   total_spent: number;
   last_visit?: string;
+  /** false = deactivated (kept for sale history; not offered for new sales). */
+  active?: boolean;
   created_at: string;
 }
 
@@ -395,6 +398,10 @@ export interface Expense {
   date: string;
   user_id: string;
   user_name: string;
+  /** posted = counts in reports; voided = kept for audit, excluded from reports. */
+  status?: 'posted' | 'voided';
+  void_reason?: string;
+  voided_at?: string;
   created_at: string;
   sync_status: SyncStatus;
 }
