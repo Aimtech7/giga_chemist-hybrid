@@ -16,7 +16,7 @@
     "db:check": "tsx scripts/check-db.ts",
     "db:seed": "tsx scripts/seed-dev.ts",
     "create-admin": "tsx scripts/create-admin.ts",
-    "lint": "tsc --noEmit",
+    "lint": "node scripts/lint-tracked.mjs",
     "postinstall": "node scripts/setup-shims.cjs",
     "package:validate": "node scripts/validate-package.js",
     "migrate:analyze": "tsx scripts/migrate-chemist-pos/analyze-legacy.ts",
