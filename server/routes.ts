@@ -77,6 +77,8 @@ import { createDraftPurchaseTx } from './db/purchases';
 import { getPriceHistory } from './db/priceHistory';
 import { acknowledgeLocalAlert, listLocalAlerts } from './ops/alerts';
 import { classifyConflict } from './sync/conflicts';
+import { businessDaySummary } from './db/businessDay';
+import { integrityReport } from './db/integrity';
 import { approveStocktake, cancelStocktake, countLine, createStocktake, getStocktake, listStocktakes, reopenStocktake, startCounting, submitStocktake } from './db/stocktakes';
 import { buildShiftRouter } from './http/shiftRoutes';
 import { openShift, getCurrentShift, closeShift, reviewShift, correctShift, listOpenTills } from './db/shifts';
@@ -679,6 +681,22 @@ apiRouter.post('/purchases/drafts', requireRole('ADMIN'), async (req: Authentica
     res.status(201).json({ success: true, purchase });
   } catch (err: any) {
     sendError(res, err, 'Could not create the purchase draft.', 'POST /purchases/drafts');
+  }
+});
+
+// --- 6d. BUSINESS DAY SUMMARY (read only) + DATA INTEGRITY DASHBOARD (read only, Administrator) ---
+apiRouter.get('/business-day', requirePermission('reports.view'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    res.json(await withLocalScope(req, (s) => businessDaySummary(s, req.query as any)));
+  } catch (err: any) {
+    sendError(res, err, 'Could not load the business day summary.', 'GET /business-day');
+  }
+});
+apiRouter.get('/integrity', requirePermission('integrity.view'), async (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    res.json(await integrityReport());
+  } catch (err: any) {
+    sendError(res, err, 'Could not run the integrity checks.', 'GET /integrity');
   }
 });
 

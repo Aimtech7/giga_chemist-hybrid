@@ -121,7 +121,7 @@ export function canAccessModule(user: User | null | undefined, module: string): 
   if (user.role === 'ADMIN') return true;
 
   if (user.role === 'MANAGER') {
-    const forbiddenForManager = ['users', 'audit', 'settings', 'stocktake', 'remote', 'sync'];
+    const forbiddenForManager = ['users', 'audit', 'settings', 'stocktake', 'remote', 'sync', 'integrity'];
     return !forbiddenForManager.includes(module);
   }
 

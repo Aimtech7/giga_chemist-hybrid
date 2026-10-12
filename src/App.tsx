@@ -19,6 +19,8 @@ import { StocktakeSessions } from './components/stocktake/StocktakeSessions';
 import { InventoryInsights } from './components/inventory/InventoryInsights';
 import { AlertsCenter } from './components/alerts/AlertsCenter';
 import { SyncCenter } from './components/sync/SyncCenter';
+import { BusinessDayView } from './components/reports/BusinessDayView';
+import { IntegrityDashboard } from './components/settings/IntegrityDashboard';
 import { BatchList } from './components/inventory/BatchList';
 import { ExpiryManager } from './components/expiry/ExpiryManager';
 import { PurchaseList } from './components/purchases/PurchaseList';
@@ -40,7 +42,7 @@ import type { PharmacySettings, User } from './types';
 
 // '#app' (or any unknown hash) is not a module and must never become the current one (blank screen).
 const KNOWN_MODULES: AppModule[] = [
-  'dashboard', 'pos', 'medicines', 'inventory', 'stocktake', 'stocktakes', 'insights', 'alerts', 'sync', 'batches', 'expiry', 'purchases', 'suppliers',
+  'dashboard', 'pos', 'medicines', 'inventory', 'stocktake', 'stocktakes', 'insights', 'alerts', 'sync', 'businessday', 'integrity', 'batches', 'expiry', 'purchases', 'suppliers',
   'customers', 'expenses', 'sales', 'returns', 'reports', 'users', 'audit', 'settings', 'remote', 'history',
 ];
 
@@ -366,6 +368,10 @@ export default function App() {
       {currentModule === 'sync' && canAccessModule(currentUser, 'sync') && (
         <SyncCenter online={serverMode === 'online'} />
       )}
+
+      {/* BUSINESS DAY SUMMARY (read only) + DATA INTEGRITY (shop computer, Administrator) */}
+      {currentModule === 'businessday' && canAccessModule(currentUser, 'businessday') && <BusinessDayView settings={settings} />}
+      {currentModule === 'integrity' && canAccessModule(currentUser, 'integrity') && <IntegrityDashboard />}
 
       {/* BATCHES - Restricted to Admin/Manager */}
       {currentModule === 'batches' && canAccessModule(currentUser, 'batches') && (

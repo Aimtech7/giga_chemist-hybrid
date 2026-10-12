@@ -21,6 +21,7 @@ import { buildRemoteAdminRouter, isAllShopsScope } from './remoteAdmin';
 import { buildUserAdminRouter } from './userAdmin';
 import { buildHistoryRouter } from '../http/historyRoutes';
 import { buildInventoryRouter } from '../http/inventoryRoutes';
+import { businessDaySummary } from '../db/businessDay';
 import { buildShiftRouter } from '../http/shiftRoutes';
 import type { HistoryScope } from '../db/history';
 import type { UserRole } from '../../src/types';
@@ -565,6 +566,14 @@ export function buildOnlineRouter() {
     send: (res, err, label) => send(res, err, label),
   }));
 
+  // Business day summary (read only) over the authorized shop(s).
+  r.get('/business-day', requirePermission('reports.view'), async (req, res) => {
+    try {
+      res.json(await withCloudScope(req, (s) => businessDaySummary(s, req.query as any)));
+    } catch (err) {
+      send(res, err, 'GET /business-day');
+    }
+  });
   // Inventory intelligence (reorder / movement classes / expiry risk) over the authorized shop(s).
   r.use(buildInventoryRouter({ canView: requirePermission('inventory.view'), withScope: withCloudScope, send: (res, err, label) => send(res, err, label) }));
 
