@@ -1,5 +1,7 @@
 import 'dotenv/config';
 import crypto from 'crypto';
+import os from 'os';
+import path from 'path';
 import { spawn, type ChildProcess } from 'child_process';
 import pg from 'pg';
 import { getDatabaseConnectionConfig } from '../../server/db/client';
@@ -93,7 +95,11 @@ export async function startServer(): Promise<void> {
   serverLog = '';
   server = spawn(process.execPath, ['--import', 'tsx', 'server.ts'], {
     // Higher login rate limit for this private test server only (the suite logs in many times).
-    env: { ...process.env, ...modeEnv(), ...serverEnv, PORT: String(PORT), AUTH_RATE_LIMIT_PER_MINUTE: '1000' },
+    // Backups of a test server never go to the real BACKUP_DIR and the daily scheduler is off (a suite
+    // running at the scheduled time used to start a dev-database dump in the real backup folder).
+    // A suite can still override both through setServerEnv (ops suite).
+    env: { ...process.env, ...modeEnv(), BACKUP_ENABLED: 'false', BACKUP_DIR: path.join(os.tmpdir(), 'giga-itest-backups'),
+      ...serverEnv, PORT: String(PORT), AUTH_RATE_LIMIT_PER_MINUTE: '1000' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const stream = Boolean(process.env.ITEST_STREAM_SERVER_LOG);

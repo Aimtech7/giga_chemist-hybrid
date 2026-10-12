@@ -6,6 +6,7 @@ import { applyCloudCommand, CREDENTIAL_COMMANDS, type CloudCommand } from './com
 import { fetchCommandCredential, pushUserCredentials } from './credentials';
 import { getShopIdentity, reconcileShopIdentity } from './identity';
 import { collectRuntimeStatus } from './heartbeat';
+import { recordAuditLog } from '../db/audit';
 
 /**
  * Background sync worker on the LOCAL server.
@@ -305,6 +306,8 @@ class SyncWorker {
             [r.id, `Rejected by cloud: ${String(res.error || 'invalid event').slice(0, 1000)}`]
           );
           console.error(`[Sync] Event ${r.event_type} ${r.id} rejected by cloud: ${res.error}`);
+          await recordAuditLog({ action: 'SYNC_EVENT_REJECTED', entity: 'sync_event', entity_id: String(r.id), user_name: 'System (sync)',
+            new_value: { event_type: r.event_type, error: String(res.error || 'invalid event').slice(0, 300) } } as any).catch(() => {});
         } else missing.push(r.id);
       }
       if (synced.length) {
@@ -421,6 +424,10 @@ class SyncWorker {
     if (unreachable) this.cloudReachable = false;
     else this.cloudReachable = true;
     this.consecutiveFailures++;
+    if (this.consecutiveFailures === 5) {
+      await recordAuditLog({ action: 'SYNC_FAILURE', entity: 'sync', entity_id: 'worker', user_name: 'System (sync)',
+        new_value: { consecutive_failures: 5, error: message.slice(0, 300), unreachable } } as any).catch(() => {});
+    }
     if (this.consecutiveFailures === 1 || this.consecutiveFailures % 10 === 0) {
       console.warn(`[Sync] ${message} (failure #${this.consecutiveFailures}; events stay queued locally)`);
     }
@@ -432,6 +439,10 @@ class SyncWorker {
     const wasDown = this.cloudReachable !== true;
     this.cloudReachable = true;
     if (this.consecutiveFailures > 0) console.log('[Sync] Cloud connection restored.');
+    if (this.consecutiveFailures >= 5) {
+      await recordAuditLog({ action: 'SYNC_RESTORED', entity: 'sync', entity_id: 'worker', user_name: 'System (sync)',
+        new_value: { after_failures: this.consecutiveFailures } } as any).catch(() => {});
+    }
     this.consecutiveFailures = 0;
     await this.saveState({ last_contact_at: new Date().toISOString() });
     return wasDown ? 'reconnected' : 'ok';

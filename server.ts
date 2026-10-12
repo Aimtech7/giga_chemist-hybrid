@@ -12,6 +12,7 @@ import { startSyncWorker, syncWorker } from './server/sync/worker';
 import { getSyncConfig } from './server/sync/config';
 import { startEmailWorker, emailWorker } from './server/email/service';
 import { startBackupScheduler } from './server/ops/backup';
+import { auditLastUpdateOnce } from './server/ops/updateAudit';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -91,6 +92,7 @@ async function startServer() {
     startSyncWorker();
     startEmailWorker();
     startBackupScheduler();
+    void auditLastUpdateOnce();
   });
 
   const shutdown = async (signal: string) => {

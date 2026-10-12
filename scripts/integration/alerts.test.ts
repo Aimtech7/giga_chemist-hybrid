@@ -83,5 +83,17 @@ export async function alertsTests(env: HybridEnv, admin: Fixture, manager: Fixtu
   r = await get(A);
   check(!r.data.alerts.some((a: any) => a.alert_key === `SHIFT_LEFT_OPEN:${yesterdayShift}`), 'AL9: closing the shift resolves the alert');
   check((await api('GET', '/api/alerts', null)).status === 401, 'AL10: anonymous -> 401');
+
+  section('AUDIT TRAIL COVERAGE');
+  const bk = await api('POST', '/api/backups/run', A, {});
+  check(bk.status === 200 && bk.data?.success !== false, 'AU1: a manual backup runs (temporary test backup folder)', bk.data);
+  const since = `now() - interval '30 minutes'`;
+  const acts = new Set((await pool.query(`SELECT DISTINCT action FROM audit_logs WHERE created_at > ${since}`)).rows.map((x: any) => x.action));
+  const need = ['SERVER_AUTH_LOGIN', 'LOGIN_FAILED', 'SHIFT_OPENED', 'SALE_COMPLETED', 'ADMIN_PHYSICAL_STOCK_COUNT', 'ADMIN_SET_STOCK', 'STOCKTAKE_CREATED', 'STOCKTAKE_APPROVED',
+    'STOCKTAKE_ADJUSTMENT', 'STOCKTAKE_CANCEL', 'ALERT_ACKNOWLEDGED', 'BACKUP_SUCCEEDED'];
+  check(need.every((a) => acts.has(a)), 'AU2: login, failed login, shift, sale, stock count / set, stocktake, alert acknowledgement and backup are audited', need.filter((a) => !acts.has(a)));
+  const blob = JSON.stringify((await pool.query(`SELECT COALESCE(previous_value::text, '') || COALESCE(new_value::text, '') AS t FROM audit_logs WHERE created_at > ${since}`)).rows);
+  check(!/password_hash|pin_hash|$[0-9a-f]{64,}|eyJ[A-Za-z0-9_-]{20,}./.test(blob) && !blob.includes(bad) && !/giga-itest-backups/i.test(blob),
+    'AU3: audit rows hold no password, hash, PIN, JWT or backup file path');
   void loginNoShift;
 }

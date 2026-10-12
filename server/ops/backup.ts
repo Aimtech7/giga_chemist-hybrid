@@ -2,6 +2,8 @@ import fs from 'fs';
 import path from 'path';
 import { spawn } from 'child_process';
 import { pgPool, getDatabaseConnectionConfig } from '../db/client';
+import { recordAuditLog } from '../db/audit';
+import { sanitizeText } from './runtime';
 
 /**
  * PostgreSQL backups with pg_dump (custom format). Never restores anything.
@@ -171,6 +173,9 @@ export async function runBackup(trigger: BackupTrigger, overrides: { dir?: strin
       );
     }
     log(`SUCCESS ${trigger} ${finalPath} ${size} bytes ${duration} ms toc=${tocEntries} pruned=${removed.length}${weekly.copied ? ' weekly=' + path.basename(weekly.copied) : ''}`);
+    // Audit trail (never the file path: every Administrator screen can read the audit log).
+    await recordAuditLog({ action: 'BACKUP_SUCCEEDED', entity: 'backup', entity_id: String(runId), user_name: 'System (backup)',
+      new_value: { trigger, size_bytes: size, toc_entries: tocEntries, verified: true, weekly: Boolean(weekly.copied), pruned: removed.length } } as any).catch(() => {});
     return { success: true as const, id: runId, file: finalPath, size_bytes: size, duration_ms: duration, toc_entries: tocEntries, verified: true, pruned: removed, weekly_file: weekly.copied, weekly_pruned: weekly.pruned };
   } catch (err: any) {
     const msg = String(err?.message || err).slice(0, 1000);
@@ -179,6 +184,9 @@ export async function runBackup(trigger: BackupTrigger, overrides: { dir?: strin
         [runId, msg, Date.now() - started]).catch(() => {});
     }
     log(`FAILED ${trigger} ${msg}`);
+    await recordAuditLog({ action: 'BACKUP_FAILED', entity: 'backup', entity_id: String(runId ?? 'none'), user_name: 'System (backup)',
+      // File-system paths are replaced (the audit log is visible to every Administrator screen).
+      new_value: { trigger, error: sanitizeText(msg.replace(/\S*[\\/]\S*/g, '<path>')) } } as any).catch(() => {});
     return { success: false as const, id: runId, error: msg };
   } finally {
     await lockClient.query('SELECT pg_advisory_unlock($1)', [LOCK_KEY]).catch(() => {});

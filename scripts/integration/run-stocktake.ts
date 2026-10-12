@@ -44,6 +44,9 @@ async function main() {
   let env: HybridEnv | null = null;
   try {
     process.env.OPS_CHECKS_CACHE_SECONDS = '2'; // alert checks re-evaluated quickly in tests (default 600)
+    // Test backups: the harness sends them to a temporary folder (never the real BACKUP_DIR).
+    process.env.BACKUP_KEEP = '2';
+    process.env.BACKUP_KEEP_WEEKLY = '1';
     env = await setupHybridCloud();
     await startServer();
     await stocktakeTests(env, admin, manager, cashier);
