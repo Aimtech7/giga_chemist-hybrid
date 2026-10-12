@@ -8,6 +8,7 @@
     "dev:local": "tsx server.ts",
     "start": "tsx server.ts",
     "start:local": "tsx server.ts",
+    "start:pc2": "powershell -NoProfile -ExecutionPolicy Bypass -File deployment/windows/start-pc2-dev.ps1",
     "server": "tsx server.ts",
     "build": "node scripts/build-online-api.mjs && vite build",
     "preview": "vite preview",
