@@ -44,6 +44,7 @@
     "test:full-write": "tsx scripts/integration/run-full-write.ts",
     "test:stock-history": "tsx scripts/integration/run-stock-history.ts",
     "test:shifts": "tsx scripts/integration/run-shifts.ts",
+    "test:stocktake": "tsx scripts/integration/run-stocktake.ts",
     "sandbox:online": "tsx scripts/dev/online-sandbox.ts",
     "test:medicine-search": "tsx scripts/integration/medicine-search.test.ts",
     "scan:dist": "node scripts/scan-dist.mjs",

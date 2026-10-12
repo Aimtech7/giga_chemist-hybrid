@@ -15,6 +15,7 @@ import { PosScreen } from './components/pos/PosScreen';
 import { MedicineList } from './components/inventory/MedicineList';
 import { InventoryManager } from './components/inventory/InventoryManager';
 import { PhysicalStockCount } from './components/stocktake/PhysicalStockCount';
+import { StocktakeSessions } from './components/stocktake/StocktakeSessions';
 import { BatchList } from './components/inventory/BatchList';
 import { ExpiryManager } from './components/expiry/ExpiryManager';
 import { PurchaseList } from './components/purchases/PurchaseList';
@@ -36,7 +37,7 @@ import type { PharmacySettings, User } from './types';
 
 // '#app' (or any unknown hash) is not a module and must never become the current one (blank screen).
 const KNOWN_MODULES: AppModule[] = [
-  'dashboard', 'pos', 'medicines', 'inventory', 'stocktake', 'batches', 'expiry', 'purchases', 'suppliers',
+  'dashboard', 'pos', 'medicines', 'inventory', 'stocktake', 'stocktakes', 'batches', 'expiry', 'purchases', 'suppliers',
   'customers', 'expenses', 'sales', 'returns', 'reports', 'users', 'audit', 'settings', 'remote', 'history',
 ];
 
@@ -223,7 +224,7 @@ export default function App() {
     if (currentUser?.role !== 'ADMIN') return;
     void getServerMode().then((mode) => {
       setServerMode(mode);
-      if (mode === 'online') setCurrentModule((m) => (m === 'pos' || m === 'stocktake' ? 'dashboard' : m));
+      if (mode === 'online') setCurrentModule((m) => (m === 'pos' || m === 'stocktake' || m === 'stocktakes' ? 'dashboard' : m));
     });
   }, [currentUser]);
   const onlineAdmin = serverMode === 'online' && currentUser?.role === 'ADMIN';
@@ -341,6 +342,11 @@ export default function App() {
       {/* PHYSICAL STOCK COUNT (FAST STOCKTAKE) - Restricted to Admin */}
       {currentModule === 'stocktake' && canAccessModule(currentUser, 'stocktake') && (
         <PhysicalStockCount currentUser={currentUser} settings={settings} />
+      )}
+
+      {/* STOCKTAKE SESSIONS - count first, Administrator approval applies (cashiers: blind counting when allowed) */}
+      {currentModule === 'stocktakes' && canAccessModule(currentUser, 'stocktakes') && (
+        <StocktakeSessions currentUser={currentUser} settings={settings} />
       )}
 
       {/* BATCHES - Restricted to Admin/Manager */}

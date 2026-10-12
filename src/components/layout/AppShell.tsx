@@ -42,6 +42,7 @@ export type AppModule =
   | 'medicines'
   | 'inventory'
   | 'stocktake'
+  | 'stocktakes'
   | 'batches'
   | 'expiry'
   | 'purchases'
@@ -121,6 +122,7 @@ export const AppShell: React.FC<AppShellProps> = ({
     { id: 'medicines' as AppModule, label: isCashier(currentUser) ? 'Medicine Lookup' : 'Medicines', icon: Pill },
     { id: 'inventory' as AppModule, label: 'Inventory', icon: PackageSearch },
     { id: 'stocktake' as AppModule, label: 'Physical Stock Count', icon: ClipboardCheck },
+    { id: 'stocktakes' as AppModule, label: 'Stocktakes', icon: ClipboardCheck },
     { id: 'batches' as AppModule, label: 'Batches', icon: Boxes },
     { id: 'expiry' as AppModule, label: 'Expiry Tracking', icon: AlertTriangle },
     { id: 'purchases' as AppModule, label: 'Purchases', icon: Truck },
@@ -151,7 +153,8 @@ export const AppShell: React.FC<AppShellProps> = ({
   // STRICT RBAC: Filter navigation items based on user role.
   // Cashiers ONLY see permitted modules: Dashboard, POS Register, Medicine Lookup, Customers, Sales History, Returns.
   // Restricted modules are completely hidden from the DOM.
-  const visibleNavItems = allNavItems.filter((item) => canAccessModule(currentUser, item.id));
+  // Stocktake sessions live on the shop server only (never in the online app).
+  const visibleNavItems = allNavItems.filter((item) => canAccessModule(currentUser, item.id) && !(serverMode === 'online' && item.id === 'stocktakes'));
 
   return (
     <div className="h-screen w-screen flex flex-col overflow-hidden bg-slate-100 font-sans select-none">

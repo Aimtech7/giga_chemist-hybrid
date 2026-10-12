@@ -72,6 +72,7 @@ import { getSystemHealth } from './ops/health';
 import { appVersion, currentCommit } from './ops/runtime';
 import { pgPool } from './db/client';
 import { buildHistoryRouter } from './http/historyRoutes';
+import { approveStocktake, cancelStocktake, countLine, createStocktake, getStocktake, listStocktakes, reopenStocktake, startCounting, submitStocktake } from './db/stocktakes';
 import { buildShiftRouter } from './http/shiftRoutes';
 import { openShift, getCurrentShift, closeShift, reviewShift, correctShift, listOpenTills } from './db/shifts';
 import type { HistoryScope } from './db/history';
@@ -643,6 +644,25 @@ apiRouter.post('/inventory/physical-count', requireRole('ADMIN'), async (req: Au
     res.status(errorStatus(err)).json({ error: err.message || 'Failed to apply physical stock count.' });
   }
 });
+
+// --- 6b. FORMAL STOCKTAKE SESSIONS (counted first; stock changes only on Administrator approval) ---
+const stocktakeActor = (req: AuthenticatedRequest) => stockActor(req) as ReturnType<typeof stockActor> & { role: string };
+const stocktakeRoute = (label: string, fn: (req: AuthenticatedRequest) => Promise<unknown>, status = 200) => async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    res.status(status).json(await fn(req));
+  } catch (err: any) {
+    sendError(res, err, 'Stocktake request failed.', label);
+  }
+};
+apiRouter.get('/stocktakes', requirePermission('stocktake.count'), stocktakeRoute('GET /stocktakes', (req) => listStocktakes(req.userRole!, req.query as any)));
+apiRouter.get('/stocktakes/:id', requirePermission('stocktake.count'), stocktakeRoute('GET /stocktakes/:id', (req) => getStocktake(req.params.id, req.userRole!, req.query as any)));
+apiRouter.post('/stocktakes', requirePermission('stocktake.create'), stocktakeRoute('POST /stocktakes', (req) => createStocktake(stocktakeActor(req), req.body || {}), 201));
+apiRouter.post('/stocktakes/:id/start', requirePermission('stocktake.create'), stocktakeRoute('POST /stocktakes/:id/start', (req) => startCounting(req.params.id, stocktakeActor(req))));
+apiRouter.put('/stocktakes/:id/lines/:lineId', requirePermission('stocktake.count'), stocktakeRoute('PUT stocktake line', (req) => countLine(req.params.id, req.params.lineId, stocktakeActor(req), req.body || {})));
+apiRouter.post('/stocktakes/:id/submit', requirePermission('stocktake.create'), stocktakeRoute('POST /stocktakes/:id/submit', (req) => submitStocktake(req.params.id, stocktakeActor(req))));
+apiRouter.post('/stocktakes/:id/reopen', requirePermission('stocktake.create'), stocktakeRoute('POST /stocktakes/:id/reopen', (req) => reopenStocktake(req.params.id, stocktakeActor(req))));
+apiRouter.post('/stocktakes/:id/approve', requirePermission('stocktake.approve'), stocktakeRoute('POST /stocktakes/:id/approve', (req) => approveStocktake(req.params.id, stocktakeActor(req), req.body || {})));
+apiRouter.post('/stocktakes/:id/cancel', requirePermission('stocktake.create'), stocktakeRoute('POST /stocktakes/:id/cancel', (req) => cancelStocktake(req.params.id, stocktakeActor(req), req.body?.reason)));
 
 // --- 7. SALES (server-authoritative checkout, explicit void, PostgreSQL daily summary) ---
 function saleActor(req: AuthenticatedRequest) {

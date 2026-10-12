@@ -265,6 +265,11 @@ export async function cleanupFixtures(): Promise<Record<string, number>> {
         AND NOT EXISTS (SELECT 1 FROM expenses e WHERE e.shift_id = x.id)`;
     await client.query(`DELETE FROM cashier_shift_corrections WHERE shift_id IN (${testShifts})`);
     counts.shifts = (await client.query(`DELETE FROM cashier_shifts WHERE id IN (${testShifts})`)).rowCount || 0;
+    // Stocktakes started by test users (022), lines first.
+    if ((await client.query(`SELECT to_regclass('stocktakes') IS NOT NULL AS ok`)).rows[0].ok) {
+      await client.query(`DELETE FROM stocktake_lines WHERE stocktake_id IN (SELECT id FROM stocktakes WHERE started_by IN (${itestUsers}))`);
+      counts.stocktakes = (await client.query(`DELETE FROM stocktakes WHERE started_by IN (${itestUsers})`)).rowCount || 0;
+    }
     counts.movements = (await client.query(
       `DELETE FROM inventory_movements WHERE medicine_id IN (SELECT id FROM medicines WHERE barcode LIKE 'ITEST-%')`
     )).rowCount || 0;
