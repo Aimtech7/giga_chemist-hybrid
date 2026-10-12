@@ -110,7 +110,8 @@ export async function unifiedAuthTests(env: HybridEnv, admin: Fixture, cashier: 
 
   // Shop 2 business data, through the REAL ingestion RPC with Shop 2's own token.
   const m2 = crypto.randomUUID(), b2 = crypto.randomUUID(), s2 = crypto.randomUUID(), u2 = crypto.randomUUID();
-  const today = new Date().toISOString().slice(0, 10);
+  // Kenya business date (UTC would put sales made 00:00-03:00 EAT on the previous day: TEST 14 flake).
+  const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Africa/Nairobi' });
   const ev = (seq: number, type: string, data: any) => ({
     event_id: crypto.randomUUID(), idempotency_key: `itest-s2-${crypto.randomUUID()}`, shop_id: shop2, local_seq: String(seq), event_type: type,
     entity_type: 'x', entity_id: 'x', payload: { data, movements: [], batches: [], audit: [] },
