@@ -42,6 +42,7 @@ import { Sheet, StatusBadge, STATUS_TEXT, ago, when, inputCls, labelCls, btnPrim
 import { AlertsTab, CommandDetail, HealthTab, InsightsTab, SecurityTab, StaffTab } from './RemoteOps';
 import { UsersTab } from './UserManagement';
 import { getSelectedShop, isGlobalAdminAccount } from '../../services/shopContext';
+import { MedicinesTable } from './MedicinesTable';
 import type { Medicine, MedicineBatch, PharmacySettings, User } from '../../types';
 
 /**
@@ -62,19 +63,6 @@ interface Props {
 
 type ActionKind = 'add' | 'remove' | 'count' | 'price' | 'details' | 'expiry' | 'active' | 'batch-new' | 'batch-edit' | 'batch-active';
 
-/** Rows rendered at a time (phone-friendly); "Show more" reveals the rest — nothing is hidden. */
-const PAGE = 60;
-const stockState = (m: Medicine): 'in' | 'low' | 'out' =>
-  m.current_stock <= 0 ? 'out' : m.current_stock <= m.reorder_level ? 'low' : 'in';
-/** Batches with stock that expire within this many days count as "expiring soon". */
-const EXPIRING_DAYS = 90;
-const isoDay = (d: Date) => d.toISOString().slice(0, 10);
-const STOCK_BADGE = {
-  in: { label: 'In stock', cls: 'text-emerald-700 bg-emerald-50 border-emerald-200' },
-  low: { label: 'Low stock', cls: 'text-amber-700 bg-amber-50 border-amber-200' },
-  out: { label: 'Out of stock', cls: 'text-rose-700 bg-rose-50 border-rose-200' },
-} as const;
-
 export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings, initialTab, initialStockFilter }) => {
   const [tab, setTab] = useState<Tab>(initialTab || 'medicines');
   useEffect(() => setTab(initialTab || 'medicines'), [initialTab]);
@@ -85,14 +73,9 @@ export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings, initi
   const [categories, setCategories] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [search, setSearch] = useState('');
-  const [statusFilter, setStatusFilter] = useState<'all' | 'active' | 'inactive'>('all');
-  const [stockFilter, setStockFilter] = useState<'all' | 'in' | 'low' | 'out' | 'expiring'>(initialStockFilter || 'all');
-  useEffect(() => setStockFilter(initialStockFilter || 'all'), [initialStockFilter]);
   const [creating, setCreating] = useState(false);
   const [fanout, setFanout] = useState<AllShopsResult | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [shown, setShown] = useState(PAGE);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [form, setForm] = useState<{ kind: ActionKind; batchId?: string } | null>(null);
   const [draft, setDraft] = useState<Draft | null>(null);
@@ -184,24 +167,6 @@ export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings, initi
     () => batches.filter((b) => b.medicine_id === selectedId).sort((a, b) => (a.expiry_date || '9999').localeCompare(b.expiry_date || '9999')),
     [batches, selectedId]
   );
-  const counts = useMemo(() => {
-    const active = medicines.filter((m) => m.status === 'active').length;
-    return { total: medicines.length, active, inactive: medicines.length - active };
-  }, [medicines]);
-  const expiringIds = useMemo(() => {
-    const today = isoDay(new Date());
-    const until = isoDay(new Date(Date.now() + EXPIRING_DAYS * 86_400_000));
-    return new Set(batches.filter((b) => b.quantity_available > 0 && b.expiry_date && b.expiry_date > today && b.expiry_date <= until).map((b) => b.medicine_id));
-  }, [batches]);
-  const matches = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    return medicines.filter((m) =>
-      (statusFilter === 'all' || (statusFilter === 'active') === (m.status === 'active'))
-      && (stockFilter === 'all' || (stockFilter === 'expiring' ? expiringIds.has(m.id) : stockState(m) === stockFilter))
-      && (!q || [m.name, m.generic_name, m.brand_name, m.barcode, m.sku].some((v) => (v || '').toLowerCase().includes(q))));
-  }, [medicines, search, statusFilter, stockFilter, expiringIds]);
-  useEffect(() => setShown(PAGE), [search, statusFilter, stockFilter]);
-  const results = useMemo(() => matches.slice(0, shown), [matches, shown]);
 
   const openCommandsFor = (medicineId: string) =>
     [...tracked, ...history].filter((c, i, all) => all.findIndex((x) => x.command_id === c.command_id) === i)
@@ -323,7 +288,7 @@ export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings, initi
         </div>
       </div>
 
-      <div className="flex-1 overflow-y-auto p-3 space-y-3 max-w-2xl w-full mx-auto">
+      <div className={`flex-1 overflow-y-auto p-3 space-y-3 w-full mx-auto ${tab === 'medicines' ? '' : 'max-w-2xl'}`}>
         {shopCard}
 
         {notice && (
@@ -354,75 +319,36 @@ export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings, initi
           </div>
         )}
 
-        {tab === 'medicines' && !selected && (
+        {tab === 'medicines' && (
           <>
-            <div className="relative">
-              <Search className="w-4 h-4 absolute left-3 top-3 text-slate-400" />
-              <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search medicine, barcode…" className={`${inputCls} pl-9`} />
-            </div>
             {loadError && <div className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded p-2">{loadError}</div>}
-            {medicines.length > 0 && (
-              <div className="space-y-2">
-                <div className="text-[11px] text-slate-600" data-testid="catalog-counts">
-                  {counts.total} medicines · {counts.active} active · {counts.inactive} inactive
-                </div>
-                <div className="flex flex-wrap gap-2">
-                  <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value as typeof statusFilter)} className={`${inputCls} w-auto`} aria-label="Status filter">
-                    <option value="all">All statuses</option>
-                    <option value="active">Active</option>
-                    <option value="inactive">Inactive</option>
-                  </select>
-                  <select value={stockFilter} onChange={(e) => setStockFilter(e.target.value as typeof stockFilter)} className={`${inputCls} w-auto`} aria-label="Stock filter">
-                    <option value="all">All stock</option>
-                    <option value="in">In stock</option>
-                    <option value="low">Low stock</option>
-                    <option value="out">Out of stock</option>
-                    <option value="expiring">Expiring soon ({EXPIRING_DAYS} days)</option>
-                  </select>
-                  <button onClick={() => { setSendError(null); setCreating(true); }} className="flex items-center gap-1 px-3 py-2 rounded-lg bg-teal-700 text-white text-xs font-bold">
-                    <Plus className="w-4 h-4" /> New medicine
-                  </button>
-                </div>
-              </div>
-            )}
-            {loading && medicines.length === 0 ? (
-              <div className="text-xs text-slate-500 flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin" /> Loading from the cloud…</div>
-            ) : (
-              <div className="space-y-2">
-                {results.map((m) => (
-                  <button key={m.id} onClick={() => setSelectedId(m.id)} className="w-full text-left bg-white border border-slate-200 rounded-xl p-3 hover:border-teal-600">
-                    <div className="flex items-center justify-between gap-2">
-                      <div className="min-w-0">
-                        <div className="text-sm font-semibold text-slate-900 truncate">{m.name}</div>
-                        <div className="text-[11px] text-slate-500 truncate">{[m.dosage_strength, m.dosage_form, m.category].filter(Boolean).join(' · ')}</div>
-                      </div>
-                      <div className="text-right shrink-0">
-                        <div className={`text-sm font-bold ${m.current_stock <= 0 ? 'text-rose-700' : 'text-slate-900'}`}>{m.current_stock}</div>
-                        <div className="text-[11px] text-slate-500">{cur} {Number(m.selling_price).toFixed(2)}</div>
-                      </div>
-                    </div>
-                    <div className="mt-1.5 flex gap-1.5 text-[10px] font-semibold uppercase tracking-wider">
-                      <span className={`px-1.5 py-0.5 rounded border ${m.status === 'active' ? 'text-slate-700 bg-slate-50 border-slate-200' : 'text-slate-500 bg-slate-100 border-slate-300'}`}>{m.status === 'active' ? 'Active' : 'Inactive'}</span>
-                      <span className={`px-1.5 py-0.5 rounded border ${STOCK_BADGE[stockState(m)].cls}`}>{STOCK_BADGE[stockState(m)].label}</span>
-                    </div>
-                    {openCommandsFor(m.id).length > 0 && <div className="mt-1 text-[11px] text-amber-700 font-medium">{openCommandsFor(m.id).length} change(s) waiting for the shop</div>}
-                  </button>
-                ))}
-                {results.length === 0 && !loading && <div className="text-xs text-slate-500 p-4 text-center">No medicines match.</div>}
-                {matches.length > results.length && (
-                  <button onClick={() => setShown((n) => n + PAGE)} className={`${btnSecondary} w-full`}>
-                    Show more ({results.length} of {matches.length})
-                  </button>
-                )}
-              </div>
-            )}
+            <MedicinesTable
+              medicines={medicines}
+              batches={batches}
+              currency={cur}
+              showCost={currentUser?.role === 'ADMIN'}
+              loading={loading}
+              pendingFor={(id) => openCommandsFor(id).length}
+              initialStock={initialStockFilter === 'in' || initialStockFilter === 'low' || initialStockFilter === 'out' ? initialStockFilter : 'all'}
+              initialExpiry={initialStockFilter === 'expiring' ? 'soon' : 'all'}
+              onCreate={() => { setSendError(null); setCreating(true); }}
+              onAction={(id, action) => {
+                setSendError(null);
+                setSelectedId(id);
+                if (action !== 'view') {
+                  const first = batches.filter((b) => b.medicine_id === id).sort((a, b) => (a.expiry_date || '9999').localeCompare(b.expiry_date || '9999'))[0];
+                  setForm({ kind: action, batchId: first?.id });
+                }
+              }}
+            />
           </>
         )}
 
-        {tab === 'medicines' && selected && (
-          <div className="space-y-3">
+        {tab === 'medicines' && selected && !form && (
+          <div className="fixed inset-0 z-40 bg-slate-900/40 flex justify-end" onClick={() => setSelectedId(null)}>
+          <div className="bg-slate-50 w-full md:max-w-xl h-full overflow-y-auto p-3 space-y-3" onClick={(e) => e.stopPropagation()}>
             <button onClick={() => setSelectedId(null)} className="flex items-center gap-1 text-xs font-semibold text-teal-800">
-              <ArrowLeft className="w-4 h-4" /> All medicines
+              <ArrowLeft className="w-4 h-4" /> Back to all medicines
             </button>
             <div className="bg-white border border-slate-200 rounded-xl p-3">
               <div className="text-base font-bold text-slate-900">{selected.name}</div>
@@ -456,18 +382,20 @@ export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings, initi
               ))}
             </div>
 
-            <div className="bg-white border border-slate-200 rounded-xl">
-              <div className="px-3 py-2 text-xs font-bold text-slate-600 uppercase tracking-wide border-b border-slate-100">Batches</div>
-              {selectedBatches.length === 0 && <div className="p-3 text-xs text-slate-500">No batches in the cloud copy.</div>}
-              {selectedBatches.map((b) => (
-                <div key={b.id} className="px-3 py-2 border-b border-slate-100 last:border-0 flex items-center justify-between text-xs">
-                  <div>
-                    <div className="font-mono font-semibold text-slate-800">{b.batch_number}</div>
-                    <div className="text-slate-500">Expiry {b.expiry_date || 'unknown'} · {b.status}</div>
-                  </div>
-                  <div className="text-sm font-bold">{b.quantity_available}</div>
-                </div>
-              ))}
+            <div className="bg-white border border-slate-200 rounded-xl overflow-x-auto">
+              <div className="px-3 py-2 text-xs font-bold text-slate-600 uppercase tracking-wide border-b border-slate-100">Batches ({selectedBatches.length})</div>
+              {selectedBatches.length === 0 ? <div className="p-3 text-xs text-slate-500">No batches in the cloud copy.</div> : (
+                <table className="w-full text-xs">
+                  <thead className="text-slate-500 text-[10px] uppercase"><tr>{['Batch', 'Qty', 'Expiry', 'Purchase', 'Sell override', 'Status'].map((h) => <th key={h} className="text-left px-3 py-1.5">{h}</th>)}</tr></thead>
+                  <tbody>{selectedBatches.map((b) => (
+                    <tr key={b.id} className="border-t border-slate-100">
+                      <td className="px-3 py-1.5 font-mono font-semibold">{b.batch_number}</td><td className="px-3 font-bold">{b.quantity_available}</td>
+                      <td className="px-3">{b.expiry_date || 'unknown'}</td><td className="px-3">{b.purchase_price != null ? Number(b.purchase_price).toFixed(2) : '—'}</td>
+                      <td className="px-3">{b.selling_price_override != null ? Number(b.selling_price_override).toFixed(2) : '—'}</td><td className="px-3 uppercase">{b.status}</td>
+                    </tr>
+                  ))}</tbody>
+                </table>
+              )}
             </div>
 
             {openCommandsFor(selected.id).length > 0 && (
@@ -476,6 +404,7 @@ export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings, initi
                 {openCommandsFor(selected.id).map(commandRow)}
               </div>
             )}
+          </div>
           </div>
         )}
 

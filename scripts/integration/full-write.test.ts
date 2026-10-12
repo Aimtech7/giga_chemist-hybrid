@@ -574,6 +574,116 @@ export async function fullWriteTests(env: HybridEnv, admin: Fixture, cashier: Fi
   check(csv.status === 200 && /text\/csv/.test(csv.headers.get('content-type') || '') && csvText.includes(recA) && !csvText.includes(recS2)
     && !secrets.some((x) => x && csvText.includes(x)), 'CSV export uses the filters and the shop scope (no secrets)');
 
+  // ================================================================== EXACT SALE DETAIL
+  section('EXACT SALE DETAIL: stored values, items, payments, returns, void');
+  const med2 = await upsertFixtureMedicine('ITEST-FW-2', 'ZZ ITEST FullWrite Second', 50, 20);
+  await lq('UPDATE medicines SET wholesale_price = 40, min_selling_price = NULL WHERE id = $1', [med2]);
+  r = await api('POST', '/api/inventory/physical-count', adminToken, { medicine_id: med2, counts: [{ batch_number: `FW2-B1-${RUN}`, quantity: 100, expiry_date: '2031-01-01' }] });
+  check(r.status === 200, 'second medicine stocked (100)', r.data);
+  // Like every real medicine, the fixture must exist in the cloud copy (the online search reads it there).
+  const boot2 = spawnSync(process.execPath, ['--import', 'tsx', 'scripts/sync-bootstrap.ts', '--confirm', '--medicine', med2], { env: { ...process.env, APP_MODE: 'hybrid' }, encoding: 'utf-8' });
+  check(boot2.status === 0 && (await cloudHas('SELECT 1 FROM giga_cloud.medicines WHERE shop_id = $1 AND medicine_id = $2', [shop1, med2])) > 0, 'second medicine baseline synced to the cloud');
+  const buyer = await api('POST', '/api/customers', cashierToken, { name: `ZZ ITEST FW Buyer ${RUN}`, phone: '0722000001' });
+  const buyerId = buyer.data?.customer?.id;
+  const pRetail = await price();
+  const ck = (body: any) => api('POST', '/api/sales/checkout', cashierToken, { idempotency_key: `itest-${crypto.randomUUID()}`, ...body });
+  const multi = (await ck({ items: [{ medicine_id: med, quantity: 2, unit_price: pRetail }, { medicine_id: med2, quantity: 3, unit_price: 50 }], discount_percent: 10, customer_id: buyerId,
+    payment: { method: 'Cash', amount_received: 1000 } })).data?.sale;
+  const ws = (await ck({ price_mode: 'WHOLESALE', items: [{ medicine_id: med2, quantity: 4, unit_price: 40, price_mode: 'WHOLESALE' }], payment: { method: 'M-Pesa', reference: 'QWE123RTY9' } })).data?.sale;
+  const mix = (await ck({ items: [{ medicine_id: med2, quantity: 2, unit_price: 50 }], payment: { method: 'Mixed', split: [{ method: 'Cash', amount: 60 }, { method: 'M-Pesa', amount: 40, reference: 'ABC123XYZ9' }] } })).data?.sale;
+  check(Boolean(multi?.id && ws?.id && mix?.id), 'multi-item / wholesale / split-payment sales recorded locally', { multi: !!multi, ws: !!ws, mix: !!mix });
+  const med2Line = multi?.items?.find((i: any) => i.medicine_id === med2);
+  const pend = await api('POST', '/api/returns', cashierToken, { sale_id: multi?.id, medicine_id: med2, batch_id: med2Line?.batch_id, quantity: 1, reason: 'ITEST pending return' });
+  check(pend.status === 201, 'pending return requested on the multi-item sale');
+  for (const s of [multi, ws, mix]) await cloudHas('SELECT 1 FROM giga_cloud.sales WHERE shop_id = $1 AND sale_id = $2', [shop1, s?.id]);
+  await cloudHas('SELECT 1 FROM giga_cloud.returns WHERE shop_id = $1 AND return_id = $2', [shop1, pend.data?.return?.id]);
+
+  // Snapshot: viewing history must change NOTHING.
+  const snap = async () => JSON.stringify((await lq(`SELECT (SELECT COUNT(*) FROM sales) s, (SELECT COUNT(*) FROM sale_items) i, (SELECT COUNT(*) FROM payments) p,
+    (SELECT COUNT(*) FROM returns) r, (SELECT COUNT(*) FROM inventory_movements) m, (SELECT COUNT(*) FROM users) u,
+    (SELECT COALESCE(SUM(quantity_available), 0) FROM medicine_batches) q, (SELECT COALESCE(SUM(total), 0) FROM sales) t`))[0]);
+  const before = await snap();
+  const D = async (id: string, token = GA, shop: string | null = shop1, extra: Record<string, string> = {}) => (await on('GET', `/api/history/sales/${id}?shop_id=${shop || ''}`, token, undefined, shop, extra));
+  const dm = (await D(multi.id)).data, dws = (await D(ws.id)).data, dmix = (await D(mix.id)).data;
+  const dA = (await D(sA.id)).data, dB = (await D(sB.id)).data, dC = (await D(sC.id)).data;
+  const near = (a: number, b: number) => Math.abs(Number(a) - Number(b)) < 0.011;
+  check(dA?.items?.length === 1 && dA.items[0].medicine_name === 'ZZ ITEST FullWrite Medicine' && dA.items[0].quantity === 1, 'E1: one-item sale shows the exact medicine and quantity');
+  const iMed = dm?.items?.find((i: any) => i.medicine_id === med), iMed2 = dm?.items?.find((i: any) => i.medicine_id === med2);
+  check(dm?.items?.length === 2 && Boolean(iMed && iMed2), 'E2: multi-item sale shows every item');
+  check(iMed?.quantity === 2 && iMed2?.quantity === 3 && dm.quantities.total_units === 5 && dm.quantities.different_medicines === 2, 'E3: exact quantities (2 + 3 = 5 units, 2 medicines)', dm?.quantities);
+  // Today's price changes; the history keeps the price charged then (local and cloud detail).
+  await lq('UPDATE medicines SET selling_price = 777 WHERE id = $1', [med2]);
+  const local = (await api('GET', `/api/history/sales/${multi.id}`, adminToken)).data;
+  await lq('UPDATE medicines SET selling_price = 50 WHERE id = $1', [med2]);
+  check(iMed2?.unit_price === 50 && local?.items?.find((i: any) => i.medicine_id === med2)?.unit_price === 50 && iMed?.unit_price === pRetail,
+    'E4: historical unit price shown (50 stored), not today\'s price (777)');
+  check(dm.sale.price_mode === 'RETAIL' && dm.items.every((i: any) => i.price_mode === 'RETAIL'), 'E5: retail sale identified');
+  check(dws?.sale?.price_mode === 'WHOLESALE' && dws.items[0].price_mode === 'WHOLESALE' && dws.items[0].unit_price === 40, 'E6: wholesale sale identified (wholesale unit price 40)', dws?.sale);
+  const sub = 2 * pRetail + 3 * 50;
+  check(Number(dm.sale.discount_percent) === 10 && near(dm.sale.discount_total, sub * 0.1), 'E7: sale-level discount: 10% and the stored amount', { pct: dm.sale.discount_percent, d: dm.sale.discount_total });
+  check(dm.items.every((i: any) => Number(i.discount) > 0) && near(dm.items.reduce((t: number, i: any) => t + Number(i.discount), 0), dm.sale.discount_total), 'E8: line discounts shown and add up to the sale discount');
+  check(dm.items.every((i: any) => near(i.total, i.quantity * i.unit_price - i.discount)), 'E9: line totals = qty x unit price - line discount');
+  check(near(dm.sale.subtotal, sub), 'E10: subtotal exact', dm.sale.subtotal);
+  check(near(dm.sale.total, Number(dm.sale.subtotal) - Number(dm.sale.discount_total) + Number(dm.sale.tax_total || 0)), 'E11: final total exact', dm.sale.total);
+  check(dm.payments.length === 1 && dm.payments[0].method === 'Cash' && near(dm.payments[0].amount, dm.sale.total) && dm.sale.amount_received === 1000 && near(dm.sale.change_given, 1000 - dm.sale.total),
+    'E12: cash payment, amount received and change', { p: dm.payments, rec: dm.sale.amount_received, ch: dm.sale.change_given });
+  check(dws.sale.payment_method === 'M-Pesa' && (dws.sale.payment_reference === 'QWE123RTY9' || dws.payments.some((p: any) => p.reference === 'QWE123RTY9')), 'E13: M-Pesa payment and its reference', { s: dws.sale, p: dws.payments });
+  check(dmix?.payments?.length === 2 && dmix.payments.some((p: any) => p.method === 'Cash' && p.amount === 60) && dmix.payments.some((p: any) => p.method === 'M-Pesa' && p.reference === 'ABC123XYZ9')
+    && near(dmix.total_paid, dmix.sale.total), 'E14: split payment shows each part (Cash 60 + M-Pesa 40 ref ABC123XYZ9)', dmix?.payments);
+  check(dm.sale.customer_name === `ZZ ITEST FW Buyer ${RUN}` && dm.sale.customer_phone === '0722000001' && dm.sale.walk_in === false, 'E15: customer shown (name + phone)');
+  check(dA.sale.walk_in === true && dA.sale.customer_name === null, 'E16: walk-in handled (no invented customer)');
+  check(dm.sale.cashier_name === 'ITest FW Cashier', 'E17: cashier shown', dm.sale.cashier_name);
+  check(iMed?.batch_number === `FW-B1-${RUN}` && iMed2?.batch_number === `FW2-B1-${RUN}`, 'E18: batch numbers shown', dm.items.map((i: any) => i.batch_number));
+  check(dm.returns.some((x: any) => x.status === 'PENDING' && x.quantity === 1 && x.original_quantity === 3) && iMed2.pending_return_quantity === 1 && iMed2.net_quantity === 3,
+    'E19: pending return displayed (sold 3, 1 pending, net still 3)', { r: dm.returns, i: iMed2 });
+  check(dA.returns.some((x: any) => x.status === 'APPROVED' && x.approved_quantity === 1 && x.reviewed_by) && dA.items[0].returned_quantity === 1 && dA.items[0].net_quantity === 0,
+    'E20: approved return displayed (returned 1, net 0, reviewer)', { r: dA.returns, i: dA.items[0] });
+  check(dB.returns.some((x: any) => x.status === 'REJECTED' && x.reviewed_at) && dB.items[0].returned_quantity === 0 && dB.items[0].net_quantity === 1, 'E21: rejected return displayed (no quantity effect)');
+  check(dC.void && dC.items.length === 1 && dC.items[0].quantity === 1 && near(dC.sale.total, sC.total), 'E22: voided sale still shows the original transaction');
+  check(/ITEST wrong item/.test(dC.void?.reason || '') && Boolean(dC.void?.voided_by), 'E23: void reason (and who) displayed', dC.void);
+  const salesN = (await lq('SELECT COUNT(*)::int n FROM sales'))[0].n;
+  const rp2 = await on('POST', `/api/history/sales/${multi.id}/reprint?shop_id=${shop1}`, GA, {}, shop1);
+  check(rp2.status === 200 && rp2.data.reprint.copy && near(rp2.data.sale.total, dm.sale.total) && (await lq('SELECT COUNT(*)::int n FROM sales'))[0].n === salesN, 'E24: reprint uses the stored sale and creates nothing');
+  check((await D(s2sale, S1A, shop1)).status === 404 && (await on('GET', `/api/history/sales/${s2sale}?shop_id=${shop2}`, S1A, undefined, shop1)).status === 403
+    && (await D(multi.id, S2A, null)).status === 404, 'E25: a Shop 1 user cannot open Shop 2 detail (and vice versa)');
+  const g2 = await on('GET', `/api/history/sales/${s2sale}?shop_id=${shop2}`, GA, undefined, null, ALLS);
+  const gWrong = await on('GET', `/api/history/sales/${s2sale}?shop_id=${shop1}`, GA, undefined, null, ALLS);
+  check(g2.status === 200 && g2.data.sale.shop_code === 'SHOP2' && g2.data.items[0].unit_price === 110 && (await D(multi.id, GA, shop1)).status === 200 && gWrong.status === 404,
+    'E26: Global Admin opens either shop\'s sale, always from its own shop (wrong shop -> 404)');
+  h = await hq(`sales?${day1}&medicine=${encodeURIComponent('ZZ ITEST FullWrite Second')}&page_size=100`, GA, shop1);
+  const mrec = recs(h);
+  check(mrec.has(multi.receipt_number) && mrec.has(ws.receipt_number) && mrec.has(mix.receipt_number) && !mrec.has(recA), 'E27: medicine search returns exactly the receipts containing it');
+  h = await hq(`sales?q=${encodeURIComponent(multi.receipt_number)}`, GA, shop1);
+  check(h.data?.total === 1 && h.data.rows[0].id === multi.id && h.data.rows[0].item_count === 2 && h.data.rows[0].units === 5, 'E28: receipt search (row shows items 2, units 5)');
+  h = await hq(`sales?${day1}&page_size=100`, GA, shop1);
+  check(h.data.rows.length <= 100 && h.data.rows.every((x: any) => x.items === undefined) && h.data.summary.units_sold >= 5 && h.data.summary.cost_of_goods !== undefined,
+    'E29: list stays lightweight + paginated (no item arrays); summary has units sold and cost of goods');
+  const md = (await D(multi.id, MGR, null)).data;
+  check(md?.items?.length === 2 && md.items.every((i: any) => i.cost_price_snapshot === undefined && i.profit === undefined) && md.sale.gross_profit === undefined && md.sale.cost_total === undefined
+    && (await hq(`sales?${day1}`, MGR, null)).data.summary.cost_of_goods === undefined && dm.items[0].cost_price_snapshot !== undefined,
+    'E30: cost / profit hidden from a Manager, shown to the Administrator');
+  check((await snap()) === before, 'viewing sales history changed nothing (sales, items, payments, returns, movements, users, stock, totals)');
+  h = await hq(`sales?${day1}&payment_method=Mixed`, GA, shop1);
+  check(recs(h).has(mix.receipt_number) && (await hq(`sales?${day1}&payment_method=M-Pesa`, GA, shop1)).data.rows.some((x: any) => x.id === mix.id),
+    'payment filter: Mixed, and M-Pesa also finds the split sale');
+  h = await hq(`sales?${day1}&price_mode=WHOLESALE`, GA, shop1);
+  check(h.data.rows.length >= 1 && h.data.rows.every((x: any) => x.price_mode === 'WHOLESALE') && recs(h).has(ws.receipt_number), 'price-mode filter (wholesale)');
+
+  // ================================================================== MEDICINES CATALOGUE (online)
+  section('MEDICINES: full catalogue per shop, offline browsing, All Shops comparison');
+  const c1 = await on('GET', '/api/medicines', GA, undefined, shop1), c2 = await on('GET', '/api/medicines', GA, undefined, shop2);
+  const ids1m = new Set((c1.data || []).map((m: any) => m.id)), ids2m = new Set((c2.data || []).map((m: any) => m.id));
+  check(c1.status === 200 && c2.status === 200 && ![...ids2m].some((id) => ids1m.has(id)) && ids2m.has(m2) && !ids1m.has(m2), 'M21: Shop 1 and Shop 2 catalogues never mix');
+  check(c2.data.length === 2 && (await on('GET', '/api/batches', GA, undefined, shop2)).data.some((b: any) => b.id === b2)
+    && (await on('GET', '/api/admin/shop-health', GA, undefined, shop2)).data?.online === false, 'M22: Shop 2 is offline and its catalogue + batches still load from the cloud copy');
+  check((c1.data || []).some((m: any) => m.current_stock <= 0) && (c1.data || []).some((m: any) => m.status !== 'active'), 'zero-stock and inactive medicines are delivered to the Admin (not hidden)');
+  const cmp = await on('GET', '/api/admin/stock-comparison', GA, undefined, null, ALLS);
+  const twin = cmp.data?.rows?.find((x: any) => x.barcode === 'ITEST-FW-1');
+  check(cmp.status === 200 && twin && twin.per_shop[shop1] && twin.per_shop[shop2]?.stock === 12 && twin.per_shop[shop1].medicine_id === med
+    && twin.combined === twin.per_shop[shop1].stock + 12, 'All Shops comparison: same medicine (barcode) per shop side by side, separate combined column', twin);
+  check(cmp.data?.rows?.some((x: any) => x.per_shop[shop2] && !x.per_shop[shop1]) , 'a Shop 2-only medicine appears only under Shop 2');
+  check((await on('GET', '/api/admin/stock-comparison', S1A, undefined, null)).status === 403, 'comparison is Global Administrator only');
+
   // ================================================================== AUDIT
   section('AUDIT (tests 49-50)');
   const auditRows = await lq(`SELECT entity_id FROM audit_logs WHERE action = 'CLOUD_COMMAND_APPLIED' AND entity_id = ANY($1::text[])`, [applied]);
