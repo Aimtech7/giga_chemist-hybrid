@@ -493,6 +493,17 @@ const HANDLERS: Record<string, Handler> = {
     return { user_id: p.user_id, before, after };
   },
 
+  // Re-sends the shop's FAILED outbox events (same ids + idempotency keys: never a duplicate in the cloud).
+  async SYNC_RETRY_FAILED(client, cmd) {
+    const p = validateCommandPayload('SYNC_RETRY_FAILED', cmd.payload);
+    const r = await client.query(`UPDATE sync_events SET status = 'PENDING', next_attempt_at = CURRENT_TIMESTAMP WHERE status = 'FAILED' RETURNING id`);
+    await recordAuditLog({
+      ...cloudActor(cmd), action: 'SYNC_FAILED_EVENTS_REQUEUED', entity: 'sync', entity_id: 'sync_events',
+      new_value: { requeued: r.rowCount || 0, reason: p.reason ?? null, command_id: cmd.command_id },
+    } as any, client);
+    return { requeued: r.rowCount || 0 };
+  },
+
   // Signs the account out of every shop terminal (its tokens issued before now are refused).
   async USER_SESSION_REVOKE(client, cmd) {
     const p = validateCommandPayload('USER_SESSION_REVOKE', cmd.payload);

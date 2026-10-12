@@ -34,6 +34,7 @@ export type RemoteAction =
   | 'customer-update'
   | 'customer-active'
   | 'purchase-create'
+  | 'sync-retry-failed'
   | 'purchase-update'
   | 'purchase-receive'
   | 'purchase-cancel'
@@ -246,6 +247,7 @@ export const COMMAND_LABELS: Record<string, string> = {
   SALE_VOID: 'Void sale',
   USER_SESSION_REVOKE: 'Sign out staff everywhere',
   USER_PROFILE_UPDATE: 'Staff profile (name / username / email)',
+  SYNC_RETRY_FAILED: 'Re-send failed sync events',
   SHIFT_REVIEW: 'Review cashier shift',
 };
 

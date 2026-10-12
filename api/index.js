@@ -1695,6 +1695,21 @@ async function getPharmacySettings(q = pgPool) {
 import crypto2 from "crypto";
 import express2 from "express";
 
+// server/sync/conflicts.ts
+function classifyConflict(commandType, error) {
+  const e = String(error || "").toLowerCase();
+  const t = String(commandType || "");
+  if (!e) return "OTHER";
+  if (/username/.test(e) && /(already|used|exists|duplicate)/.test(e)) return "DUPLICATE_USERNAME";
+  if (/email/.test(e) && /(already|used|exists|duplicate)/.test(e)) return "DUPLICATE_EMAIL";
+  if (t.startsWith("USER_") && /(changed at the shop|changed meanwhile|reload and edit)/.test(e)) return "USER_CHANGED_LOCALLY";
+  if (/(stock|quantity).*(changed|moved)|expected.?quantity|insufficient|below zero|would go negative/.test(e)) return "STOCK_CHANGED";
+  if (/(changed meanwhile|was changed|stale|version|expected)/.test(e)) return "STALE_VERSION";
+  if (/(not found|does not exist|unknown (medicine|batch|user|supplier|customer|purchase|sale))/.test(e)) return "RECORD_NOT_FOUND";
+  if (/(cannot .* (a|an) .* that is|already (voided|received|cancelled|approved|rejected|closed|reviewed)|invalid.state|not pending|is (closed|completed|cancelled))/.test(e)) return "INVALID_STATE";
+  return "OTHER";
+}
+
 // server/sync/commandSchema.ts
 var HIGH_CONFLICT_TYPES = [
   "STOCK_ADD",
@@ -2256,6 +2271,11 @@ function validateCommandPayload(type, payload) {
       if (reason) out.reason = reason;
       return out;
     }
+    case "SYNC_RETRY_FAILED": {
+      onlyKeys(p, ["reason"], "SYNC_RETRY_FAILED");
+      const reason = reasonText(p.reason, false);
+      return reason ? { reason } : {};
+    }
     case "USER_SESSION_REVOKE": {
       onlyKeys(p, ["user_id", "reason"], "USER_SESSION_REVOKE");
       return { user_id: uuid(p.user_id, "user_id"), reason: reasonText(p.reason, false) };
@@ -2352,6 +2372,7 @@ var ACTIONS = {
   "return-reject": "RETURN_REJECT",
   "sale-void": "SALE_VOID",
   "user-session-revoke": "USER_SESSION_REVOKE",
+  "sync-retry-failed": "SYNC_RETRY_FAILED",
   // Cashier shifts (cloud migration 009)
   "shift-review": "SHIFT_REVIEW"
 };
@@ -2834,6 +2855,114 @@ function buildRemoteAdminRouter(deps) {
       commands: counts,
       controls: ctl
     };
+  }));
+  r.get("/admin/sync-center", requireAdmin2, route2("GET /admin/sync-center", async (req) => {
+    const global = deps.isGlobalAdmin(req.onlineUser);
+    const shops = (await deps.withCloud((c) => global ? c.query("SELECT shop_id, shop_code, name FROM giga_cloud.shops WHERE active ORDER BY shop_code, shop_id") : c.query("SELECT shop_id, shop_code, name FROM giga_cloud.shops WHERE shop_id = $1", [deps.shopId(req)]))).rows;
+    const out = [];
+    for (const s of shops) {
+      const rt = await runtimeRow(deps, s.shop_id);
+      const st = rt?.status || {};
+      const row = await deps.withCloud(async (c) => {
+        const counts = await commandCounts(c, s.shop_id);
+        const extra = (await c.query(
+          `SELECT (SELECT MAX(local_seq) FROM giga_cloud.processed_events WHERE shop_id = $1)::bigint AS cloud_last_seq,
+                  (SELECT COUNT(*) FROM giga_cloud.commands WHERE shop_id = $1 AND status = 'REJECTED' AND acked_at > now() - interval '7 days')::int AS rejected_7d,
+                  (SELECT COUNT(*) FROM giga_cloud.rejected_events WHERE shop_id = $1 AND rejected_at > now() - interval '7 days')::int AS cloud_rejected_events_7d`,
+          [s.shop_id]
+        )).rows[0];
+        return { counts, extra };
+      });
+      const shopSeq = st.outbound?.last_seq ?? null;
+      const cloudSeq = row.extra.cloud_last_seq !== null ? Number(row.extra.cloud_last_seq) : null;
+      out.push({
+        shop_id: s.shop_id,
+        shop_code: s.shop_code,
+        name: s.name,
+        online: rt ? rt.age_seconds <= HEARTBEAT_ONLINE_SECONDS : false,
+        last_heartbeat_at: rt?.reported_at ?? null,
+        heartbeat_age_seconds: rt?.age_seconds ?? null,
+        last_sync_at: rt?.last_sync_at ?? null,
+        shop_last_seq: shopSeq,
+        shop_last_synced_seq: st.outbound?.last_synced_seq ?? null,
+        cloud_last_seq: cloudSeq,
+        sequence_gap: shopSeq !== null && cloudSeq !== null ? Math.max(0, shopSeq - cloudSeq) : null,
+        outbox_pending: rt?.outbound_pending ?? null,
+        outbox_failed: rt?.outbound_failed ?? null,
+        commands_unacknowledged_at_shop: rt?.inbound_unacked ?? null,
+        commands_pending: row.counts.pending,
+        commands_delivered: row.counts.delivered,
+        commands_rejected_7d: row.extra.rejected_7d,
+        cloud_rejected_events_7d: row.extra.cloud_rejected_events_7d,
+        last_error: safeError(st.last_error ?? null),
+        installed_commit: rt?.git_commit ?? null,
+        app_version: rt?.app_version ?? null,
+        update_status: rt?.update_state?.status ?? null,
+        available_commit: rt?.update_state?.available_commit ?? null,
+        device_id: rt?.device_id ?? null,
+        last_backup_at: rt?.backup?.last_success_at ?? null,
+        backup_age_hours: rt?.backup?.age_hours ?? null,
+        backup_verified: rt?.backup?.last_success_verified ?? null
+      });
+    }
+    return { shops: out, server_time: (/* @__PURE__ */ new Date()).toISOString() };
+  }));
+  r.get("/admin/sync-center/issues", requireAdmin2, route2("GET /admin/sync-center/issues", async (req) => {
+    const shopId = deps.shopId(req);
+    return deps.withCloud(async (c) => {
+      const commands = (await c.query(
+        `SELECT command_id, command_type, status, error, created_at, acked_at, display, payload
+           FROM giga_cloud.commands WHERE shop_id = $1 AND status IN ('REJECTED', 'EXPIRED') ORDER BY COALESCE(acked_at, created_at) DESC LIMIT 100`,
+        [shopId]
+      )).rows;
+      const events = (await c.query(
+        `SELECT id, event_type, error, rejected_at FROM giga_cloud.rejected_events WHERE shop_id = $1 ORDER BY rejected_at DESC LIMIT 100`,
+        [shopId]
+      )).rows;
+      const retried = new Set((await c.query(
+        `SELECT display->>'retry_of' AS r FROM giga_cloud.commands WHERE shop_id = $1 AND display ? 'retry_of'`,
+        [shopId]
+      )).rows.map((x) => x.r));
+      return {
+        commands: commands.map((x) => ({
+          command_id: x.command_id,
+          command_type: x.command_type,
+          status: x.status,
+          error: safeError(x.error),
+          created_at: x.created_at,
+          acked_at: x.acked_at,
+          conflict: classifyConflict(x.command_type, x.error),
+          already_retried: retried.has(String(x.command_id)),
+          entity: commandEntity(x.command_type, x.payload)
+        })),
+        rejected_events: events.map((x) => ({ id: Number(x.id), event_type: x.event_type, error: safeError(x.error), rejected_at: x.rejected_at, conflict: classifyConflict(x.event_type, x.error) }))
+      };
+    });
+  }));
+  r.post("/admin/commands/:id/retry", requireAdmin2, commandRateLimit, route2("POST /admin/commands/:id/retry", async (req) => {
+    if (!isValidUuid(req.params.id)) throw new HttpError(400, "Command id must be a UUID.");
+    if (isAllShopsScope(req)) throw new HttpError(409, "Select the command's shop to retry it.", { code: "ALL_SHOPS_READ_ONLY" });
+    const shopId = deps.shopId(req);
+    const orig = (await deps.withCloud((c) => c.query(
+      `SELECT command_id, command_type, status, payload FROM giga_cloud.commands WHERE command_id = $1 AND shop_id = $2`,
+      [req.params.id, shopId]
+    ))).rows[0];
+    if (!orig) throw new HttpError(404, "Command not found for the selected shop.");
+    if (!["REJECTED", "EXPIRED"].includes(orig.status)) throw new HttpError(409, `Only a REJECTED or EXPIRED command can be retried (this one is ${orig.status}).`);
+    if (String(orig.command_type).startsWith("USER_") || orig.command_type === "APP_UPDATE_APPROVE") {
+      throw new HttpError(409, "Staff account and update approvals are retried from their own screens (User management / Software updates).");
+    }
+    const already = (await deps.withCloud((c) => c.query(
+      `SELECT 1 FROM giga_cloud.commands WHERE shop_id = $1 AND display->>'retry_of' = $2 LIMIT 1`,
+      [shopId, String(orig.command_id)]
+    ))).rows[0];
+    if (already) throw new HttpError(409, "This command was already retried.");
+    const body = { ...orig.payload };
+    const createField = CREATE_ID_FIELD[orig.command_type];
+    if (createField) delete body[createField];
+    const out = await queueForShop(req, shopId, orig.command_type, body, null, { retry_of: String(orig.command_id) });
+    await deps.securityEvent(req, "REMOTE_COMMAND_RETRIED", req.onlineUser.email, req.onlineUser.id, { retry_of: orig.command_id, command_id: out.command_id, command_type: orig.command_type });
+    return out;
   }));
   r.get("/admin/overview", requireAdmin2, route2("GET /admin/overview", async (req) => {
     const global = deps.isGlobalAdmin(req.onlineUser);

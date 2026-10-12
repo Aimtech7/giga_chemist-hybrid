@@ -70,12 +70,13 @@ import {
 import { runBackup, getBackupStatus } from './ops/backup';
 import { getSystemHealth } from './ops/health';
 import { appVersion, currentCommit } from './ops/runtime';
-import { pgPool } from './db/client';
+import { pgPool, isValidUuid } from './db/client';
 import { buildHistoryRouter } from './http/historyRoutes';
 import { buildInventoryRouter } from './http/inventoryRoutes';
 import { createDraftPurchaseTx } from './db/purchases';
 import { getPriceHistory } from './db/priceHistory';
 import { acknowledgeLocalAlert, listLocalAlerts } from './ops/alerts';
+import { classifyConflict } from './sync/conflicts';
 import { approveStocktake, cancelStocktake, countLine, createStocktake, getStocktake, listStocktakes, reopenStocktake, startCounting, submitStocktake } from './db/stocktakes';
 import { buildShiftRouter } from './http/shiftRoutes';
 import { openShift, getCurrentShift, closeShift, reviewShift, correctShift, listOpenTills } from './db/shifts';
@@ -850,6 +851,43 @@ apiRouter.post('/sync/now', requireRole('ADMIN'), async (req: AuthenticatedReque
 });
 
 // ADMIN: re-queue events the cloud rejected (after the cause was fixed). Idempotency keys are kept.
+// SYNC & CONFLICT CONTROL CENTER (this shop): outbox sequence, failed events, recent remote commands
+// with a plain conflict reason. Retrying an event re-sends it with its ORIGINAL idempotency key, so the
+// cloud answers DUPLICATE for anything it already has (a retry never creates a second event).
+apiRouter.get('/sync/center', requireRole('ADMIN'), async (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    const [status, seq, failed, commands] = await Promise.all([
+      getSyncStatus(),
+      pgPool.query(`SELECT MAX(seq)::bigint AS last_seq, MAX(seq) FILTER (WHERE status = 'SYNCED')::bigint AS last_synced_seq FROM sync_events`),
+      pgPool.query(`SELECT id, seq, event_type, entity_type, entity_id, business_ref, status, attempt_count, last_error, created_at, last_attempt_at
+                      FROM sync_events WHERE status = 'FAILED' OR (status = 'PENDING' AND attempt_count > 0)
+                     ORDER BY seq LIMIT 200`),
+      pgPool.query(`SELECT command_id, command_type, status, error, received_at, applied_at, acked_at
+                      FROM sync_inbound_commands ORDER BY received_at DESC LIMIT 100`),
+    ]);
+    res.json({
+      status,
+      sequence: { last_seq: seq.rows[0].last_seq !== null ? Number(seq.rows[0].last_seq) : null, last_synced_seq: seq.rows[0].last_synced_seq !== null ? Number(seq.rows[0].last_synced_seq) : null },
+      failed_events: failed.rows.map((e: any) => ({ ...e, seq: Number(e.seq), conflict: e.status === 'FAILED' ? classifyConflict(e.event_type, e.last_error) : null })),
+      commands: commands.rows.map((c: any) => ({ ...c, conflict: c.status === 'REJECTED' ? classifyConflict(c.command_type, c.error) : null })),
+    });
+  } catch (err: any) {
+    sendError(res, err, 'Could not load the sync center.', 'GET /sync/center');
+  }
+});
+apiRouter.post('/sync/events/:id/retry', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    if (!isValidUuid(req.params.id)) return res.status(400).json({ error: 'Event id must be a UUID.' });
+    const r = await pgPool.query(`UPDATE sync_events SET status = 'PENDING', next_attempt_at = CURRENT_TIMESTAMP WHERE id = $1 AND status = 'FAILED' RETURNING id, event_type`, [req.params.id]);
+    if (!r.rows[0]) return res.status(409).json({ error: 'Only a FAILED event can be retried.' });
+    await recordAuditLog({ ...actorAudit(req), action: 'SYNC_EVENT_REQUEUED', entity: 'sync_event', entity_id: req.params.id, new_value: { event_type: r.rows[0].event_type } });
+    syncWorker.wake(false);
+    res.json({ success: true, requeued: 1 });
+  } catch (err: any) {
+    sendError(res, err, 'Could not re-queue the event.', 'POST /sync/events/:id/retry');
+  }
+});
+
 apiRouter.post('/sync/retry-failed', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
   try {
     const r = await pgPool.query(

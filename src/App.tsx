@@ -18,6 +18,7 @@ import { PhysicalStockCount } from './components/stocktake/PhysicalStockCount';
 import { StocktakeSessions } from './components/stocktake/StocktakeSessions';
 import { InventoryInsights } from './components/inventory/InventoryInsights';
 import { AlertsCenter } from './components/alerts/AlertsCenter';
+import { SyncCenter } from './components/sync/SyncCenter';
 import { BatchList } from './components/inventory/BatchList';
 import { ExpiryManager } from './components/expiry/ExpiryManager';
 import { PurchaseList } from './components/purchases/PurchaseList';
@@ -39,7 +40,7 @@ import type { PharmacySettings, User } from './types';
 
 // '#app' (or any unknown hash) is not a module and must never become the current one (blank screen).
 const KNOWN_MODULES: AppModule[] = [
-  'dashboard', 'pos', 'medicines', 'inventory', 'stocktake', 'stocktakes', 'insights', 'alerts', 'batches', 'expiry', 'purchases', 'suppliers',
+  'dashboard', 'pos', 'medicines', 'inventory', 'stocktake', 'stocktakes', 'insights', 'alerts', 'sync', 'batches', 'expiry', 'purchases', 'suppliers',
   'customers', 'expenses', 'sales', 'returns', 'reports', 'users', 'audit', 'settings', 'remote', 'history',
 ];
 
@@ -359,6 +360,11 @@ export default function App() {
       {/* ALERTS CENTER - local (offline-capable) or the selected shop online */}
       {currentModule === 'alerts' && canAccessModule(currentUser, 'alerts') && (
         <AlertsCenter currentUser={currentUser} online={serverMode === 'online'} />
+      )}
+
+      {/* SYNC & CONFLICT CENTER - Administrator */}
+      {currentModule === 'sync' && canAccessModule(currentUser, 'sync') && (
+        <SyncCenter online={serverMode === 'online'} />
       )}
 
       {/* BATCHES - Restricted to Admin/Manager */}

@@ -4,7 +4,8 @@
 -- Apply after 009, BEFORE deploying the Vercel API of this release (it queues USER_PROFILE_UPDATE,
 -- which a pre-010 cloud refuses). ADDITIVE and re-runnable: no table, column or row is dropped.
 --
---   1. Command type USER_PROFILE_UPDATE (name / username / email of one shop staff account, with the
+--   1. Command types USER_PROFILE_UPDATE and SYNC_RETRY_FAILED (the shop re-sends its failed outbox
+--      events with their original idempotency keys). USER_PROFILE_UPDATE (name / username / email of one shop staff account, with the
 --      values the Administrator saw; the shop rejects a stale edit). Never a password, hash or PIN.
 --   2. gc_sync_user_credentials (shop -> cloud) re-created from 005 with two changes:
 --        * while an online USER_PROFILE_UPDATE for the account is still open, the cloud keeps the
@@ -46,7 +47,7 @@ ALTER TABLE giga_cloud.commands ADD CONSTRAINT commands_command_type_check CHECK
     'RETURN_APPROVE', 'RETURN_REJECT', 'SALE_VOID',
     'USER_SESSION_REVOKE',
     'SHIFT_REVIEW',
-    'USER_PROFILE_UPDATE'));
+    'USER_PROFILE_UPDATE', 'SYNC_RETRY_FAILED'));
 
 -- 2. Shop -> cloud credential / profile publish -----------------------------------------
 CREATE OR REPLACE FUNCTION public.gc_sync_user_credentials(p_shop_id UUID, p_token TEXT, p_users JSONB) RETURNS JSONB

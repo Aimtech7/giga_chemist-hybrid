@@ -3,6 +3,7 @@ import express, { type Request, type Response, type NextFunction } from 'express
 import type pg from 'pg';
 import { HttpError, isValidUuid } from '../db/client';
 import { getAllMedicines, getMedicineById } from '../db/medicines';
+import { classifyConflict } from '../sync/conflicts';
 import {
   validateCommandPayload, commandEntity, commandExpectation, STOCK_REMOVE_REASONS, ASSIGNABLE_ROLES, HIGH_CONFLICT_TYPES, ALL_SHOPS_TYPES,
   EXPENSE_CATEGORIES, EXPENSE_PAYMENT_METHODS, RETURN_DISPOSITIONS, PRICE_FIELDS, METADATA_FIELDS, type CommandType,
@@ -91,6 +92,7 @@ export const ACTIONS: Record<string, CommandType> = {
   'return-reject': 'RETURN_REJECT',
   'sale-void': 'SALE_VOID',
   'user-session-revoke': 'USER_SESSION_REVOKE',
+  'sync-retry-failed': 'SYNC_RETRY_FAILED',
   // Cashier shifts (cloud migration 009)
   'shift-review': 'SHIFT_REVIEW',
 };
@@ -608,6 +610,98 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
       commands: counts,
       controls: ctl,
     };
+  }));
+
+  // ------------------------------------------------------------------ SYNC & CONFLICT CONTROL CENTER
+  /**
+   * Per shop: contact, heartbeat, last sync, shop outbox sequence vs the cloud's highest processed
+   * sequence, outbox / command counts, installed version, device, last backup. Global Administrator:
+   * every active shop; a shop Administrator: their own. Read only.
+   */
+  r.get('/admin/sync-center', requireAdmin, route('GET /admin/sync-center', async (req) => {
+    const global = deps.isGlobalAdmin(req.onlineUser);
+    const shops = (await deps.withCloud((c) => (global
+      ? c.query('SELECT shop_id, shop_code, name FROM giga_cloud.shops WHERE active ORDER BY shop_code, shop_id')
+      : c.query('SELECT shop_id, shop_code, name FROM giga_cloud.shops WHERE shop_id = $1', [deps.shopId(req)])))).rows;
+    const out: Record<string, unknown>[] = [];
+    for (const s of shops) {
+      const rt = await runtimeRow(deps, s.shop_id);
+      const st = rt?.status || {};
+      const row = await deps.withCloud(async (c) => {
+        const counts = await commandCounts(c, s.shop_id);
+        const extra = (await c.query(
+          `SELECT (SELECT MAX(local_seq) FROM giga_cloud.processed_events WHERE shop_id = $1)::bigint AS cloud_last_seq,
+                  (SELECT COUNT(*) FROM giga_cloud.commands WHERE shop_id = $1 AND status = 'REJECTED' AND acked_at > now() - interval '7 days')::int AS rejected_7d,
+                  (SELECT COUNT(*) FROM giga_cloud.rejected_events WHERE shop_id = $1 AND rejected_at > now() - interval '7 days')::int AS cloud_rejected_events_7d`,
+          [s.shop_id])).rows[0];
+        return { counts, extra };
+      });
+      const shopSeq = st.outbound?.last_seq ?? null;
+      const cloudSeq = row.extra.cloud_last_seq !== null ? Number(row.extra.cloud_last_seq) : null;
+      out.push({
+        shop_id: s.shop_id, shop_code: s.shop_code, name: s.name,
+        online: rt ? rt.age_seconds <= HEARTBEAT_ONLINE_SECONDS : false, last_heartbeat_at: rt?.reported_at ?? null, heartbeat_age_seconds: rt?.age_seconds ?? null,
+        last_sync_at: rt?.last_sync_at ?? null, shop_last_seq: shopSeq, shop_last_synced_seq: st.outbound?.last_synced_seq ?? null, cloud_last_seq: cloudSeq,
+        sequence_gap: shopSeq !== null && cloudSeq !== null ? Math.max(0, shopSeq - cloudSeq) : null,
+        outbox_pending: rt?.outbound_pending ?? null, outbox_failed: rt?.outbound_failed ?? null, commands_unacknowledged_at_shop: rt?.inbound_unacked ?? null,
+        commands_pending: row.counts.pending, commands_delivered: row.counts.delivered, commands_rejected_7d: row.extra.rejected_7d,
+        cloud_rejected_events_7d: row.extra.cloud_rejected_events_7d, last_error: safeError(st.last_error ?? null),
+        installed_commit: rt?.git_commit ?? null, app_version: rt?.app_version ?? null, update_status: rt?.update_state?.status ?? null,
+        available_commit: rt?.update_state?.available_commit ?? null, device_id: rt?.device_id ?? null,
+        last_backup_at: rt?.backup?.last_success_at ?? null, backup_age_hours: rt?.backup?.age_hours ?? null, backup_verified: rt?.backup?.last_success_verified ?? null,
+      });
+    }
+    return { shops: out, server_time: new Date().toISOString() };
+  }));
+
+  /** Rejected commands and cloud-rejected events of the selected shop, with a plain conflict reason. */
+  r.get('/admin/sync-center/issues', requireAdmin, route('GET /admin/sync-center/issues', async (req) => {
+    const shopId = deps.shopId(req);
+    return deps.withCloud(async (c) => {
+      const commands = (await c.query(
+        `SELECT command_id, command_type, status, error, created_at, acked_at, display, payload
+           FROM giga_cloud.commands WHERE shop_id = $1 AND status IN ('REJECTED', 'EXPIRED') ORDER BY COALESCE(acked_at, created_at) DESC LIMIT 100`, [shopId])).rows;
+      const events = (await c.query(
+        `SELECT id, event_type, error, rejected_at FROM giga_cloud.rejected_events WHERE shop_id = $1 ORDER BY rejected_at DESC LIMIT 100`, [shopId])).rows;
+      const retried = new Set((await c.query(
+        `SELECT display->>'retry_of' AS r FROM giga_cloud.commands WHERE shop_id = $1 AND display ? 'retry_of'`, [shopId])).rows.map((x: any) => x.r));
+      return {
+        commands: commands.map((x: any) => ({
+          command_id: x.command_id, command_type: x.command_type, status: x.status, error: safeError(x.error), created_at: x.created_at, acked_at: x.acked_at,
+          conflict: classifyConflict(x.command_type, x.error), already_retried: retried.has(String(x.command_id)),
+          entity: commandEntity(x.command_type, x.payload),
+        })),
+        rejected_events: events.map((x: any) => ({ id: Number(x.id), event_type: x.event_type, error: safeError(x.error), rejected_at: x.rejected_at, conflict: classifyConflict(x.event_type, x.error) })),
+      };
+    });
+  }));
+
+  /**
+   * RETRY a REJECTED / EXPIRED command: ONE new command with the same (re-validated) payload, linked by
+   * display.retry_of. A rejected command changed nothing, so this can never apply a change twice; a
+   * second retry of the same command is refused. Staff account commands are retried from User
+   * management (they also change the cloud login), never here.
+   */
+  r.post('/admin/commands/:id/retry', requireAdmin, commandRateLimit, route('POST /admin/commands/:id/retry', async (req) => {
+    if (!isValidUuid(req.params.id)) throw new HttpError(400, 'Command id must be a UUID.');
+    if (isAllShopsScope(req)) throw new HttpError(409, 'Select the command\'s shop to retry it.', { code: 'ALL_SHOPS_READ_ONLY' });
+    const shopId = deps.shopId(req);
+    const orig = (await deps.withCloud((c) => c.query(
+      `SELECT command_id, command_type, status, payload FROM giga_cloud.commands WHERE command_id = $1 AND shop_id = $2`, [req.params.id, shopId]))).rows[0];
+    if (!orig) throw new HttpError(404, 'Command not found for the selected shop.');
+    if (!['REJECTED', 'EXPIRED'].includes(orig.status)) throw new HttpError(409, `Only a REJECTED or EXPIRED command can be retried (this one is ${orig.status}).`);
+    if (String(orig.command_type).startsWith('USER_') || orig.command_type === 'APP_UPDATE_APPROVE') {
+      throw new HttpError(409, 'Staff account and update approvals are retried from their own screens (User management / Software updates).');
+    }
+    const already = (await deps.withCloud((c) => c.query(
+      `SELECT 1 FROM giga_cloud.commands WHERE shop_id = $1 AND display->>'retry_of' = $2 LIMIT 1`, [shopId, String(orig.command_id)]))).rows[0];
+    if (already) throw new HttpError(409, 'This command was already retried.');
+    const body = { ...orig.payload };
+    const createField = CREATE_ID_FIELD[orig.command_type as CommandType];
+    if (createField) delete body[createField];
+    const out = await queueForShop(req, shopId, orig.command_type as CommandType, body, null, { retry_of: String(orig.command_id) });
+    await deps.securityEvent(req, 'REMOTE_COMMAND_RETRIED', req.onlineUser.email, req.onlineUser.id, { retry_of: orig.command_id, command_id: out.command_id, command_type: orig.command_type });
+    return out;
   }));
 
   // ------------------------------------------------------------------ GLOBAL CONTROL CENTER

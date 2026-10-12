@@ -56,6 +56,9 @@ export const COMMAND_TYPES = [
   'SHIFT_REVIEW',
   // Unified accounts (cloud migration 010): name / username / email of a shop staff account.
   'USER_PROFILE_UPDATE',
+  // Sync control center (cloud migration 010): the shop re-sends its FAILED outbox events with their
+  // ORIGINAL idempotency keys (the cloud answers DUPLICATE for anything it already has).
+  'SYNC_RETRY_FAILED',
 ] as const;
 export type CommandType = (typeof COMMAND_TYPES)[number];
 
@@ -622,6 +625,11 @@ export function validateCommandPayload(type: string, payload: unknown): Record<s
       const reason = reasonText(p.reason, false);
       if (reason) out.reason = reason;
       return out;
+    }
+    case 'SYNC_RETRY_FAILED': {
+      onlyKeys(p, ['reason'], 'SYNC_RETRY_FAILED');
+      const reason = reasonText(p.reason, false);
+      return reason ? { reason } : {};
     }
     case 'USER_SESSION_REVOKE': {
       onlyKeys(p, ['user_id', 'reason'], 'USER_SESSION_REVOKE');

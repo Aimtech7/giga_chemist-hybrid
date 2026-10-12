@@ -104,7 +104,8 @@ async function buildStatus(worker: WorkerSnapshot) {
     SELECT COUNT(*) FILTER (WHERE status IN ('PENDING', 'PROCESSING'))::int AS pending,
            COUNT(*) FILTER (WHERE status = 'FAILED')::int AS failed,
            MIN(created_at) FILTER (WHERE status IN ('PENDING', 'PROCESSING')) AS oldest_pending_at,
-           MAX(synced_at) AS last_synced_at
+           MAX(synced_at) AS last_synced_at,
+           MAX(seq) AS last_seq, MAX(seq) FILTER (WHERE status = 'SYNCED') AS last_synced_seq
       FROM sync_events`);
   const inbound = await q<any>(`SELECT COUNT(*) FILTER (WHERE acked_at IS NULL)::int AS unacked,
                                        COUNT(*) FILTER (WHERE status = 'REJECTED' AND received_at > now() - interval '1 day')::int AS rejected_24h
@@ -145,7 +146,8 @@ async function buildStatus(worker: WorkerSnapshot) {
     uptime_seconds: Math.round(process.uptime()),
     db_healthy: Boolean(dbOk),
     worker: { running: worker.running, leader: worker.leader, consecutive_failures: worker.consecutive_failures, halted: sanitizeText(worker.halted_reason) },
-    outbound: out ? { pending: out.pending, failed: out.failed, oldest_pending_at: out.oldest_pending_at } : null,
+    outbound: out ? { pending: out.pending, failed: out.failed, oldest_pending_at: out.oldest_pending_at,
+      last_seq: out.last_seq !== null ? Number(out.last_seq) : null, last_synced_seq: out.last_synced_seq !== null ? Number(out.last_synced_seq) : null } : null,
     inbound: inbound ? { unacked: inbound.unacked, rejected_24h: inbound.rejected_24h } : null,
     last_sync_at: state?.last_success_at || (out?.last_synced_at ? new Date(out.last_synced_at).toISOString() : null),
     last_error: sanitizeText(state?.last_error),

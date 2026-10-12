@@ -2,6 +2,7 @@ import { assertDevDatabase, cleanupFixtures, getServerLog, pool, startServer, st
 import { setupHybridCloud, type HybridEnv } from './hybrid.test';
 import { stocktakeTests } from './stocktake.test';
 import { alertsTests } from './alerts.test';
+import { stopSyncCenterOnline, syncCenterTests } from './synccenter.test';
 
 /**
  * Formal stocktake + Alerts Center suite.   npm run test:stocktake
@@ -51,12 +52,14 @@ async function main() {
     await startServer();
     await stocktakeTests(env, admin, manager, cashier);
     await alertsTests(env, admin, manager, cashier);
+    await syncCenterTests(env, admin, manager, cashier);
   } catch (err: any) {
     section('ABORTED');
     check(false, `suite aborted: ${err?.message || err}`);
     console.error(err?.stack || err);
     console.error(getServerLog().split('\n').slice(-40).join('\n'));
   } finally {
+    await stopSyncCenterOnline();
     await stopServer();
     if (env) await env.emu.close().catch(() => {});
     console.log('[stocktake] post-run fixture cleanup:', await cleanupFixtures());
