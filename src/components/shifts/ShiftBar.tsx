@@ -1,27 +1,44 @@
 import React, { useEffect, useState } from 'react';
-import { Loader2, Lock, Printer, Wallet, X } from 'lucide-react';
+import { AlertCircle, Loader2, Lock, Printer, RefreshCw, Wallet, X } from 'lucide-react';
 import { ApiError } from '../../services/http';
 import {
   closeShift, fmtMoney, fmtVariance, getShiftMedicines, openShift, printShiftReport, varianceLabel,
-  type LiveTotals, type Shift, type ShiftMedicine,
+  type LiveTotals, type Shift, type ShiftMedicine, type ShiftStatusState,
 } from '../../services/shifts';
 import { navigateTo } from '../../services/navigation';
-import type { PharmacySettings } from '../../types';
+import { hasPermission } from '../../services/permissions';
+import type { PharmacySettings, User as UserType } from '../../types';
+
+export interface ShiftBarProps {
+  settings: PharmacySettings;
+  shiftStatus?: ShiftStatusState;
+  shift?: Shift | null;
+  live?: LiveTotals | null;
+  errorReason?: string | null;
+  currentUser?: UserType | null;
+  onRetry?: () => void | Promise<void>;
+  onChanged: () => void | Promise<void>;
+  openShiftInputRef?: React.RefObject<HTMLInputElement | null>;
+}
 
 /**
- * POS shift strip. No open shift: OPEN SHIFT card (opening float) — searching medicines still works,
- * only checkout needs the shift. Open shift: live summary (payments, transactions; never profit)
- * + Close Shift. Works with NO internet: everything goes to the local POS server.
+ * POS shift strip with explicit states: LOADING, NO_SHIFT, OPEN_SHIFT, ERROR.
+ * Never silently renders null/nothing so cashier/admin are never stuck at checkout.
  */
-export const ShiftBar: React.FC<{
-  settings: PharmacySettings;
-  shift: Shift | null | undefined;
-  live: LiveTotals | null;
-  onChanged: () => void | Promise<void>;
-}> = ({ settings, shift, live, onChanged }) => {
+export const ShiftBar: React.FC<ShiftBarProps> = ({
+  settings,
+  shiftStatus,
+  shift,
+  live,
+  errorReason,
+  currentUser,
+  onRetry,
+  onChanged,
+  openShiftInputRef,
+}) => {
   const cur = settings.currency || 'KES';
   const money = (n: number | null | undefined) => fmtMoney(cur, n);
-  const [float, setFloat] = useState('');
+  const [float, setFloat] = useState('0');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // The shift being closed is kept here: after the close the bar reloads (no open shift) while the
@@ -31,21 +48,96 @@ export const ShiftBar: React.FC<{
     <CloseShiftDialog settings={settings} shift={closing.shift} live={closing.live} onClose={() => setClosing(null)} onDone={onChanged} />
   );
 
-  if (shift === undefined) return dialog || null; // still loading / server without shifts
+  // Derive explicit state if not provided
+  const status: ShiftStatusState = shiftStatus ?? (
+    shift === undefined ? 'LOADING' :
+    shift === null ? 'NO_SHIFT' :
+    'OPEN_SHIFT'
+  );
 
-  if (!shift) {
+  // 1. LOADING STATE
+  if (status === 'LOADING') {
+    return (
+      <>
+        {dialog}
+        <div className="mx-3 mt-2 rounded-lg border border-slate-300 bg-slate-50 px-4 py-3 flex items-center gap-3 text-xs text-slate-700 shadow-xs">
+          <Loader2 className="w-5 h-5 text-teal-600 animate-spin shrink-0" />
+          <div className="flex flex-col">
+            <span className="font-bold text-slate-800">Checking shift status...</span>
+            <span className="text-[11px] text-slate-500">Contacting local POS server to verify active cashier drawer.</span>
+          </div>
+        </div>
+      </>
+    );
+  }
+
+  // 2. ERROR STATE
+  if (status === 'ERROR') {
+    return (
+      <>
+        {dialog}
+        <div className="mx-3 mt-2 rounded-lg border-2 border-rose-400 bg-rose-50 p-3.5 text-xs text-rose-900 shadow-xs">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-start gap-2.5">
+              <AlertCircle className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
+              <div>
+                <div className="text-sm font-black tracking-wide text-rose-900">SHIFT STATUS UNAVAILABLE</div>
+                <div className="text-xs text-rose-800 mt-0.5">Could not load the current shift. You must open a shift before completing sales.</div>
+                {errorReason && (
+                  <div className="mt-1.5 text-[11px] font-mono bg-white/90 border border-rose-200 rounded px-2.5 py-1 text-rose-900 font-semibold">
+                    Reason: {errorReason}
+                  </div>
+                )}
+              </div>
+            </div>
+            {onRetry && (
+              <button
+                type="button"
+                onClick={() => void onRetry()}
+                className="px-3.5 py-1.5 rounded bg-rose-700 hover:bg-rose-800 text-white font-bold text-xs flex items-center gap-1.5 shrink-0 transition shadow-xs cursor-pointer"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>Retry</span>
+              </button>
+            )}
+          </div>
+        </div>
+      </>
+    );
+  }
+
+  // 3. NO SHIFT STATE
+  if (status === 'NO_SHIFT' || !shift) {
+    const canOpen = currentUser ? hasPermission(currentUser, 'shift.open') : true;
+
+    if (!canOpen) {
+      return (
+        <>
+          {dialog}
+          <div className="mx-3 mt-2 rounded-lg border-2 border-amber-300 bg-amber-50 p-3 text-xs text-amber-900 shadow-xs flex items-center gap-3">
+            <Lock className="w-5 h-5 text-amber-700 shrink-0" />
+            <div>
+              <div className="font-bold text-amber-900">SHIFT NOT OPEN</div>
+              <div className="text-[11px] text-amber-800">You must open a shift before completing sales. Contact an Administrator to open a shift.</div>
+            </div>
+          </div>
+        </>
+      );
+    }
+
     const submit = async (e: React.FormEvent) => {
       e.preventDefault();
-      const n = Number(float);
-      if (float.trim() === '' || !Number.isFinite(n) || n < 0) {
-        setError('Enter the opening cash float (0 or more).');
+      const trimmed = float.trim();
+      const n = trimmed === '' ? 0 : Number(trimmed);
+      if (!Number.isFinite(n) || n < 0) {
+        setError('Enter a valid opening cash float (0 or more).');
         return;
       }
       setBusy(true);
       setError(null);
       try {
         await openShift(Math.round(n * 100) / 100);
-        setFloat('');
+        setFloat('0');
         await onChanged();
       } catch (err: any) {
         setError(err?.message || 'Could not open the shift.');
@@ -53,50 +145,80 @@ export const ShiftBar: React.FC<{
         setBusy(false);
       }
     };
+
     return (
       <>
-      {dialog}
-      <form onSubmit={submit} className="mx-3 mt-2 rounded-lg border-2 border-amber-400 bg-amber-50 p-3 flex flex-wrap items-end gap-3">
-        <div className="flex items-center gap-2 text-amber-900">
-          <Lock className="w-5 h-5" />
-          <div>
-            <div className="text-sm font-black tracking-wide">OPEN SHIFT</div>
-            <div className="text-[11px]">Count the cash in the drawer. You can search medicines now; selling starts after the shift is open.</div>
+        {dialog}
+        <form onSubmit={submit} className="mx-3 mt-2 rounded-lg border-2 border-amber-400 bg-amber-50 p-3.5 shadow-xs">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5 text-amber-950">
+              <div className="w-9 h-9 rounded-full bg-amber-200 border border-amber-300 flex items-center justify-center shrink-0">
+                <Lock className="w-5 h-5 text-amber-800" />
+              </div>
+              <div>
+                <div className="text-sm font-black tracking-wide text-amber-950 flex items-center gap-2">
+                  <span>SHIFT NOT OPEN</span>
+                  <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-200 text-amber-900 uppercase">Sales Locked</span>
+                </div>
+                <div className="text-xs text-amber-900 font-medium mt-0.5">
+                  You must open a shift before completing sales.
+                </div>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-end gap-3 ml-auto">
+              <label className="text-xs font-bold text-slate-800 flex flex-col">
+                <span>Opening Cash Float</span>
+                <div className="flex items-center mt-1">
+                  <span className="px-2.5 py-2 bg-slate-100 border border-r-0 border-slate-300 rounded-l text-xs font-bold text-slate-600">{cur}</span>
+                  <input
+                    ref={openShiftInputRef}
+                    autoFocus
+                    inputMode="decimal"
+                    value={float}
+                    onChange={(e) => setFloat(e.target.value)}
+                    placeholder="0"
+                    className="w-32 px-2.5 py-2 border border-slate-300 rounded-r text-sm font-mono font-bold bg-white focus:ring-2 focus:ring-teal-600 outline-none"
+                    aria-label="Opening cash float"
+                  />
+                </div>
+              </label>
+              <button
+                type="submit"
+                disabled={busy}
+                className="px-5 py-2 rounded bg-teal-700 hover:bg-teal-800 text-white text-xs font-extrabold flex items-center gap-1.5 disabled:opacity-50 transition shadow-sm cursor-pointer"
+              >
+                {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wallet className="w-4 h-4" />}
+                <span>OPEN SHIFT</span>
+              </button>
+            </div>
           </div>
-        </div>
-        <label className="text-xs font-semibold text-slate-700">
-          Opening Cash Float
-          <div className="flex items-center mt-0.5">
-            <span className="px-2 py-2 bg-white border border-r-0 border-slate-300 rounded-l text-xs text-slate-500">{cur}</span>
-            <input autoFocus inputMode="decimal" value={float} onChange={(e) => setFloat(e.target.value)} placeholder="e.g. 2000"
-              className="w-32 px-2 py-2 border border-slate-300 rounded-r text-sm font-mono focus:ring-2 focus:ring-teal-600 outline-none" aria-label="Opening cash float" />
-          </div>
-        </label>
-        <button type="submit" disabled={busy} className="px-4 py-2 rounded bg-teal-700 hover:bg-teal-800 text-white text-xs font-bold flex items-center gap-1 disabled:opacity-50">
-          {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wallet className="w-4 h-4" />} Open Shift
-        </button>
-        {error && <div className="w-full text-xs text-rose-700">{error}</div>}
-      </form>
+          {error && <div className="mt-2 text-xs font-semibold text-rose-700 bg-rose-100/60 border border-rose-200 rounded px-2.5 py-1">{error}</div>}
+        </form>
       </>
     );
   }
 
+  // 4. OPEN SHIFT STATE
   const t = live;
   return (
     <>
-      <div className="mx-3 mt-2 rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-slate-700">
-        <div className="font-black text-emerald-800 text-xs tracking-wide">CURRENT SHIFT</div>
-        <span>Opened <b>{new Date(shift.opened_at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</b></span>
-        <span>Float <b>{money(shift.opening_float)}</b></span>
-        <span>Transactions <b>{t?.total_transactions ?? 0}</b></span>
-        <span>Sales <b>{money(t?.total_sales)}</b></span>
-        <span>Cash <b>{money(t?.cash_sales)}</b></span>
-        <span>M-Pesa <b>{money(t?.mpesa_sales)}</b></span>
-        {!!t?.card_sales && <span>Card <b>{money(t.card_sales)}</b></span>}
-        {!!t?.bank_sales && <span>Bank <b>{money(t.bank_sales)}</b></span>}
+      <div className="mx-3 mt-2 rounded-lg border border-emerald-300 bg-emerald-50 px-3.5 py-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-slate-700 shadow-xs">
+        <div className="font-black text-emerald-800 text-xs tracking-wide flex items-center gap-1.5">
+          <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+          <span>CURRENT SHIFT</span>
+        </div>
+        <span>Opened: <b>{new Date(shift.opened_at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</b></span>
+        <span>Opening Float: <b>{money(shift.opening_float)}</b></span>
+        <span>Transactions: <b>{t?.total_transactions ?? 0}</b></span>
+        <span>Sales: <b>{money(t?.total_sales)}</b></span>
+        <span>Cash: <b>{money(t?.cash_sales)}</b></span>
+        <span>M-Pesa: <b>{money(t?.mpesa_sales)}</b></span>
+        {!!t?.card_sales && <span>Card: <b>{money(t.card_sales)}</b></span>}
+        {!!t?.bank_sales && <span>Bank: <b>{money(t.bank_sales)}</b></span>}
         <div className="ml-auto flex gap-1.5">
-          <button onClick={() => navigateTo('history', 'shifts', { shift_id: shift.id })} className="px-2.5 py-1 rounded border border-emerald-400 bg-white text-emerald-800 font-semibold">Shift Details</button>
-          <button onClick={() => setClosing({ shift, live })} className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-900 text-white font-bold">Close Shift</button>
+          <button onClick={() => navigateTo('history', 'shifts', { shift_id: shift.id })} className="px-2.5 py-1 rounded border border-emerald-400 bg-white hover:bg-emerald-50 text-emerald-800 font-semibold transition cursor-pointer">Shift Details</button>
+          <button onClick={() => setClosing({ shift, live })} className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-900 text-white font-bold transition cursor-pointer">Close Shift</button>
         </div>
       </div>
       {dialog}

@@ -89,14 +89,15 @@ export default function App() {
 
       if (isProtected) {
         if (cached) {
-          // Check if specific module in hash or path is allowed for this user
-          const rawModule = hash.replace('#', '').replace('/app/', '') as AppModule;
-          // Only real module names ("#app" is the shell, not a module: it used to blank the screen for Admins).
-          if (rawModule && KNOWN_MODULES.includes(rawModule) && canAccessModule(cached, rawModule)) {
-            setCurrentModule(rawModule);
-          } else if (isCashier(cached)) {
-            // Cashier defaults to POS register
+          if (isCashier(cached)) {
+            // Cashier must land directly on POS
             setCurrentModule('pos');
+          } else {
+            const rawModule = hash.replace('#', '').replace('/app/', '') as AppModule;
+            // Only real module names ("#app" is the shell, not a module: it used to blank the screen for Admins).
+            if (rawModule && KNOWN_MODULES.includes(rawModule) && canAccessModule(cached, rawModule)) {
+              setCurrentModule(rawModule);
+            }
           }
           setViewMode('app');
         } else {
@@ -165,7 +166,7 @@ export default function App() {
       return;
     }
     const userToEvaluate = currentUser || cached;
-    const targetModule = canAccessModule(userToEvaluate, module) ? module : 'pos';
+    const targetModule = isCashier(userToEvaluate) ? 'pos' : (canAccessModule(userToEvaluate, module) ? module : 'pos');
     setCurrentModule(targetModule);
     setViewMode('app');
     window.location.hash = '#app';
@@ -185,7 +186,7 @@ export default function App() {
         const verified = await verifySession();
         if (verified) {
           setCurrentUser(verified);
-          if (isCashier(verified) && !canAccessModule(verified, currentModule)) {
+          if (isCashier(verified)) {
             setCurrentModule('pos');
           }
           syncFromLocalApiToDexie().catch((e) => console.warn('[App] Local sync failed:', e));
