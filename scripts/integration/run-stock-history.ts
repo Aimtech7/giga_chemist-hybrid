@@ -3,6 +3,8 @@ import { assertDevDatabase, check, cleanupFixtures, getServerLog, pool, section,
 import { prepareCloudDatabase } from '../cloud-emulator';
 import { CLOUD_TEST_DB } from './hybrid.test';
 import { stockHistoryApiTests, stockHistoryCalculationTests } from './stock-history.test';
+import { insightsApiTests, insightsCalculationTests } from './insights.test';
+import { businessDayApiTests, businessDayTests } from './businessday.test';
 
 /**
  * Daily Stock History suite.   npm run test:stock-history
@@ -38,10 +40,14 @@ async function main() {
   const cloudPool = new pg.Pool({ connectionString: url.toString() });
   try {
     await stockHistoryCalculationTests(admin, cloudPool);
+    await insightsCalculationTests(admin);
+    await businessDayTests(admin);
     // Shop 1 runs hybrid: same here, with its cloud UNREACHABLE (port 9 refuses) and the worker off.
     setServerEnv({ APP_MODE: 'hybrid', SYNC_ENABLED: 'false', SUPABASE_URL: 'http://127.0.0.1:9', SUPABASE_ANON_KEY: 'itest-offline', SUPABASE_SERVICE_ROLE_KEY: '', SYNC_SHOP_TOKEN: 'itest-offline-token', SHOP_ID: '' });
     await startServer();
     await stockHistoryApiTests(admin, cashier, manager);
+    await insightsApiTests(admin, cashier, manager);
+    await businessDayApiTests(admin, cashier, manager);
   } catch (err: any) {
     section('ABORTED');
     check(false, `suite aborted: ${err?.message || err}`);

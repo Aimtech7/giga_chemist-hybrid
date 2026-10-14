@@ -61,6 +61,8 @@ export interface LiveTotals extends ShiftFigures {
 
 export interface ShiftMedicine { medicine_id: string; name: string; quantity_sold: number; returned: number; net_sold: number }
 
+export type ShiftStatusState = 'LOADING' | 'NO_SHIFT' | 'OPEN_SHIFT' | 'ERROR';
+
 export const getCurrentShift = () => apiFetch<{ shift: Shift | null; live?: LiveTotals }>('/api/shifts/current');
 export const openShift = (opening_float: number) => apiFetch<{ created: boolean; shift: Shift; live: LiveTotals }>('/api/shifts/open', { body: { opening_float } });
 export const closeShift = (id: string, body: { actual_cash: number; closing_notes?: string; expected_cash_seen?: number; admin_close_reason?: string }) =>

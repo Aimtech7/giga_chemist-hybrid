@@ -1,5 +1,7 @@
 import 'dotenv/config';
 import crypto from 'crypto';
+import os from 'os';
+import path from 'path';
 import { spawn, type ChildProcess } from 'child_process';
 import pg from 'pg';
 import { getDatabaseConnectionConfig } from '../../server/db/client';
@@ -93,7 +95,11 @@ export async function startServer(): Promise<void> {
   serverLog = '';
   server = spawn(process.execPath, ['--import', 'tsx', 'server.ts'], {
     // Higher login rate limit for this private test server only (the suite logs in many times).
-    env: { ...process.env, ...modeEnv(), ...serverEnv, PORT: String(PORT), AUTH_RATE_LIMIT_PER_MINUTE: '1000' },
+    // Backups of a test server never go to the real BACKUP_DIR and the daily scheduler is off (a suite
+    // running at the scheduled time used to start a dev-database dump in the real backup folder).
+    // A suite can still override both through setServerEnv (ops suite).
+    env: { ...process.env, ...modeEnv(), BACKUP_ENABLED: 'false', BACKUP_DIR: path.join(os.tmpdir(), 'giga-itest-backups'),
+      ...serverEnv, PORT: String(PORT), AUTH_RATE_LIMIT_PER_MINUTE: '1000' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const stream = Boolean(process.env.ITEST_STREAM_SERVER_LOG);
@@ -265,6 +271,11 @@ export async function cleanupFixtures(): Promise<Record<string, number>> {
         AND NOT EXISTS (SELECT 1 FROM expenses e WHERE e.shift_id = x.id)`;
     await client.query(`DELETE FROM cashier_shift_corrections WHERE shift_id IN (${testShifts})`);
     counts.shifts = (await client.query(`DELETE FROM cashier_shifts WHERE id IN (${testShifts})`)).rowCount || 0;
+    // Stocktakes started by test users (022), lines first.
+    if ((await client.query(`SELECT to_regclass('stocktakes') IS NOT NULL AS ok`)).rows[0].ok) {
+      await client.query(`DELETE FROM stocktake_lines WHERE stocktake_id IN (SELECT id FROM stocktakes WHERE started_by IN (${itestUsers}))`);
+      counts.stocktakes = (await client.query(`DELETE FROM stocktakes WHERE started_by IN (${itestUsers})`)).rowCount || 0;
+    }
     counts.movements = (await client.query(
       `DELETE FROM inventory_movements WHERE medicine_id IN (SELECT id FROM medicines WHERE barcode LIKE 'ITEST-%')`
     )).rowCount || 0;

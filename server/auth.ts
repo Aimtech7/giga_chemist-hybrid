@@ -170,6 +170,16 @@ export const ROLE_PERMISSIONS: Record<UserRole, string[]> = {
     'shift.view_all',
     'shift.review',
     'shift.correct',
+    // Formal stocktake, alerts, backups, updates, data integrity.
+    'stocktake.create',
+    'stocktake.count',
+    'stocktake.approve',
+    'stocktake.view',
+    'alerts.view',
+    'alerts.manage',
+    'backup.view',
+    'update.approve',
+    'integrity.view',
   ],
   MANAGER: [
     'medicine.view',
@@ -191,6 +201,11 @@ export const ROLE_PERMISSIONS: Record<UserRole, string[]> = {
     'shift.view_own',
     'shift.view_all',
     'shift.review',
+    // Stocktake: create / count / view (approval changes stock: Administrator only).
+    'stocktake.create',
+    'stocktake.count',
+    'stocktake.view',
+    'alerts.view',
   ],
   // Cashier: History -> Stock History only (quantities, own shop, read only). No sales.view_all,
   // stock.receive, inventory.view or reports.view.
@@ -205,6 +220,8 @@ export const ROLE_PERMISSIONS: Record<UserRole, string[]> = {
     'shift.open',
     'shift.close',
     'shift.view_own',
+    // Counts ONLY in a stocktake that allows cashier counting (checked per session), blind.
+    'stocktake.count',
   ],
 };
 

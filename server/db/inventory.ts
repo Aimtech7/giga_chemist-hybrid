@@ -1,3 +1,4 @@
+import { setPriceContext } from './priceHistory';
 import crypto from 'crypto';
 import type pg from 'pg';
 import { pgPool, cleanUuid, HttpError, requireUuid, withTransaction } from './client';
@@ -15,7 +16,7 @@ export async function getAllMovements(): Promise<InventoryMovement[]> {
       COALESCE(im.adjustment_quantity, 0)::int as adjustment_quantity,
       COALESCE(im.new_quantity, 0)::int as new_quantity,
       im.reason, im.movement_type, im.reference_id, im.notes,
-      im.user_id, u.name as user_name,
+      im.user_id, COALESCE(user_name_at(im.user_id, im.created_at), u.name) as user_name,
       im.device_id, im.date, im.created_at
     FROM inventory_movements im
     LEFT JOIN medicines m ON im.medicine_id = m.id
@@ -389,6 +390,7 @@ export async function adminAddStockTx(client: pg.PoolClient, params: AdminAddSto
     previousQty = Number(existing.quantity_available) || 0;
     const newQty = previousQty + quantity;
     const effectiveExpiry = expiryDate ?? existing.expiry_date ?? null;
+    await setPriceContext(client, params, 'BATCH_EDIT', { reason: 'Stock added' });
     const upd = await client.query(`
       UPDATE medicine_batches
       SET quantity_available = $1,
@@ -840,6 +842,7 @@ export async function adminUpdateBatchTx(client: pg.PoolClient, params: AdminUpd
   if (params.supplier_id && !(await client.query('SELECT 1 FROM suppliers WHERE id = $1', [params.supplier_id])).rows[0]) {
     throw new HttpError(404, 'Supplier not found.');
   }
+  await setPriceContext(client, params, 'BATCH_EDIT', { reason: 'Batch edited' });
   const upd = await client.query(`
     UPDATE medicine_batches SET
       batch_number = COALESCE($2, batch_number),

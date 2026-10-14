@@ -27,7 +27,16 @@ export type PermissionKey =
   | 'shift.view_own'
   | 'shift.view_all'
   | 'shift.review'
-  | 'shift.correct';
+  | 'shift.correct'
+  | 'stocktake.create'
+  | 'stocktake.count'
+  | 'stocktake.approve'
+  | 'stocktake.view'
+  | 'alerts.view'
+  | 'alerts.manage'
+  | 'backup.view'
+  | 'update.approve'
+  | 'integrity.view';
 
 export interface User {
   id: string;

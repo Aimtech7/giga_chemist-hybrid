@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import pg from 'pg';
 import { api, BASE, check, login, pool, section, upsertFixtureMedicine, type Fixture } from './harness';
 import { stockHistory, stockHistoryDetail } from '../../server/db/stockHistory';
-import { salesHistory, type HistoryScope } from '../../server/db/history';
+import { salesHistory, soldMedicines, type HistoryScope } from '../../server/db/history';
 import { HttpError } from '../../server/db/client';
 
 /**
@@ -281,6 +281,29 @@ export async function stockHistoryCalculationTests(admin: Fixture, cloudPool: pg
     const sh = await salesHistory(local, { from: D1, to: D1, medicine_id: M.A, page_size: 25 });
     check(sh.summary!.units_sold === a1.gross_sold, 'TEST 29: Sales History units for the medicine/day = Stock History gross sold', { sales: sh.summary!.units_sold, stock: a1.gross_sold });
 
+    section('SOLD MEDICINES (POS "Today\'s Sold Medicines") — CALCULATION');
+    const sold = await soldMedicines(local, { date: D1, search: RUN }, { allowDate: true });
+    const sa = sold.items.find((x: any) => x.medicine_id === M.A), sl = sold.items.find((x: any) => x.medicine_id === M.L);
+    check(sold.date === D1 && sa?.gross_sold === 6 && sa.retail_qty === 6 && sa.wholesale_qty === 0 && sa.transactions === 3,
+      'SOLD 1: Monday gross sold 6 = 2 + 3 + 1 in 3 sales (the VOIDED sale is excluded); legacy sales without a mode count as retail', sa);
+    check(sa?.returned === 3 && sa?.net_sold === 3, 'SOLD 2: returned = APPROVED returns of that day\'s sales (2 restocked + 1 damaged); pending / rejected not counted', sa);
+    check(sl?.gross_sold === 5 && sold.totals.gross_sold === 11 && sold.totals.transactions === 4, 'SOLD 3: totals over the day (6 + 5 units; 4 non-voided sales: 3 for A, 1 for L)', sold.totals);
+    check(sa?.gross_sold === a1.gross_sold, 'SOLD 3: same "Sold" definition as Stock History', { sold: sa?.gross_sold, stock: a1.gross_sold });
+    check(!('revenue' in (sa || {})) && !COST_KEYS.test(JSON.stringify(sold)), 'SOLD 4: no money or cost field without the cost permission');
+    const soldCost = await soldMedicines({ ...local, includeCost: true }, { date: D1, search: RUN }, { allowDate: true });
+    const sac = soldCost.items.find((x: any) => x.medicine_id === M.A);
+    check(sac?.revenue === 600 && sac?.cost === 360 && sac?.refunds === 200 && sac?.gross_profit === 40, 'SOLD 5: Administrator sees revenue 600, refunds 200, cost 360, profit 40', sac);
+    const forced = await soldMedicines(local, { date: D1, search: RUN }, { allowDate: false });
+    check(forced.date !== D1 && forced.is_today, 'SOLD 6: without the date permission (cashier) the date is always TODAY', forced.date);
+    const soldC = await soldMedicines(cloud1, { date: D1, search: RUN }, { allowDate: true });
+    check(soldC.items.find((x: any) => x.medicine_id === M.A)?.gross_sold === 6 && !soldC.items.some((x: any) => x.shop_id === s2),
+      'SOLD 7: cloud source gives the same gross sold (6) and only the authorized shop');
+    const soldAll = await soldMedicines(cloudAll, { date: D1, search: RUN }, { allowDate: true });
+    check(soldAll.items.some((x: any) => x.shop_id === s2 && x.gross_sold === 10) && soldAll.items.some((x: any) => x.shop_id === s1), 'SOLD 8: All Shops keeps each shop\'s rows');
+    let soldDenied = false;
+    try { await soldMedicines(cloud1, { date: D1, shop_id: s2 }, { allowDate: true }); } catch (e) { soldDenied = e instanceof HttpError && e.status === 403; }
+    check(soldDenied, 'SOLD 9: a Shop 1 scope asking for Shop 2 -> 403');
+
     // Never today's stock for a past day: change today's batch quantity in this transaction; Monday is unchanged.
     await lc.query('UPDATE medicine_batches SET quantity_available = 500 WHERE medicine_id = $1', [M.A]);
     const again = rowOf(await stockHistory(local, { q: RUN, date: D1 }), M.A, D1);
@@ -386,6 +409,22 @@ export async function stockHistoryApiTests(admin: Fixture, cashier: Fixture, man
   check(rm.status === 200 && (await api('GET', '/api/history/sales', managerToken)).status === 200 && (await api('GET', '/api/history/supplies', managerToken)).status === 200
     && (await api('POST', '/api/inventory/set-stock', managerToken, { medicine_id: med, batch_id: batchId, quantity: 99, reason: 'x' })).status === 403,
     'TEST 40: MANAGER: Sales + Supply + Stock History, still no stock adjustment');
+  section('SOLD MEDICINES — LOCAL API (cashier / manager / admin)');
+  const yday = new Date(Date.parse(`${r.data.today}T00:00:00Z`) - 86_400_000).toISOString().slice(0, 10);
+  const sc = await api('GET', `/api/history/sold?search=${encodeURIComponent(`Api Tabs ${RUN}`)}&date=${yday}`, cashierToken);
+  const srow = sc.data?.items?.find((x: any) => x.medicine_id === med);
+  check(sc.status === 200 && sc.data.is_today && srow?.gross_sold === 3 && srow?.net_sold === 3 && srow?.current_stock === 22 && srow?.transactions === 1,
+    'SOLD API 1: CASHIER sees today\'s sold medicines (3 sold, voided sale excluded, stock 22); a requested other date is ignored', sc.data);
+  check(!COST_KEYS.test(JSON.stringify(sc.data)) && !/"revenue"|"refunds"|"cost"/.test(JSON.stringify(sc.data)), 'SOLD API 2: cashier response has quantities only (no money)');
+  const sm = await api('GET', `/api/history/sold?search=${encodeURIComponent(`Api Tabs ${RUN}`)}&date=${yday}`, managerToken);
+  check(sm.status === 200 && sm.data.date === yday && !/"revenue"/.test(JSON.stringify(sm.data)), 'SOLD API 3: MANAGER can pick another date; still no money', sm.data?.date);
+  const sad = await api('GET', `/api/history/sold?search=${encodeURIComponent(`Api Tabs ${RUN}`)}`, adminToken);
+  const arow = sad.data?.items?.find((x: any) => x.medicine_id === med);
+  check(sad.status === 200 && arow?.revenue === 3 * price && typeof arow?.gross_profit === 'number', 'SOLD API 4: ADMIN sees revenue / cost / profit', arow);
+  check((await api('GET', `/api/history/sold?shop_id=${other}`, cashierToken)).status === 403, 'SOLD API 5: another shop_id -> 403');
+  check((await api('POST', '/api/history/sold', adminToken, {})).status === 405, 'SOLD API 6: read only (writes -> 405)');
+  check((await api('GET', '/api/history/sold?date=2025-13-40', adminToken)).status === 400, 'SOLD API 7: invalid date -> 400');
+
   const after = await counts();
   check(JSON.stringify(before) === JSON.stringify(after), 'viewing / exporting stock history changed nothing (sales, movements, returns, purchases, stock)', { before, after });
 }

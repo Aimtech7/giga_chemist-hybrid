@@ -31,6 +31,15 @@ const ROLE_PERMISSIONS: Record<UserRole, PermissionKey[]> = {
     'shift.view_all',
     'shift.review',
     'shift.correct',
+    'stocktake.create',
+    'stocktake.count',
+    'stocktake.approve',
+    'stocktake.view',
+    'alerts.view',
+    'alerts.manage',
+    'backup.view',
+    'update.approve',
+    'integrity.view',
   ],
   MANAGER: [
     'medicine.view',
@@ -50,6 +59,10 @@ const ROLE_PERMISSIONS: Record<UserRole, PermissionKey[]> = {
     'shift.view_own',
     'shift.view_all',
     'shift.review',
+    'stocktake.create',
+    'stocktake.count',
+    'stocktake.view',
+    'alerts.view',
   ],
   CASHIER: [
     'sales.create',
@@ -61,6 +74,7 @@ const ROLE_PERMISSIONS: Record<UserRole, PermissionKey[]> = {
     'shift.open',
     'shift.close',
     'shift.view_own',
+    'stocktake.count',
   ],
 };
 
@@ -107,13 +121,14 @@ export function canAccessModule(user: User | null | undefined, module: string): 
   if (user.role === 'ADMIN') return true;
 
   if (user.role === 'MANAGER') {
-    const forbiddenForManager = ['users', 'audit', 'settings', 'stocktake', 'remote'];
+    const forbiddenForManager = ['users', 'audit', 'settings', 'stocktake', 'remote', 'sync', 'integrity'];
     return !forbiddenForManager.includes(module);
   }
 
   if (user.role === 'CASHIER') {
     // 'history' = Stock History ONLY for a cashier (the Sales / Supply tabs stay Administrator / Manager).
-    const allowedForCashier = ['dashboard', 'pos', 'medicines', 'customers', 'sales', 'returns', 'history'];
+    // 'stocktakes' = blind counting in sessions an Administrator / Manager opened to cashiers (server-checked).
+    const allowedForCashier = ['dashboard', 'pos', 'medicines', 'customers', 'sales', 'returns', 'history', 'stocktakes'];
     return allowedForCashier.includes(module);
   }
 

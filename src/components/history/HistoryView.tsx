@@ -7,6 +7,7 @@ import { printThermalReceipt } from '../../services/receiptPrinter';
 import { canViewAllShifts, canViewShifts, canViewStockHistory, canViewTransactionHistory } from '../../services/permissions';
 import { StockHistoryView } from './StockHistoryView';
 import { ShiftHistoryView } from './ShiftHistoryView';
+import { SoldMedicinesView } from './SoldMedicinesView';
 import type { PharmacySettings, Sale, User } from '../../types';
 
 /**
@@ -18,7 +19,7 @@ import type { PharmacySettings, Sale, User } from '../../types';
  * discount, total, price mode, batch; the sale's own totals and payments) — never today's prices.
  * Completed sales have no Edit: corrections are Void, Return (approved under Returns) or refund.
  */
-export type HistoryTab = 'sales' | 'supplies' | 'stock' | 'shifts';
+export type HistoryTab = 'sales' | 'supplies' | 'stock' | 'sold' | 'shifts';
 /**
  * Filters a caller may open the list with, e.g. Stock History -> "View sales":
  * { medicine_id, medicine_label, from, to, shop_id } = the receipts behind one day's Sold figure.
@@ -59,7 +60,7 @@ export const HistoryView: React.FC<{ settings: PharmacySettings; currentUser: Us
   // Tabs this user may open: a cashier gets Stock History only (the server enforces the same).
   const tabs = useMemo(() => ([
     ...(canViewTransactionHistory(currentUser) ? [['sales', 'Sales'], ['supplies', 'Supply / Purchases']] : []),
-    ...(canViewStockHistory(currentUser) ? [['stock', 'Stock History']] : []),
+    ...(canViewStockHistory(currentUser) ? [['stock', 'Stock History'], ['sold', 'Sold Medicines']] : []),
     // Cashier: "My Shifts" (own shifts only, read only); Administrator / Manager: every shift.
     ...(canViewShifts(currentUser) ? [['shifts', canViewAllShifts(currentUser) ? 'Shifts' : 'My Shifts']] : []),
   ] as [HistoryTab, string][]), [currentUser]);
@@ -80,10 +81,12 @@ export const HistoryView: React.FC<{ settings: PharmacySettings; currentUser: Us
   return (
     <div className="flex-1 flex flex-col overflow-hidden bg-slate-50">
       <div className="px-3 pt-3 pb-2 bg-white border-b border-slate-200 shrink-0">
-        <h1 className="text-base font-bold text-slate-900">{tab === 'sales' ? 'Sales History' : tab === 'supplies' ? 'Supply History' : tab === 'shifts' ? (canViewAllShifts(currentUser) ? 'Shift History' : 'My Shifts') : 'Stock History'}</h1>
+        <h1 className="text-base font-bold text-slate-900">{tab === 'sales' ? 'Sales History' : tab === 'supplies' ? 'Supply History' : tab === 'shifts' ? (canViewAllShifts(currentUser) ? 'Shift History' : 'My Shifts') : tab === 'sold' ? 'Sold Medicines' : 'Stock History'}</h1>
         <p className="text-[11px] text-slate-500">
           {tab === 'shifts'
             ? `Cashier shifts${allShops ? ' of every shop (each shift stays in its own shop)' : ''}: opening float, sales by payment method, refunds, till expenses, expected vs counted cash and the variance — read only.`
+            : tab === 'sold'
+            ? `Medicines sold on one business day${allShops ? ' per shop' : ''}: retail and wholesale units, returns, net sold, current stock and number of sales — voided sales excluded, read only.`
             : tab === 'stock'
             ? `Daily stock per medicine${allShops ? ' for each shop' : ''}: opening, sold, returned, received, adjustments and the stock remaining at the end of each day — from the stock movement ledger, read only.`
             : `Every past transaction${allShops ? ' across ALL SHOPS' : ''}, exactly as recorded at the time — read only. Corrections use void / return (sales) or cancel (pending purchases), always audited.`}
@@ -97,6 +100,8 @@ export const HistoryView: React.FC<{ settings: PharmacySettings; currentUser: Us
       {tab === 'shifts' ? (
         <ShiftHistoryView key={`shifts-${JSON.stringify(initialFilters || {})}`} settings={settings} currentUser={currentUser} online={online} allShops={allShops} shops={shops}
           initialShiftId={initialTab === 'shifts' ? initialFilters?.shift_id || null : null} />
+      ) : tab === 'sold' ? (
+        <SoldMedicinesView settings={settings} currentUser={currentUser} allShops={allShops} shops={shops} />
       ) : tab === 'stock' ? (
         <StockHistoryView key={`stock-${JSON.stringify(initialFilters || {})}`} settings={settings} currentUser={currentUser} online={online} allShops={allShops} shops={shops}
           initialFilters={initialTab === 'stock' ? initialFilters || null : null} />
@@ -642,6 +647,24 @@ const ReturnSheet: React.FC<{ saleId: string; items: any[]; money: (n: any) => s
   );
 };
 
+/** Printable goods received note of a stored purchase (a copy of the record; nothing is created). */
+function printPurchase(d: any, money: (n: any) => string) {
+  const esc = (s: unknown) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
+  const w = window.open('', '_blank', 'width=800,height=800');
+  if (!w) return;
+  const p = d.purchase;
+  const rows = d.items.map((i: any) => `<tr><td>${esc(i.medicine_name)}</td><td>${esc(i.batch_number)}</td><td>${esc(i.expiry_date || 'unknown')}</td><td style="text-align:right">${esc(i.quantity)}</td><td style="text-align:right">${esc(money(i.purchase_price))}</td><td style="text-align:right">${esc(money(i.total))}</td></tr>`).join('');
+  w.document.write(`<!doctype html><html><head><title>${esc(p.order_number)}</title><style>body{font-family:sans-serif;font-size:12px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:3px 6px;text-align:left}</style></head><body>
+    <h2>${esc(p.shop_name || 'GIGA CHEMIST')} — Goods received note</h2>
+    <p>Purchase <b>${esc(p.order_number)}</b> · invoice ${esc(p.invoice_number || '—')} · supplier ${esc(p.supplier_name || '—')}<br/>
+    Ordered ${esc(p.order_date || '—')} · received ${esc(p.received_date || '—')} by ${esc(p.received_by || '—')} · status ${esc(p.status)} · payment ${esc(p.payment_status || '—')}</p>
+    <table><thead><tr><th>Medicine</th><th>Batch</th><th>Expiry</th><th>Qty</th><th>Buy price</th><th>Line total</th></tr></thead><tbody>${rows}</tbody></table>
+    <p style="text-align:right"><b>Total ${esc(money(p.total_amount))}</b></p><p>COPY printed ${esc(new Date().toLocaleString())} from the stored purchase.</p></body></html>`);
+  w.document.close();
+  w.focus();
+  w.print();
+}
+
 const SupplyDrawer: React.FC<{ id: string; money: (n: any) => string; onClose: () => void }> = ({ id, money, onClose }) => {
   const [d, setD] = useState<any>(null);
   const [error, setError] = useState<string | null>(null);
@@ -658,6 +681,9 @@ const SupplyDrawer: React.FC<{ id: string; money: (n: any) => string; onClose: (
             ['Supplier', d.purchase.supplier_name], ['Ordered', d.purchase.order_date], ['Received', d.purchase.received_date], ['Received by', d.purchase.received_by],
             ['Payment', d.purchase.payment_status], ['Status', <StatusTag key="s" s={d.purchase.status} />], ['Total', money(d.purchase.total_amount)], ['Notes', d.purchase.notes]]} />
           <p className="text-[11px] text-slate-500">A received purchase is never edited or deleted (its stock is posted). Corrections need an audited stock correction / return to supplier.</p>
+          <button className="flex items-center gap-1 px-3 py-2 rounded-lg border border-slate-300 text-xs font-semibold w-fit" onClick={() => printPurchase(d, money)}>
+            <Printer className="w-4 h-4" /> Print goods received note
+          </button>
           <Section title={`Items (${d.items.length})`}>
             <table className="w-full text-xs"><thead className="text-slate-500"><tr>{['Medicine', 'Batch', 'Expiry', 'Qty', 'Buy price', 'Line total', 'Sell now*', 'Wholesale now*'].map((h) => <th key={h} className="text-left pr-2">{h}</th>)}</tr></thead>
               <tbody>{d.items.map((i: any, n: number) => (

@@ -20,6 +20,8 @@ import { getPharmacySettings, toSettings } from '../db/settings';
 import { buildRemoteAdminRouter, isAllShopsScope } from './remoteAdmin';
 import { buildUserAdminRouter } from './userAdmin';
 import { buildHistoryRouter } from '../http/historyRoutes';
+import { buildInventoryRouter } from '../http/inventoryRoutes';
+import { businessDaySummary } from '../db/businessDay';
 import { buildShiftRouter } from '../http/shiftRoutes';
 import type { HistoryScope } from '../db/history';
 import type { UserRole } from '../../src/types';
@@ -564,12 +566,24 @@ export function buildOnlineRouter() {
     send: (res, err, label) => send(res, err, label),
   }));
 
+  // Business day summary (read only) over the authorized shop(s).
+  r.get('/business-day', requirePermission('reports.view'), async (req, res) => {
+    try {
+      res.json(await withCloudScope(req, (s) => businessDaySummary(s, req.query as any)));
+    } catch (err) {
+      send(res, err, 'GET /business-day');
+    }
+  });
+  // Inventory intelligence (reorder / movement classes / expiry risk) over the authorized shop(s).
+  r.use(buildInventoryRouter({ canView: requirePermission('inventory.view'), withScope: withCloudScope, send: (res, err, label) => send(res, err, label) }));
+
   r.use(buildHistoryRouter({
     canSales: requirePermission('sales.view_all'),
     canSupplies: requirePermission('stock.receive'),
     // Cashier / Manager / Shop Admin: their own shop only (resolveShop already refused any other shop).
     canStockHistory: requirePermission('history.stock.view'),
     canStockExport: requirePermission('reports.view'),
+    mayPickSoldDate: (req) => hasPermission((req as OnlineRequest).onlineUser?.role as any, 'sales.view_all'),
     withScope: withCloudScope,
     auditReprint: (req, sale) => securityEvent(req, 'RECEIPT_REPRINTED', (req as OnlineRequest).onlineUser?.email ?? null, (req as OnlineRequest).onlineUser?.id ?? null,
       { sale_id: sale.id, receipt_number: sale.receipt_number, sale_shop_id: sale.shop_id }),

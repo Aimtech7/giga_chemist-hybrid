@@ -13,6 +13,10 @@ import {
   Receipt,
   RotateCcw,
   BarChart3,
+  BellRing,
+  Waypoints,
+  CalendarDays,
+  ShieldAlert,
   ShieldCheck,
   FileText,
   Settings as SettingsIcon,
@@ -42,6 +46,12 @@ export type AppModule =
   | 'medicines'
   | 'inventory'
   | 'stocktake'
+  | 'stocktakes'
+  | 'insights'
+  | 'alerts'
+  | 'sync'
+  | 'businessday'
+  | 'integrity'
   | 'batches'
   | 'expiry'
   | 'purchases'
@@ -121,6 +131,12 @@ export const AppShell: React.FC<AppShellProps> = ({
     { id: 'medicines' as AppModule, label: isCashier(currentUser) ? 'Medicine Lookup' : 'Medicines', icon: Pill },
     { id: 'inventory' as AppModule, label: 'Inventory', icon: PackageSearch },
     { id: 'stocktake' as AppModule, label: 'Physical Stock Count', icon: ClipboardCheck },
+    { id: 'stocktakes' as AppModule, label: 'Stocktakes', icon: ClipboardCheck },
+    { id: 'insights' as AppModule, label: 'Stock Insights', icon: BarChart3 },
+    { id: 'alerts' as AppModule, label: 'Alerts Center', icon: BellRing },
+    { id: 'sync' as AppModule, label: 'Sync Center', icon: Waypoints },
+    { id: 'businessday' as AppModule, label: 'Business Day', icon: CalendarDays },
+    { id: 'integrity' as AppModule, label: 'Data Integrity', icon: ShieldAlert },
     { id: 'batches' as AppModule, label: 'Batches', icon: Boxes },
     { id: 'expiry' as AppModule, label: 'Expiry Tracking', icon: AlertTriangle },
     { id: 'purchases' as AppModule, label: 'Purchases', icon: Truck },
@@ -141,17 +157,18 @@ export const AppShell: React.FC<AppShellProps> = ({
   const onlineAdmin = serverMode === 'online' && currentUser?.role === 'ADMIN';
   const ONLINE_SECTIONS: [string, AppModule[]][] = [
     ['', ['dashboard' as AppModule]],
-    ['Operations', ['medicines', 'inventory', 'batches', 'expiry', 'purchases'] as AppModule[]],
+    ['Operations', ['medicines', 'inventory', 'insights', 'batches', 'expiry', 'purchases'] as AppModule[]],
     ['Directory', ['suppliers', 'customers'] as AppModule[]],
-    ['Finance', ['history', 'sales', 'returns', 'expenses', 'reports'] as AppModule[]],
+    ['Finance', ['history', 'businessday', 'sales', 'returns', 'expenses', 'reports'] as AppModule[]],
     ['Administration', ['users', 'settings', 'audit'] as AppModule[]],
-    ['System', ['remote'] as AppModule[]],
+    ['System', ['alerts', 'sync', 'remote'] as AppModule[]],
   ];
 
   // STRICT RBAC: Filter navigation items based on user role.
   // Cashiers ONLY see permitted modules: Dashboard, POS Register, Medicine Lookup, Customers, Sales History, Returns.
   // Restricted modules are completely hidden from the DOM.
-  const visibleNavItems = allNavItems.filter((item) => canAccessModule(currentUser, item.id));
+  // Stocktake sessions live on the shop server only (never in the online app).
+  const visibleNavItems = allNavItems.filter((item) => canAccessModule(currentUser, item.id) && !(serverMode === 'online' && (item.id === 'stocktakes' || item.id === 'integrity')));
 
   return (
     <div className="h-screen w-screen flex flex-col overflow-hidden bg-slate-100 font-sans select-none">

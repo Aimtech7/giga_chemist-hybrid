@@ -17,6 +17,7 @@ import {
   Filter,
   CheckCircle2,
   History as HistoryIcon,
+  Wallet,
 } from 'lucide-react';
 import { db } from '../../db/dexie';
 import { allocateFefo } from '../../services/inventoryEngine';
@@ -32,7 +33,7 @@ import { CATALOG_REFRESHED_EVENT, isCatalogForCurrentShop } from '../../services
 import { CatalogStatusBanner } from '../common/CatalogStatusBanner';
 import { navigateTo } from '../../services/navigation';
 import { ShiftBar } from '../shifts/ShiftBar';
-import { getCurrentShift, type LiveTotals, type Shift } from '../../services/shifts';
+import { getCurrentShift, type LiveTotals, type Shift, type ShiftStatusState } from '../../services/shifts';
 import type {
   Medicine,
   MedicineBatch,
@@ -109,23 +110,67 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
   const [isPaymentOpen, setIsPaymentOpen] = useState(false);
   const [isHeldOpen, setIsHeldOpen] = useState(false);
   const [completedSale, setCompletedSale] = useState<Sale | null>(null);
-  // Cashier shift: undefined = not loaded / server without shifts; null = no open shift (checkout locked).
-  const [shift, setShift] = useState<Shift | null | undefined>(undefined);
+  // Cashier shift state: explicit LOADING, NO_SHIFT, OPEN_SHIFT, ERROR.
+  const [shiftStatus, setShiftStatus] = useState<ShiftStatusState>('LOADING');
+  const [shift, setShift] = useState<Shift | null>(null);
   const [shiftLive, setShiftLive] = useState<LiveTotals | null>(null);
+  const [shiftErrorReason, setShiftErrorReason] = useState<string | null>(null);
+  const openShiftInputRef = useRef<HTMLInputElement>(null);
+
   const refreshShift = React.useCallback(async () => {
+    setShiftStatus('LOADING');
+    setShiftErrorReason(null);
     try {
       const d = await getCurrentShift();
-      setShift(d.shift);
-      setShiftLive(d.live || null);
+      if (d.shift) {
+        setShift(d.shift);
+        setShiftLive(d.live || null);
+        setShiftStatus('OPEN_SHIFT');
+      } else {
+        setShift(null);
+        setShiftLive(null);
+        setShiftStatus('NO_SHIFT');
+      }
     } catch (err: any) {
-      // 404 = a server without shifts (older build / online app): no shift gate in the UI.
-      if (err instanceof ApiError && err.status === 404) setShift(undefined);
+      setShift(null);
+      setShiftLive(null);
+      setShiftStatus('ERROR');
+      let reason = 'Server unavailable';
+      if (err instanceof ApiError) {
+        if (err.status === 404) {
+          reason = 'Shift module is not installed on this Shop 1 server (API route not found).';
+        } else if (err.status === 401) {
+          reason = 'Unauthorized: session expired or authentication credentials required.';
+        } else if (err.status === 403) {
+          reason = 'Unauthorized: user does not have permission to access shifts.';
+        } else if (err.status === 500 && (err.message?.toLowerCase().includes('cashier_shifts') || err.data?.code === '42P01')) {
+          reason = 'Shift database migration missing (020_cashier_shifts.sql not applied).';
+        } else {
+          reason = err.message || `Server error (${err.status})`;
+        }
+      } else if (err?.message) {
+        if (err.message.includes('Failed to fetch') || err.message.includes('NetworkError') || err.message.includes('ECONNREFUSED')) {
+          reason = 'Server unavailable: could not connect to POS server.';
+        } else {
+          reason = err.message;
+        }
+      }
+      setShiftErrorReason(reason);
     }
   }, []);
+
   useEffect(() => {
     void refreshShift();
   }, [refreshShift]);
-  const shiftLocked = shift === null;
+
+  const shiftLocked = shiftStatus !== 'OPEN_SHIFT';
+
+  const focusOrOpenShift = () => {
+    openShiftInputRef.current?.focus();
+    openShiftInputRef.current?.select();
+    openShiftInputRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  };
+
   const [warningMessage, setWarningMessage] = useState<string | null>(null);
 
   // References
@@ -243,7 +288,18 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
         searchInputRef.current?.select();
       } else if (e.key === 'F4') {
         e.preventDefault();
-        if (cart.length > 0 && !shiftLocked) setIsPaymentOpen(true);
+        if (cart.length > 0 && !shiftLocked) {
+          setIsPaymentOpen(true);
+        } else if (shiftLocked) {
+          if (shiftStatus === 'NO_SHIFT') {
+            setWarningMessage('You must open a shift before completing sales.');
+            focusOrOpenShift();
+          } else if (shiftStatus === 'ERROR') {
+            setWarningMessage(`Cannot complete sale: ${shiftErrorReason || 'Shift status unavailable'}`);
+          } else if (shiftStatus === 'LOADING') {
+            setWarningMessage('Checking shift status, please wait...');
+          }
+        }
       } else if (e.key === 'F8') {
         e.preventDefault();
         if (cart.length > 0) handleHoldSale();
@@ -590,13 +646,24 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
   };
 
   return (
-    <div className="flex-1 flex overflow-hidden bg-slate-100">
-      {/* LEFT COLUMN: Medicine Catalog & Universal Search */}
-      <div className="flex-1 flex flex-col min-w-0 border-r border-slate-200 bg-white">
-        <CatalogStatusBanner />
-        <ShiftBar settings={settings} shift={shift} live={shiftLive} onChanged={refreshShift} />
-        {/* Universal Search Bar & Scanner Status */}
-        <div className="p-3 bg-white border-b border-slate-200 space-y-2">
+    <div className="flex-1 flex flex-col min-w-0 overflow-hidden bg-slate-100">
+      <CatalogStatusBanner />
+      <ShiftBar
+        settings={settings}
+        shiftStatus={shiftStatus}
+        shift={shift}
+        live={shiftLive}
+        errorReason={shiftErrorReason}
+        currentUser={currentUser}
+        onRetry={refreshShift}
+        onChanged={refreshShift}
+        openShiftInputRef={openShiftInputRef}
+      />
+      <div className="flex-1 flex overflow-hidden">
+        {/* LEFT COLUMN: Medicine Catalog & Universal Search */}
+        <div className="flex-1 flex flex-col min-w-0 border-r border-slate-200 bg-white">
+          {/* Universal Search Bar & Scanner Status */}
+          <div className="p-3 bg-white border-b border-slate-200 space-y-2">
           <div className="flex items-center gap-2">
             <div className="relative flex-1">
               <Search className="w-4 h-4 absolute left-3 top-2.5 text-slate-400" />
@@ -643,6 +710,18 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
               <Barcode className="w-4 h-4 text-teal-700" />
               <span className="hidden md:inline font-semibold">Scanner Ready</span>
             </div>
+
+            {shiftStatus === 'NO_SHIFT' && (
+              <button
+                type="button"
+                onClick={focusOrOpenShift}
+                className="flex items-center gap-1.5 px-3 py-2 rounded bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-black shrink-0 shadow-sm transition animate-pulse cursor-pointer"
+                title="Shift not open — click to enter opening cash float"
+              >
+                <Wallet className="w-4 h-4" />
+                <span>OPEN SHIFT</span>
+              </button>
+            )}
           </div>
 
           {/* Category filter: real PostgreSQL categories (hundreds exist, so a list, not buttons) */}
@@ -816,6 +895,17 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
           </div>
 
           <div className="flex items-center gap-2">
+            {shiftStatus === 'NO_SHIFT' && (
+              <button
+                type="button"
+                onClick={focusOrOpenShift}
+                className="px-2.5 py-1 rounded bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-black flex items-center gap-1 shadow-sm transition animate-pulse cursor-pointer"
+                title="Click to open shift with opening cash float"
+              >
+                <Wallet className="w-3.5 h-3.5" />
+                <span>OPEN SHIFT</span>
+              </button>
+            )}
             {/* Today's stock history (History -> Stock History, read only; every role incl. cashier). */}
             <button
               onClick={() => navigateTo('history', 'stock')}
@@ -824,6 +914,15 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
             >
               <HistoryIcon className="w-3 h-3" />
               <span>Stock History</span>
+            </button>
+            {/* Today's sold medicines (History -> Sold Medicines; quantities only for a cashier). */}
+            <button
+              onClick={() => navigateTo('history', 'sold')}
+              className="px-2 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-white text-[11px] font-semibold flex items-center gap-1 cursor-pointer"
+              title="Today's sold medicines: retail / wholesale units, returns, net sold and current stock"
+            >
+              <HistoryIcon className="w-3 h-3" />
+              <span>Today's Sold</span>
             </button>
             {heldSales.length > 0 && (
               <button
@@ -1022,6 +1121,41 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
             </div>
           </div>
 
+          {shiftLocked && (
+            <div className={`mb-2 px-3 py-2 rounded text-xs flex items-center justify-between gap-2 border ${
+              shiftStatus === 'NO_SHIFT' ? 'bg-amber-50 border-amber-300 text-amber-900' :
+              shiftStatus === 'ERROR' ? 'bg-rose-50 border-rose-300 text-rose-900' :
+              'bg-slate-100 border-slate-300 text-slate-700'
+            }`}>
+              <div className="flex items-center gap-1.5">
+                <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                <span className="font-semibold text-[11px]">
+                  {shiftStatus === 'NO_SHIFT' && 'Shift not open — open shift to enable sales.'}
+                  {shiftStatus === 'ERROR' && (shiftErrorReason || 'Shift status unavailable.')}
+                  {shiftStatus === 'LOADING' && 'Checking shift status...'}
+                </span>
+              </div>
+              {shiftStatus === 'NO_SHIFT' && (
+                <button
+                  type="button"
+                  onClick={focusOrOpenShift}
+                  className="px-2 py-0.5 rounded bg-amber-600 hover:bg-amber-700 text-white font-bold text-[10px] shrink-0 cursor-pointer"
+                >
+                  Open Shift
+                </button>
+              )}
+              {shiftStatus === 'ERROR' && (
+                <button
+                  type="button"
+                  onClick={() => void refreshShift()}
+                  className="px-2 py-0.5 rounded bg-rose-700 hover:bg-rose-800 text-white font-bold text-[10px] shrink-0 cursor-pointer"
+                >
+                  Retry
+                </button>
+              )}
+            </div>
+          )}
+
           <div className="grid grid-cols-2 gap-2 pt-1">
             <button
               onClick={handleHoldSale}
@@ -1033,9 +1167,28 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
             </button>
 
             <button
-              onClick={() => setIsPaymentOpen(true)}
+              onClick={() => {
+                if (cart.length > 0 && !shiftLocked) {
+                  setIsPaymentOpen(true);
+                } else if (shiftLocked) {
+                  if (shiftStatus === 'NO_SHIFT') {
+                    setWarningMessage('You must open a shift before completing sales.');
+                    focusOrOpenShift();
+                  } else if (shiftStatus === 'ERROR') {
+                    setWarningMessage(`Cannot complete sale: ${shiftErrorReason || 'Shift status unavailable'}`);
+                  }
+                }
+              }}
               disabled={cart.length === 0 || shiftLocked}
-              title={shiftLocked ? 'Open your shift (opening cash float) before selling.' : undefined}
+              title={
+                shiftLocked
+                  ? shiftStatus === 'NO_SHIFT'
+                    ? 'Open your shift (opening cash float) before selling.'
+                    : shiftStatus === 'ERROR'
+                    ? `Cannot complete sale: ${shiftErrorReason}`
+                    : 'Checking shift status...'
+                  : undefined
+              }
               className="py-2.5 rounded bg-teal-700 hover:bg-teal-800 text-white text-xs font-bold transition flex items-center justify-center gap-1.5 disabled:opacity-40 cursor-pointer"
             >
               <CreditCard className="w-4 h-4" />
@@ -1044,6 +1197,7 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
           </div>
         </div>
       </div>
+    </div>
 
       {/* MODALS */}
       {retailFallbackPrompt && (

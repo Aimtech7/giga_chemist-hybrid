@@ -1,3 +1,4 @@
+import { setPriceContext } from './priceHistory';
 import crypto from 'crypto';
 import type pg from 'pg';
 import { pgPool, HttpError, requireUuid, withTransaction, businessNow, cleanUuid, type Queryable } from './client';
@@ -214,6 +215,8 @@ async function receiveIntoStock(
   const meds = await client.query('SELECT id, name FROM medicines WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE', [medIds]);
   if (meds.rows.length !== medIds.length) throw new HttpError(404, 'One or more medicines were not found.');
 
+  // Latest landed cost below changes medicine / batch purchase prices: attributed in price_history.
+  await setPriceContext(client, actor, 'PURCHASE_RECEIPT', { reference: p.orderNumber, reason: `Purchase ${p.orderNumber} received` });
   const touched = new Map<string, any>();
   for (const it of [...p.items].sort((a, b) => a.medicine_id.localeCompare(b.medicine_id))) {
     const existing = await client.query(

@@ -70,8 +70,16 @@ import {
 import { runBackup, getBackupStatus } from './ops/backup';
 import { getSystemHealth } from './ops/health';
 import { appVersion, currentCommit } from './ops/runtime';
-import { pgPool } from './db/client';
+import { pgPool, isValidUuid } from './db/client';
 import { buildHistoryRouter } from './http/historyRoutes';
+import { buildInventoryRouter } from './http/inventoryRoutes';
+import { createDraftPurchaseTx } from './db/purchases';
+import { getPriceHistory } from './db/priceHistory';
+import { acknowledgeLocalAlert, listLocalAlerts } from './ops/alerts';
+import { classifyConflict } from './sync/conflicts';
+import { businessDaySummary } from './db/businessDay';
+import { integrityReport } from './db/integrity';
+import { approveStocktake, cancelStocktake, countLine, createStocktake, getStocktake, listStocktakes, reopenStocktake, startCounting, submitStocktake } from './db/stocktakes';
 import { buildShiftRouter } from './http/shiftRoutes';
 import { openShift, getCurrentShift, closeShift, reviewShift, correctShift, listOpenTills } from './db/shifts';
 import type { HistoryScope } from './db/history';
@@ -298,6 +306,14 @@ apiRouter.post('/auth/login', authRateLimiter, async (req: Request, res: Respons
   } catch (err: any) {
     const status = errorStatus(err);
     if (status >= 500) console.error('[API] /auth/login failed:', err.message);
+    // Failed login: audited WITHOUT the secret (identifier only, truncated); feeds LOGIN_SECURITY_WARNING.
+    if (status < 500) {
+      const ident = String(req.body?.email || req.body?.username || '').trim().slice(0, 100);
+      await recordAuditLog({
+        user_name: ident || 'unknown', role: 'CASHIER' as any, action: 'LOGIN_FAILED', entity: 'auth', entity_id: ident.slice(0, 100) || 'unknown',
+        device_id: normalizeDeviceId(req.headers['x-device-id']) || 'SERVER', new_value: { identifier: ident, via: req.body?.pin ? 'PIN' : 'PASSWORD', status },
+      } as any).catch(() => {});
+    }
     res.status(status === 400 && !err.status ? 401 : status).json({ error: err.message || 'Authentication failed.' });
   }
 });
@@ -644,6 +660,81 @@ apiRouter.post('/inventory/physical-count', requireRole('ADMIN'), async (req: Au
   }
 });
 
+// --- 6a. INVENTORY INTELLIGENCE (read only) + purchase DRAFT from reorder suggestions ---
+apiRouter.use(buildInventoryRouter({
+  canView: requirePermission('inventory.view'),
+  withScope: withLocalScope,
+  send: (res, err: any, label) => sendError(res, err, 'Inventory insight failed.', label),
+}));
+// Immutable price history (local 023): Administrator + Manager; purchase-cost rows for Administrators only.
+apiRouter.get('/price-history', requirePermission('reports.view'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    res.json(await getPriceHistory(req.query as any, req.userRole === 'ADMIN'));
+  } catch (err: any) {
+    sendError(res, err, 'Could not load the price history.', 'GET /price-history');
+  }
+});
+// A PENDING purchase (nothing enters stock until it is received). Administrator only.
+apiRouter.post('/purchases/drafts', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const purchase = await withTransaction((client) => createDraftPurchaseTx(client, crypto.randomUUID(), req.body || {}, saleActor(req), { source: 'REORDER_SUGGESTIONS' }));
+    res.status(201).json({ success: true, purchase });
+  } catch (err: any) {
+    sendError(res, err, 'Could not create the purchase draft.', 'POST /purchases/drafts');
+  }
+});
+
+// --- 6d. BUSINESS DAY SUMMARY (read only) + DATA INTEGRITY DASHBOARD (read only, Administrator) ---
+apiRouter.get('/business-day', requirePermission('reports.view'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    res.json(await withLocalScope(req, (s) => businessDaySummary(s, req.query as any)));
+  } catch (err: any) {
+    sendError(res, err, 'Could not load the business day summary.', 'GET /business-day');
+  }
+});
+apiRouter.get('/integrity', requirePermission('integrity.view'), async (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    res.json(await integrityReport());
+  } catch (err: any) {
+    sendError(res, err, 'Could not run the integrity checks.', 'GET /integrity');
+  }
+});
+
+// --- 6c. LOCAL ALERTS CENTER (works offline; same conditions as the heartbeat) ---
+apiRouter.get('/alerts', requirePermission('alerts.view'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    res.json(await listLocalAlerts(req.query as any));
+  } catch (err: any) {
+    sendError(res, err, 'Could not load alerts.', 'GET /alerts');
+  }
+});
+apiRouter.post('/alerts/:id/ack', requirePermission('alerts.manage'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    res.json(await acknowledgeLocalAlert(req.params.id, stockActor(req)));
+  } catch (err: any) {
+    sendError(res, err, 'Could not acknowledge the alert.', 'POST /alerts/:id/ack');
+  }
+});
+
+// --- 6b. FORMAL STOCKTAKE SESSIONS (counted first; stock changes only on Administrator approval) ---
+const stocktakeActor = (req: AuthenticatedRequest) => stockActor(req) as ReturnType<typeof stockActor> & { role: string };
+const stocktakeRoute = (label: string, fn: (req: AuthenticatedRequest) => Promise<unknown>, status = 200) => async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    res.status(status).json(await fn(req));
+  } catch (err: any) {
+    sendError(res, err, 'Stocktake request failed.', label);
+  }
+};
+apiRouter.get('/stocktakes', requirePermission('stocktake.count'), stocktakeRoute('GET /stocktakes', (req) => listStocktakes(req.userRole!, req.query as any)));
+apiRouter.get('/stocktakes/:id', requirePermission('stocktake.count'), stocktakeRoute('GET /stocktakes/:id', (req) => getStocktake(req.params.id, req.userRole!, req.query as any)));
+apiRouter.post('/stocktakes', requirePermission('stocktake.create'), stocktakeRoute('POST /stocktakes', (req) => createStocktake(stocktakeActor(req), req.body || {}), 201));
+apiRouter.post('/stocktakes/:id/start', requirePermission('stocktake.create'), stocktakeRoute('POST /stocktakes/:id/start', (req) => startCounting(req.params.id, stocktakeActor(req))));
+apiRouter.put('/stocktakes/:id/lines/:lineId', requirePermission('stocktake.count'), stocktakeRoute('PUT stocktake line', (req) => countLine(req.params.id, req.params.lineId, stocktakeActor(req), req.body || {})));
+apiRouter.post('/stocktakes/:id/submit', requirePermission('stocktake.create'), stocktakeRoute('POST /stocktakes/:id/submit', (req) => submitStocktake(req.params.id, stocktakeActor(req))));
+apiRouter.post('/stocktakes/:id/reopen', requirePermission('stocktake.create'), stocktakeRoute('POST /stocktakes/:id/reopen', (req) => reopenStocktake(req.params.id, stocktakeActor(req))));
+apiRouter.post('/stocktakes/:id/approve', requirePermission('stocktake.approve'), stocktakeRoute('POST /stocktakes/:id/approve', (req) => approveStocktake(req.params.id, stocktakeActor(req), req.body || {})));
+apiRouter.post('/stocktakes/:id/cancel', requirePermission('stocktake.create'), stocktakeRoute('POST /stocktakes/:id/cancel', (req) => cancelStocktake(req.params.id, stocktakeActor(req), req.body?.reason)));
+
 // --- 7. SALES (server-authoritative checkout, explicit void, PostgreSQL daily summary) ---
 function saleActor(req: AuthenticatedRequest) {
   return stockActor(req) as ReturnType<typeof stockActor> & { role: UserRole };
@@ -778,6 +869,43 @@ apiRouter.post('/sync/now', requireRole('ADMIN'), async (req: AuthenticatedReque
 });
 
 // ADMIN: re-queue events the cloud rejected (after the cause was fixed). Idempotency keys are kept.
+// SYNC & CONFLICT CONTROL CENTER (this shop): outbox sequence, failed events, recent remote commands
+// with a plain conflict reason. Retrying an event re-sends it with its ORIGINAL idempotency key, so the
+// cloud answers DUPLICATE for anything it already has (a retry never creates a second event).
+apiRouter.get('/sync/center', requireRole('ADMIN'), async (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    const [status, seq, failed, commands] = await Promise.all([
+      getSyncStatus(),
+      pgPool.query(`SELECT MAX(seq)::bigint AS last_seq, MAX(seq) FILTER (WHERE status = 'SYNCED')::bigint AS last_synced_seq FROM sync_events`),
+      pgPool.query(`SELECT id, seq, event_type, entity_type, entity_id, business_ref, status, attempt_count, last_error, created_at, last_attempt_at
+                      FROM sync_events WHERE status = 'FAILED' OR (status = 'PENDING' AND attempt_count > 0)
+                     ORDER BY seq LIMIT 200`),
+      pgPool.query(`SELECT command_id, command_type, status, error, received_at, applied_at, acked_at
+                      FROM sync_inbound_commands ORDER BY received_at DESC LIMIT 100`),
+    ]);
+    res.json({
+      status,
+      sequence: { last_seq: seq.rows[0].last_seq !== null ? Number(seq.rows[0].last_seq) : null, last_synced_seq: seq.rows[0].last_synced_seq !== null ? Number(seq.rows[0].last_synced_seq) : null },
+      failed_events: failed.rows.map((e: any) => ({ ...e, seq: Number(e.seq), conflict: e.status === 'FAILED' ? classifyConflict(e.event_type, e.last_error) : null })),
+      commands: commands.rows.map((c: any) => ({ ...c, conflict: c.status === 'REJECTED' ? classifyConflict(c.command_type, c.error) : null })),
+    });
+  } catch (err: any) {
+    sendError(res, err, 'Could not load the sync center.', 'GET /sync/center');
+  }
+});
+apiRouter.post('/sync/events/:id/retry', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    if (!isValidUuid(req.params.id)) return res.status(400).json({ error: 'Event id must be a UUID.' });
+    const r = await pgPool.query(`UPDATE sync_events SET status = 'PENDING', next_attempt_at = CURRENT_TIMESTAMP WHERE id = $1 AND status = 'FAILED' RETURNING id, event_type`, [req.params.id]);
+    if (!r.rows[0]) return res.status(409).json({ error: 'Only a FAILED event can be retried.' });
+    await recordAuditLog({ ...actorAudit(req), action: 'SYNC_EVENT_REQUEUED', entity: 'sync_event', entity_id: req.params.id, new_value: { event_type: r.rows[0].event_type } });
+    syncWorker.wake(false);
+    res.json({ success: true, requeued: 1 });
+  } catch (err: any) {
+    sendError(res, err, 'Could not re-queue the event.', 'POST /sync/events/:id/retry');
+  }
+});
+
 apiRouter.post('/sync/retry-failed', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
   try {
     const r = await pgPool.query(
@@ -1173,6 +1301,7 @@ apiRouter.use(buildHistoryRouter({
   // Stock History: its own narrow permission (cashiers included); the scope is always this shop.
   canStockHistory: requirePermission('history.stock.view'),
   canStockExport: requirePermission('reports.view'),
+  mayPickSoldDate: (req) => hasPermission((req as AuthenticatedRequest).userRole as any, 'sales.view_all'),
   withScope: withLocalScope,
   auditReprint: async (req, sale) => {
     const a = saleActor(req as AuthenticatedRequest);

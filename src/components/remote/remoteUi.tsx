@@ -147,6 +147,7 @@ export function describeRequest(c: RemoteCommand): string {
   else if (t === 'RETURN_APPROVE' || t === 'RETURN_REJECT') what = `${t === 'RETURN_APPROVE' ? 'approve' : 'reject'} receipt ${d.return?.receipt_number || ''}`;
   else if (t === 'SALE_VOID') what = `void receipt ${d.sale?.receipt_number || ''}`;
   else if (t === 'USER_SESSION_REVOKE') what = 'sign out everywhere';
+  else if (t === 'USER_PROFILE_UPDATE') what = ['name', 'username', 'email'].filter((f) => p[f] !== undefined).map((f) => `${f} ${p.expected?.[f] ?? '—'} → ${p[f] ?? '—'}`).join(', ');
   else if (t === 'SHIFT_REVIEW') what = `review ${d.shift?.shift_number || 'shift'}${d.shift?.cashier_name ? ` (${d.shift.cashier_name})` : ''}`;
   const shop = d.target_shop?.shop_code ? `[${d.target_shop.shop_code}]` : '';
   return [shop, target, what].filter(Boolean).join(' · ');

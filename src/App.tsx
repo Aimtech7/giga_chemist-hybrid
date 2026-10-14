@@ -15,6 +15,12 @@ import { PosScreen } from './components/pos/PosScreen';
 import { MedicineList } from './components/inventory/MedicineList';
 import { InventoryManager } from './components/inventory/InventoryManager';
 import { PhysicalStockCount } from './components/stocktake/PhysicalStockCount';
+import { StocktakeSessions } from './components/stocktake/StocktakeSessions';
+import { InventoryInsights } from './components/inventory/InventoryInsights';
+import { AlertsCenter } from './components/alerts/AlertsCenter';
+import { SyncCenter } from './components/sync/SyncCenter';
+import { BusinessDayView } from './components/reports/BusinessDayView';
+import { IntegrityDashboard } from './components/settings/IntegrityDashboard';
 import { BatchList } from './components/inventory/BatchList';
 import { ExpiryManager } from './components/expiry/ExpiryManager';
 import { PurchaseList } from './components/purchases/PurchaseList';
@@ -36,7 +42,7 @@ import type { PharmacySettings, User } from './types';
 
 // '#app' (or any unknown hash) is not a module and must never become the current one (blank screen).
 const KNOWN_MODULES: AppModule[] = [
-  'dashboard', 'pos', 'medicines', 'inventory', 'stocktake', 'batches', 'expiry', 'purchases', 'suppliers',
+  'dashboard', 'pos', 'medicines', 'inventory', 'stocktake', 'stocktakes', 'insights', 'alerts', 'sync', 'businessday', 'integrity', 'batches', 'expiry', 'purchases', 'suppliers',
   'customers', 'expenses', 'sales', 'returns', 'reports', 'users', 'audit', 'settings', 'remote', 'history',
 ];
 
@@ -83,14 +89,15 @@ export default function App() {
 
       if (isProtected) {
         if (cached) {
-          // Check if specific module in hash or path is allowed for this user
-          const rawModule = hash.replace('#', '').replace('/app/', '') as AppModule;
-          // Only real module names ("#app" is the shell, not a module: it used to blank the screen for Admins).
-          if (rawModule && KNOWN_MODULES.includes(rawModule) && canAccessModule(cached, rawModule)) {
-            setCurrentModule(rawModule);
-          } else if (isCashier(cached)) {
-            // Cashier defaults to POS register
+          if (isCashier(cached)) {
+            // Cashier must land directly on POS
             setCurrentModule('pos');
+          } else {
+            const rawModule = hash.replace('#', '').replace('/app/', '') as AppModule;
+            // Only real module names ("#app" is the shell, not a module: it used to blank the screen for Admins).
+            if (rawModule && KNOWN_MODULES.includes(rawModule) && canAccessModule(cached, rawModule)) {
+              setCurrentModule(rawModule);
+            }
           }
           setViewMode('app');
         } else {
@@ -159,7 +166,7 @@ export default function App() {
       return;
     }
     const userToEvaluate = currentUser || cached;
-    const targetModule = canAccessModule(userToEvaluate, module) ? module : 'pos';
+    const targetModule = isCashier(userToEvaluate) ? 'pos' : (canAccessModule(userToEvaluate, module) ? module : 'pos');
     setCurrentModule(targetModule);
     setViewMode('app');
     window.location.hash = '#app';
@@ -179,7 +186,7 @@ export default function App() {
         const verified = await verifySession();
         if (verified) {
           setCurrentUser(verified);
-          if (isCashier(verified) && !canAccessModule(verified, currentModule)) {
+          if (isCashier(verified)) {
             setCurrentModule('pos');
           }
           syncFromLocalApiToDexie().catch((e) => console.warn('[App] Local sync failed:', e));
@@ -223,7 +230,7 @@ export default function App() {
     if (currentUser?.role !== 'ADMIN') return;
     void getServerMode().then((mode) => {
       setServerMode(mode);
-      if (mode === 'online') setCurrentModule((m) => (m === 'pos' || m === 'stocktake' ? 'dashboard' : m));
+      if (mode === 'online') setCurrentModule((m) => (m === 'pos' || m === 'stocktake' || m === 'stocktakes' ? 'dashboard' : m));
     });
   }, [currentUser]);
   const onlineAdmin = serverMode === 'online' && currentUser?.role === 'ADMIN';
@@ -342,6 +349,30 @@ export default function App() {
       {currentModule === 'stocktake' && canAccessModule(currentUser, 'stocktake') && (
         <PhysicalStockCount currentUser={currentUser} settings={settings} />
       )}
+
+      {/* STOCKTAKE SESSIONS - count first, Administrator approval applies (cashiers: blind counting when allowed) */}
+      {currentModule === 'stocktakes' && canAccessModule(currentUser, 'stocktakes') && (
+        <StocktakeSessions currentUser={currentUser} settings={settings} />
+      )}
+
+      {/* STOCK INSIGHTS - reorder, fast / slow / dead stock, expiry risk, reconciliation (read only) */}
+      {currentModule === 'insights' && canAccessModule(currentUser, 'insights') && (
+        <InventoryInsights currentUser={currentUser} online={serverMode === 'online'} />
+      )}
+
+      {/* ALERTS CENTER - local (offline-capable) or the selected shop online */}
+      {currentModule === 'alerts' && canAccessModule(currentUser, 'alerts') && (
+        <AlertsCenter currentUser={currentUser} online={serverMode === 'online'} />
+      )}
+
+      {/* SYNC & CONFLICT CENTER - Administrator */}
+      {currentModule === 'sync' && canAccessModule(currentUser, 'sync') && (
+        <SyncCenter online={serverMode === 'online'} />
+      )}
+
+      {/* BUSINESS DAY SUMMARY (read only) + DATA INTEGRITY (shop computer, Administrator) */}
+      {currentModule === 'businessday' && canAccessModule(currentUser, 'businessday') && <BusinessDayView settings={settings} />}
+      {currentModule === 'integrity' && canAccessModule(currentUser, 'integrity') && <IntegrityDashboard />}
 
       {/* BATCHES - Restricted to Admin/Manager */}
       {currentModule === 'batches' && canAccessModule(currentUser, 'batches') && (

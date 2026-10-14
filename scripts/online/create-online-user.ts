@@ -45,7 +45,7 @@ const localUser = opt('--local-user') || null;
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) fail('--email is required (valid address).');
 if (!name) fail('--name is required.');
-if (!['ADMIN', 'CASHIER'].includes(role)) fail('--role must be ADMIN or CASHIER.');
+if (!['ADMIN', 'MANAGER', 'CASHIER'].includes(role)) fail('--role must be ADMIN, MANAGER or CASHIER.');
 if (globalAdmin && role !== 'ADMIN') fail('--global requires --role ADMIN.');
 if (shopId && !uuid.test(shopId)) fail('--shop / SHOP_ID must be a UUID.');
 if (localUser && !uuid.test(localUser)) fail('--local-user must be a UUID.');

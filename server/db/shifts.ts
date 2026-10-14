@@ -67,7 +67,7 @@ export function varianceLabel(variance: number | null | undefined): 'BALANCED' |
 // ============================================================================ relations (local / cloud)
 const LOCAL = {
   shops: `(SELECT si.shop_id, si.shop_code, COALESCE(si.shop_name, 'This shop') AS shop_name FROM shop_identity si WHERE si.shop_id = ANY($1::uuid[]))`,
-  shifts: `(SELECT ($1::uuid[])[1] AS shop_id, x.id, x.shift_number, x.cashier_id, u.name AS cashier_name, x.device_id, x.status,
+  shifts: `(SELECT ($1::uuid[])[1] AS shop_id, x.id, x.shift_number, x.cashier_id, COALESCE(user_name_at(x.cashier_id, x.opened_at), u.name) AS cashier_name, x.device_id, x.status,
              x.opened_at, x.opened_business_date, x.opening_float, x.opened_by_name, x.closed_at, x.closed_business_date, x.closed_by_name,
              x.close_method, x.admin_close_reason, x.total_transactions, x.total_sales, x.cash_sales, x.mpesa_sales, x.card_sales, x.bank_sales,
              x.other_sales, x.units_sold, x.voided_count, x.voided_total, x.returns_count, x.refund_total, x.cash_refunds, x.cash_expenses,
@@ -88,7 +88,7 @@ const LOCAL = {
 
 const CLOUD = {
   shops: `(SELECT s.shop_id, s.shop_code, s.name AS shop_name FROM giga_cloud.shops s WHERE s.shop_id = ANY($1::uuid[]))`,
-  shifts: `(SELECT c.shop_id, c.shift_id AS id, c.shift_number, c.cashier_id, COALESCE(u.name, c.cashier_name) AS cashier_name, c.device_id, c.status,
+  shifts: `(SELECT c.shop_id, c.shift_id AS id, c.shift_number, c.cashier_id, COALESCE(c.cashier_name, u.name) AS cashier_name, c.device_id, c.status,
              c.opened_at, c.opened_business_date, c.opening_float, c.data->>'opened_by_name' AS opened_by_name, c.closed_at, c.closed_business_date,
              c.data->>'closed_by_name' AS closed_by_name, c.data->>'close_method' AS close_method, c.data->>'admin_close_reason' AS admin_close_reason,
              (c.data->>'total_transactions')::int AS total_transactions, (c.data->>'total_sales')::numeric AS total_sales,
@@ -305,7 +305,7 @@ async function currentShiftView(shiftId: string) {
   const client = await pgPool.connect();
   try {
     const scope = await shopScope(client);
-    const shift = (await client.query(`SELECT x.*, u.name AS cashier_name FROM cashier_shifts x LEFT JOIN users u ON u.id = x.cashier_id WHERE x.id = $1`, [shiftId])).rows[0];
+    const shift = (await client.query(`SELECT x.*, COALESCE(user_name_at(x.cashier_id, x.opened_at), u.name) AS cashier_name FROM cashier_shifts x LEFT JOIN users u ON u.id = x.cashier_id WHERE x.id = $1`, [shiftId])).rows[0];
     if (!shift) return { shift: null };
     const totals = (await computeShiftTotals(scope, [shiftId])).get(shiftId) || EMPTY_TOTALS;
     const live = { ...totals, expected_cash: expectedCash(Number(shift.opening_float), totals) };
@@ -417,7 +417,7 @@ export async function closeShift(shiftIdRaw: string, input: CloseShiftInput, act
       },
     }, client);
     await enqueueShift(client, 'SHIFT_CLOSED', shiftId, actor, deviceId);
-    const saved = (await client.query(`SELECT x.*, u.name AS cashier_name FROM cashier_shifts x LEFT JOIN users u ON u.id = x.cashier_id WHERE x.id = $1`, [shiftId])).rows[0];
+    const saved = (await client.query(`SELECT x.*, COALESCE(user_name_at(x.cashier_id, x.opened_at), u.name) AS cashier_name FROM cashier_shifts x LEFT JOIN users u ON u.id = x.cashier_id WHERE x.id = $1`, [shiftId])).rows[0];
     return { success: true, shift: shiftRow(saved, null), medicines: (await shiftMedicines(scope, shiftId)).medicines };
   });
 }
@@ -532,7 +532,7 @@ export async function assertSaleShiftOpen(client: pg.PoolClient, shiftId: string
 /** Open shifts of this shop (Administrator: choose the till an expense is paid from). */
 export async function listOpenTills(q: Queryable) {
   return (await q.query(
-    `SELECT x.id, x.shift_number, x.cashier_id, u.name AS cashier_name, x.opened_at, x.device_id
+    `SELECT x.id, x.shift_number, x.cashier_id, COALESCE(user_name_at(x.cashier_id, x.opened_at), u.name) AS cashier_name, x.opened_at, x.device_id
        FROM cashier_shifts x LEFT JOIN users u ON u.id = x.cashier_id WHERE x.status = 'OPEN' ORDER BY x.opened_at`
   )).rows;
 }
