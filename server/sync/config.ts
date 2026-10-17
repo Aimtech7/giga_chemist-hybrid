@@ -26,6 +26,7 @@ export interface SyncConfig {
   envShopId: string | null;
   deviceId: string;
   intervalMs: number;
+  commandPollIntervalMs: number;
   batchSize: number;
   httpTimeoutMs: number;
   maxBackoffMs: number;
@@ -90,6 +91,7 @@ export function getSyncConfig(): SyncConfig {
     envShopId: envShopIdRaw && UUID_RE.test(envShopIdRaw) ? envShopIdRaw.toLowerCase() : null,
     deviceId: (process.env.DEVICE_ID || 'SERVER').trim().slice(0, 100) || 'SERVER',
     intervalMs: num('SYNC_INTERVAL_SECONDS', 30, 1, 3600) * 1000,
+    commandPollIntervalMs: num('SYNC_COMMAND_POLL_SECONDS', 5, 1, 300) * 1000,
     batchSize: Math.round(num('SYNC_BATCH_SIZE', 50, 1, 200)),
     httpTimeoutMs: num('SYNC_HTTP_TIMEOUT_MS', 10_000, 500, 120_000),
     maxBackoffMs: num('SYNC_MAX_BACKOFF_SECONDS', 120, 1, 3600) * 1000,

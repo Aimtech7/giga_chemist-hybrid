@@ -1,9 +1,10 @@
 import crypto from 'crypto';
 import type pg from 'pg';
-import { cleanUuid } from '../db/client';
+import { cleanUuid, registerAfterCommit } from '../db/client';
 import { getSyncConfig } from './config';
 import { getShopIdentity } from './identity';
 import { takeCollected } from './collector';
+import { notifySyncWake } from './wake';
 
 /**
  * Durable outbox. enqueueSyncEvent() MUST be called with the business transaction's client, before
@@ -35,6 +36,7 @@ export type SyncEventType =
   | 'EXPENSE_RECORDED'
   | 'SETTINGS_UPDATED'
   | 'USER_UPSERTED'
+  | 'USER_DELETED'
   // Cloud migration 006 and later only (deploy cloud 006 BEFORE a shop that can emit these).
   | 'EXPENSE_UPDATED'
   | 'EXPENSE_VOIDED'
@@ -87,7 +89,8 @@ export async function enqueueSyncEvent(client: pg.PoolClient, input: EnqueueInpu
   const batches = batchIds.length
     ? (await client.query(
         `SELECT id, medicine_id, batch_number, expiry_date, expiry_status, status, supplier_id,
-                purchase_price, selling_price_override, received_date
+                purchase_price, selling_price_override, received_date, manufacturing_date,
+                purchase_invoice, notes, created_by
            FROM medicine_batches WHERE id = ANY($1::uuid[])`,
         [batchIds]
       )).rows
@@ -127,6 +130,10 @@ export async function enqueueSyncEvent(client: pg.PoolClient, input: EnqueueInpu
       input.business_ref ? String(input.business_ref).slice(0, 100) : null,
     ]
   );
+
+  // Register post-commit sync worker wake: fires immediately when the local transaction commits!
+  registerAfterCommit(client, notifySyncWake);
+
   return eventId;
 }
 
