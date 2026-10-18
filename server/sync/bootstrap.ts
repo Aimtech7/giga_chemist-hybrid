@@ -22,7 +22,7 @@ export async function enqueueMedicineBaselines(opts: { medicineIds?: string[]; o
       if (!locked.rows[0]) return;
       const batches = (await client.query(
         `SELECT id, medicine_id, batch_number, quantity_available, expiry_date, expiry_status, status, supplier_id,
-                purchase_price, selling_price_override, received_date
+                purchase_price, selling_price_override, received_date, manufacturing_date, purchase_invoice, notes, created_by
            FROM medicine_batches WHERE medicine_id = $1 ORDER BY id`,
         [id]
       )).rows;

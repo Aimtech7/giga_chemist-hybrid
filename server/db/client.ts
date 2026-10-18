@@ -157,6 +157,19 @@ export function requireUuid(id: unknown, field: string): string {
 /** Anything that can run a query: the pool or a client inside a transaction. */
 export type Queryable = Pick<pg.PoolClient, 'query'>;
 
+const afterCommitHooks = new WeakMap<pg.PoolClient, Array<() => void | Promise<void>>>();
+
+/**
+ * Registers a callback to run immediately AFTER the transaction successfully commits.
+ * If the transaction rolls back, registered hooks are discarded.
+ * Errors in hooks are logged and never fail the committed transaction.
+ */
+export function registerAfterCommit(client: pg.PoolClient, hook: () => void | Promise<void>): void {
+  const hooks = afterCommitHooks.get(client) || [];
+  hooks.push(hook);
+  afterCommitHooks.set(client, hooks);
+}
+
 /** Runs fn inside BEGIN/COMMIT on one pooled client; any error triggers ROLLBACK and is rethrown. */
 export async function withTransaction<T>(fn: (client: pg.PoolClient) => Promise<T>): Promise<T> {
   const client = await pgPool.connect();
@@ -165,8 +178,23 @@ export async function withTransaction<T>(fn: (client: pg.PoolClient) => Promise<
     await client.query('BEGIN');
     const result = await fn(client);
     await client.query('COMMIT');
+    const hooks = afterCommitHooks.get(client);
+    if (hooks && hooks.length > 0) {
+      afterCommitHooks.delete(client);
+      for (const hook of hooks) {
+        try {
+          const res = hook();
+          if (res && typeof (res as any).catch === 'function') {
+            (res as Promise<void>).catch((hErr) => console.error('[Server DB] After-commit hook error:', hErr?.message || hErr));
+          }
+        } catch (hErr: any) {
+          console.error('[Server DB] After-commit hook synchronous error:', hErr?.message || hErr);
+        }
+      }
+    }
     return result;
   } catch (err) {
+    afterCommitHooks.delete(client);
     try {
       await client.query('ROLLBACK');
     } catch (rbErr: any) {
@@ -174,6 +202,7 @@ export async function withTransaction<T>(fn: (client: pg.PoolClient) => Promise<
     }
     throw err;
   } finally {
+    afterCommitHooks.delete(client);
     resetCollector(client);
     client.release();
   }

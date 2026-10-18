@@ -7,6 +7,7 @@ import { fetchCommandCredential, pushUserCredentials } from './credentials';
 import { getShopIdentity, reconcileShopIdentity } from './identity';
 import { collectRuntimeStatus } from './heartbeat';
 import { recordAuditLog } from '../db/audit';
+import { registerSyncWakeHandler } from './wake';
 
 /**
  * Background sync worker on the LOCAL server.
@@ -55,13 +56,14 @@ class SyncWorker {
 
   start(): void {
     const cfg = getSyncConfig();
+    registerSyncWakeHandler(() => this.wake(false));
     if (this.started || !cfg.workerEnabled) return;
     this.started = true;
     this.stopped = false;
     if (!cfg.cloudConfigured) {
       console.warn(`[Sync] Hybrid worker enabled but the cloud is not configured: ${cfg.configError} Events will queue locally.`);
     } else {
-      console.log(`[Sync] Worker started (cloud ${cloudHost(cfg)}, every ${cfg.intervalMs / 1000}s, batch ${cfg.batchSize}).`);
+      console.log(`[Sync] Worker started (cloud ${cloudHost(cfg)}, every ${cfg.intervalMs / 1000}s, poll ${cfg.commandPollIntervalMs / 1000}s, batch ${cfg.batchSize}).`);
     }
     this.schedule(1000);
   }
@@ -111,8 +113,9 @@ class SyncWorker {
 
   private nextDelay(): number {
     const cfg = getSyncConfig();
-    if (this.consecutiveFailures === 0) return cfg.intervalMs;
-    return Math.min(cfg.maxBackoffMs, cfg.intervalMs * 2 ** Math.min(this.consecutiveFailures - 1, 10));
+    const base = Math.min(cfg.intervalMs, cfg.commandPollIntervalMs);
+    if (this.consecutiveFailures === 0) return base;
+    return Math.min(cfg.maxBackoffMs, base * 2 ** Math.min(this.consecutiveFailures - 1, 10));
   }
 
   private async cycle(): Promise<void> {
@@ -257,7 +260,12 @@ class SyncWorker {
             SET status = 'PROCESSING', attempt_count = attempt_count + 1, last_attempt_at = CURRENT_TIMESTAMP,
                 locked_at = CURRENT_TIMESTAMP, locked_by = $2
           WHERE id IN (SELECT id FROM sync_events
-                        WHERE status = 'PENDING' AND next_attempt_at <= CURRENT_TIMESTAMP
+                        WHERE status = 'PENDING'
+                          AND next_attempt_at <= CURRENT_TIMESTAMP
+                          AND seq < COALESCE((
+                                SELECT MIN(seq) FROM sync_events
+                                 WHERE status = 'PENDING' AND next_attempt_at > CURRENT_TIMESTAMP
+                              ), 9223372036854775807)
                         ORDER BY seq LIMIT $1 FOR UPDATE SKIP LOCKED)
           RETURNING id, seq, idempotency_key, shop_id, device_id, event_type, operation, entity_type, entity_id,
                     payload, actor_user_id, actor_name, business_ref, created_at, attempt_count`,
@@ -444,6 +452,11 @@ class SyncWorker {
         new_value: { after_failures: this.consecutiveFailures } } as any).catch(() => {});
     }
     this.consecutiveFailures = 0;
+    if (wasDown) {
+      await pgPool.query(
+        `UPDATE sync_events SET next_attempt_at = CURRENT_TIMESTAMP WHERE status = 'PENDING' AND next_attempt_at > CURRENT_TIMESTAMP`
+      ).catch(() => {});
+    }
     await this.saveState({ last_contact_at: new Date().toISOString() });
     return wasDown ? 'reconnected' : 'ok';
   }
