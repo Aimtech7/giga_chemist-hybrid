@@ -11,6 +11,7 @@ import {
   UserCheck,
   UserX,
   Edit2,
+  Trash2,
 } from 'lucide-react';
 import { db } from '../../db/dexie';
 import { apiFetch } from '../../services/http';
@@ -27,6 +28,7 @@ export const UserManagement: React.FC<UserManagementProps> = ({ currentUser }) =
   const [isLoading, setIsLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [statusFilter, setStatusFilter] = useState<'ALL' | 'ACTIVE' | 'ARCHIVED'>('ALL');
 
   // Add / Edit Modal
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -190,6 +192,31 @@ export const UserManagement: React.FC<UserManagementProps> = ({ currentUser }) =
     }
   };
 
+  const handleDeleteUser = async (u: UserType) => {
+    if (u.id === currentUser?.id) {
+      alert('You cannot delete or archive your own active admin account.');
+      return;
+    }
+    const confirmPrompt = `Delete or archive staff account "${u.name}" (${u.email})?\n\n- If this account has historical transaction records (sales, shifts, inventory movements, audits), it will be safely ARCHIVED and DEACTIVATED.\n- If no historical records exist, it will be PERMANENTLY DELETED.\n\nProceed?`;
+    if (!window.confirm(confirmPrompt)) return;
+
+    setIsLoading(true);
+    setErrorMessage(null);
+    try {
+      const res: any = await apiFetch(`/api/users/${u.id}`, { method: 'DELETE' });
+      if (res.action === 'deleted') {
+        setSuccessMessage(`User "${u.name}" had no historical transactions and was permanently deleted.`);
+      } else {
+        setSuccessMessage(`User "${u.name}" has historical transactions and was safely archived/deactivated.`);
+      }
+      await loadUsers();
+    } catch (err: any) {
+      setErrorMessage(err.message || 'Failed to delete or archive user.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
   const openResetPasswordModal = (u: UserType) => {
     setResetTargetUser(u);
     setResetNewPassword('');
@@ -252,6 +279,16 @@ export const UserManagement: React.FC<UserManagementProps> = ({ currentUser }) =
         </div>
 
         <div className="flex items-center gap-2">
+          <select
+            value={statusFilter}
+            onChange={(e) => setStatusFilter(e.target.value as any)}
+            className="px-2.5 py-1.5 rounded border border-slate-300 text-xs font-semibold text-slate-700 bg-white hover:bg-slate-50 transition cursor-pointer"
+          >
+            <option value="ALL">All Staff ({users.length})</option>
+            <option value="ACTIVE">Active ({users.filter((u) => u.active).length})</option>
+            <option value="ARCHIVED">Archived / Inactive ({users.filter((u) => !u.active).length})</option>
+          </select>
+
           <button
             onClick={loadUsers}
             disabled={isLoading}
@@ -307,7 +344,13 @@ export const UserManagement: React.FC<UserManagementProps> = ({ currentUser }) =
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {users.map((u) => (
+              {users
+                .filter((u) => {
+                  if (statusFilter === 'ACTIVE') return u.active;
+                  if (statusFilter === 'ARCHIVED') return !u.active;
+                  return true;
+                })
+                .map((u) => (
                 <tr key={u.id} className="hover:bg-slate-50 transition">
                   <td className="py-2.5 px-3 font-bold text-slate-900">
                     <div className="flex items-center gap-2">
@@ -350,7 +393,7 @@ export const UserManagement: React.FC<UserManagementProps> = ({ currentUser }) =
                       }`}
                     >
                       <span className={`w-1.5 h-1.5 rounded-full ${u.active ? 'bg-emerald-600' : 'bg-slate-400'}`} />
-                      <span>{u.active ? 'Active' : 'Deactivated'}</span>
+                      <span>{u.active ? 'Active' : 'Archived / Deactivated'}</span>
                     </span>
                   </td>
                   <td className="py-2.5 px-3 text-right">
@@ -372,16 +415,27 @@ export const UserManagement: React.FC<UserManagementProps> = ({ currentUser }) =
                       </button>
 
                       {u.id !== currentUser?.id && (
-                        <button
-                          onClick={() => toggleUserActive(u)}
-                          className={`px-2 py-1 rounded text-xs font-semibold cursor-pointer ${
-                            u.active
-                              ? 'bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200'
-                              : 'bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200'
-                          }`}
-                        >
-                          {u.active ? 'Deactivate' : 'Activate'}
-                        </button>
+                        <>
+                          <button
+                            onClick={() => toggleUserActive(u)}
+                            className={`px-2 py-1 rounded text-xs font-semibold cursor-pointer ${
+                              u.active
+                                ? 'bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-200'
+                                : 'bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200'
+                            }`}
+                          >
+                            {u.active ? 'Deactivate' : 'Activate'}
+                          </button>
+
+                          <button
+                            onClick={() => handleDeleteUser(u)}
+                            className="flex items-center gap-1 px-2 py-1 rounded text-xs font-semibold cursor-pointer bg-slate-100 hover:bg-rose-50 text-slate-700 hover:text-rose-700 border border-slate-300 hover:border-rose-300 transition"
+                            title="Delete if no history, otherwise safely archive"
+                          >
+                            <Trash2 className="w-3 h-3 text-slate-500" />
+                            <span>Delete / Archive</span>
+                          </button>
+                        </>
                       )}
                     </div>
                   </td>

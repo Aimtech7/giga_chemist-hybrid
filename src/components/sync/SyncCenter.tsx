@@ -1,19 +1,32 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Loader2, RefreshCw, RotateCcw, Send, Waypoints } from 'lucide-react';
+import {
+  Loader2,
+  RefreshCw,
+  RotateCcw,
+  Send,
+  Waypoints,
+  CheckCircle2,
+  AlertTriangle,
+  ShieldAlert,
+  Search,
+  Wrench,
+  Check,
+} from 'lucide-react';
 import { apiFetch } from '../../services/http';
 import { queueRemoteCommand } from '../../services/remoteAdmin';
 
 /**
  * SYNC & CONFLICT CONTROL CENTER (Administrator).
  *   shop computer: this shop's outbox (sequence, failed events with the cloud's reason), recent remote
- *                  commands with a plain conflict reason; retry one / all failed events, sync now
+ *                  commands with a plain conflict reason; retry one / all failed events, sync now,
+ *                  READ-ONLY SHOP CONSISTENCY CHECK, and controlled individual reconciliations.
  *   online app   : every authorized shop (contact, heartbeat, shop vs cloud sequence, outbox, commands,
  *                  version, device, last backup) + the selected shop's rejected commands / events;
  *                  retry a rejected command (ONE new linked command), ask the shop to re-send failed events
  * Retries never duplicate: events keep their idempotency keys; a rejected command changed nothing.
  */
 const when = (v?: string | null) => (v ? new Date(v).toLocaleString() : '—');
-const btn = 'px-2.5 py-1.5 rounded-lg border border-slate-300 text-xs font-semibold flex items-center gap-1 disabled:opacity-50';
+const btn = 'px-2.5 py-1.5 rounded-lg border border-slate-300 text-xs font-semibold flex items-center gap-1 disabled:opacity-50 cursor-pointer hover:bg-slate-50 transition';
 const Reason: React.FC<{ v?: string | null }> = ({ v }) => (v ? <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 text-[10px] font-bold whitespace-nowrap">{v.replace(/_/g, ' ')}</span> : null);
 
 const Table: React.FC<{ cols: string[]; rows: React.ReactNode[][]; empty: string }> = ({ cols, rows, empty }) => (
@@ -33,6 +46,10 @@ export const SyncCenter: React.FC<{ online: boolean }> = ({ online }) => {
   const [issues, setIssues] = useState<any>(null);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+
+  // Shop Consistency Scanner state
+  const [consistencyReport, setConsistencyReport] = useState<any>(null);
+  const [runningCheck, setRunningCheck] = useState(false);
 
   const load = useCallback(async () => {
     setBusy(true);
@@ -65,6 +82,41 @@ export const SyncCenter: React.FC<{ online: boolean }> = ({ online }) => {
     }
   };
 
+  const runConsistencyCheck = async () => {
+    setRunningCheck(true);
+    setMsg(null);
+    try {
+      const report = await apiFetch<any>('/api/sync/consistency-check');
+      setConsistencyReport(report);
+      setMsg({ ok: true, text: `Shop consistency scan completed at ${new Date(report.timestamp).toLocaleTimeString()}.` });
+    } catch (err: any) {
+      setMsg({ ok: false, text: err?.message || 'Failed to run shop consistency check.' });
+    } finally {
+      setRunningCheck(false);
+    }
+  };
+
+  const repairBaseline = async (medicineId: string, name: string) => {
+    if (!window.confirm(`Re-publish authoritative baseline for "${name}"?\n\nThis locks the local medicine row, snapshots actual local stock & batches, and atomically replaces the cloud baseline.`)) return;
+    await run(() => apiFetch('/api/sync/reconcile-baseline', { body: { medicine_id: medicineId } }), `Baseline re-published for ${name}`);
+    await runConsistencyCheck();
+  };
+
+  const repairCatalogue = async (medicineId: string, name: string) => {
+    await run(() => apiFetch('/api/sync/reconcile-catalogue', { body: { medicine_id: medicineId } }), `Catalogue re-published for ${name}`);
+    await runConsistencyCheck();
+  };
+
+  const repairUserProfile = async (userId: string, name: string) => {
+    await run(() => apiFetch('/api/sync/reconcile-user-profile', { body: { user_id: userId } }), `Profile re-published for ${name}`);
+    await runConsistencyCheck();
+  };
+
+  const repairCredentials = async () => {
+    await run(() => apiFetch('/api/sync/reconcile-credentials', { body: {} }), 'Credentials published to cloud');
+    await runConsistencyCheck();
+  };
+
   return (
     <div className="flex-1 overflow-y-auto p-3 space-y-3">
       <div className="flex items-center justify-between gap-2">
@@ -73,11 +125,164 @@ export const SyncCenter: React.FC<{ online: boolean }> = ({ online }) => {
           <p className="text-[11px] text-slate-500">Retries never duplicate: events keep their idempotency keys; a rejected command changed nothing and is re-sent once as a new linked command.</p>
         </div>
         <div className="flex gap-2">
-          {!online && <button className={btn} disabled={busy} onClick={() => void run(() => apiFetch('/api/sync/now', { body: {} }), 'Sync started')}><Send className="w-3.5 h-3.5" /> Sync now</button>}
+          {!online && (
+            <>
+              <button
+                className="px-3 py-1.5 rounded-lg bg-teal-700 hover:bg-teal-800 text-white text-xs font-semibold flex items-center gap-1.5 shadow-xs cursor-pointer disabled:opacity-50 transition"
+                disabled={runningCheck}
+                onClick={runConsistencyCheck}
+              >
+                {runningCheck ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Search className="w-3.5 h-3.5" />}
+                <span>Run Consistency Check</span>
+              </button>
+              <button className={btn} disabled={busy} onClick={() => void run(() => apiFetch('/api/sync/now', { body: {} }), 'Sync started')}><Send className="w-3.5 h-3.5" /> Sync now</button>
+            </>
+          )}
           <button className={btn} disabled={busy} onClick={() => void load()}>{busy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />} Refresh</button>
         </div>
       </div>
       {msg && <div className={`text-xs rounded p-2 border ${msg.ok ? 'bg-emerald-50 border-emerald-200 text-emerald-800' : 'bg-rose-50 border-rose-200 text-rose-800'}`}>{msg.text}</div>}
+
+      {/* Local Shop Consistency Audit & Controlled Reconciliation */}
+      {!online && consistencyReport && (
+        <div className="bg-white border border-slate-200 rounded-xl p-3 space-y-3 shadow-xs">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              {consistencyReport.healthy ? (
+                <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
+              ) : (
+                <ShieldAlert className="w-5 h-5 text-amber-600 shrink-0" />
+              )}
+              <div>
+                <h2 className="text-sm font-bold text-slate-900">
+                  Shop Consistency Audit {consistencyReport.healthy ? '— Fully Consistent' : '— Discrepancies Detected'}
+                </h2>
+                <p className="text-[11px] text-slate-500">
+                  Read-only comparison of authoritative local PostgreSQL vs cloud. Select individual repair actions below.
+                </p>
+              </div>
+            </div>
+            <button
+              className="text-xs text-slate-500 hover:text-slate-800 font-semibold cursor-pointer"
+              onClick={() => setConsistencyReport(null)}
+            >
+              Dismiss
+            </button>
+          </div>
+
+          <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 text-xs">
+            <div className={`p-2 rounded-lg border ${consistencyReport.summary.negative_cloud_stock > 0 ? 'bg-rose-50 border-rose-200 text-rose-900' : 'bg-slate-50 border-slate-200'}`}>
+              <div className="text-[10px] uppercase font-semibold text-slate-500">Negative Cloud Stock</div>
+              <div className="text-sm font-bold">{consistencyReport.summary.negative_cloud_stock}</div>
+            </div>
+            <div className={`p-2 rounded-lg border ${consistencyReport.summary.stock_mismatches > 0 ? 'bg-amber-50 border-amber-200 text-amber-900' : 'bg-slate-50 border-slate-200'}`}>
+              <div className="text-[10px] uppercase font-semibold text-slate-500">Stock Mismatches</div>
+              <div className="text-sm font-bold">{consistencyReport.summary.stock_mismatches}</div>
+            </div>
+            <div className={`p-2 rounded-lg border ${consistencyReport.summary.catalogue_missing_cloud > 0 ? 'bg-amber-50 border-amber-200 text-amber-900' : 'bg-slate-50 border-slate-200'}`}>
+              <div className="text-[10px] uppercase font-semibold text-slate-500">Missing in Cloud</div>
+              <div className="text-sm font-bold">{consistencyReport.summary.catalogue_missing_cloud}</div>
+            </div>
+            <div className={`p-2 rounded-lg border ${consistencyReport.summary.users_missing_online_login > 0 ? 'bg-blue-50 border-blue-200 text-blue-900' : 'bg-slate-50 border-slate-200'}`}>
+              <div className="text-[10px] uppercase font-semibold text-slate-500">No Online Login</div>
+              <div className="text-sm font-bold">{consistencyReport.summary.users_missing_online_login}</div>
+            </div>
+            <div className={`p-2 rounded-lg border ${consistencyReport.summary.sequence_gaps > 0 ? 'bg-rose-50 border-rose-200 text-rose-900' : 'bg-slate-50 border-slate-200'}`}>
+              <div className="text-[10px] uppercase font-semibold text-slate-500">Sequence Gaps</div>
+              <div className="text-sm font-bold">{consistencyReport.summary.sequence_gaps}</div>
+            </div>
+          </div>
+
+          {/* Stock Discrepancies Table */}
+          {consistencyReport.stock_issues?.length > 0 && (
+            <div className="space-y-1.5">
+              <div className="text-xs font-bold text-slate-800 flex items-center justify-between">
+                <span>Stock Discrepancies ({consistencyReport.stock_issues.length})</span>
+                <span className="text-[11px] text-slate-500 font-normal">Re-publishing baseline authoritatively updates cloud with local stock snapshot</span>
+              </div>
+              <Table
+                cols={['Medicine', 'Barcode / SKU', 'Local Stock', 'Cloud Stock', 'Discrepancy', 'Status', 'Action']}
+                empty="No stock discrepancies."
+                rows={consistencyReport.stock_issues.map((s: any) => [
+                  <b>{s.name}</b>,
+                  <span className="font-mono text-slate-500">{s.barcode || s.sku || '—'}</span>,
+                  <span className="font-bold text-emerald-800">{s.local_stock}</span>,
+                  <span className={`font-bold ${s.cloud_stock < 0 ? 'text-rose-700' : 'text-slate-700'}`}>{s.cloud_stock ?? 'None'}</span>,
+                  <span className="font-mono text-xs">{s.difference > 0 ? `+${s.difference}` : s.difference}</span>,
+                  s.negative_cloud ? (
+                    <span className="px-1.5 py-0.5 rounded bg-rose-100 text-rose-800 text-[10px] font-bold">NEGATIVE CLOUD STOCK</span>
+                  ) : (
+                    <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 text-[10px] font-bold">MISMATCH</span>
+                  ),
+                  <button
+                    className="px-2 py-1 rounded bg-teal-50 hover:bg-teal-100 text-teal-800 border border-teal-300 text-xs font-semibold cursor-pointer"
+                    disabled={busy}
+                    onClick={() => repairBaseline(s.medicine_id, s.name)}
+                  >
+                    Reconcile Baseline
+                  </button>,
+                ])}
+              />
+            </div>
+          )}
+
+          {/* Catalogue Discrepancies */}
+          {consistencyReport.catalogue_issues?.length > 0 && (
+            <div className="space-y-1.5">
+              <div className="text-xs font-bold text-slate-800">Catalogue Parity Issues ({consistencyReport.catalogue_issues.length})</div>
+              <Table
+                cols={['Medicine', 'Issue Type', 'Details', 'Action']}
+                empty="No catalogue issues."
+                rows={consistencyReport.catalogue_issues.map((c: any) => [
+                  <b>{c.name}</b>,
+                  <Reason v={c.type} />,
+                  <span className="text-slate-600 text-[11px]">{typeof c.details === 'string' ? c.details : JSON.stringify(c.details)}</span>,
+                  <button
+                    className="px-2 py-1 rounded bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-semibold cursor-pointer"
+                    disabled={busy}
+                    onClick={() => repairCatalogue(c.medicine_id, c.name)}
+                  >
+                    Re-publish Catalogue
+                  </button>,
+                ])}
+              />
+            </div>
+          )}
+
+          {/* User Parity Issues */}
+          {consistencyReport.user_issues?.length > 0 && (
+            <div className="space-y-1.5">
+              <div className="text-xs font-bold text-slate-800 flex items-center justify-between">
+                <span>User Accounts &amp; Credential Sync ({consistencyReport.user_issues.length})</span>
+                <button
+                  className={btn}
+                  disabled={busy}
+                  onClick={repairCredentials}
+                >
+                  <Send className="w-3 h-3 text-teal-700" />
+                  <span>Publish All Pending Credentials</span>
+                </button>
+              </div>
+              <Table
+                cols={['Staff Name', 'Email Identifier', 'Issue', 'Action']}
+                empty="All staff accounts synced."
+                rows={consistencyReport.user_issues.map((u: any) => [
+                  <b>{u.name}</b>,
+                  <span className="font-mono text-slate-600">{u.email}</span>,
+                  <Reason v={u.type} />,
+                  <button
+                    className="px-2 py-1 rounded bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-semibold cursor-pointer"
+                    disabled={busy}
+                    onClick={() => repairUserProfile(u.user_id, u.name)}
+                  >
+                    Re-publish Profile
+                  </button>,
+                ])}
+              />
+            </div>
+          )}
+        </div>
+      )}
 
       {online && data && (
         <>

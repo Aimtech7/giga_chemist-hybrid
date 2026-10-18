@@ -44,8 +44,10 @@ import {
   createUser,
   updateUser,
   toggleUserStatus,
+  deleteOrArchiveUser,
   changeUserPassword,
   adminResetUserPassword,
+  adminSetUserPin,
   authenticateUser,
   registerDevice,
   normalizeDeviceId,
@@ -62,6 +64,13 @@ import {
   type JwtPayload,
 } from './auth';
 import { getSyncStatus, syncWorker } from './sync/worker';
+import {
+  runShopConsistencyCheck,
+  reconcileMedicineBaseline,
+  reconcileCatalogueMetadata,
+  reconcileUserProfile,
+  reconcileUserCredentials,
+} from './sync/consistency';
 import { resolveRange, getSalesReport } from './db/reports';
 import {
   getEmailSettings, updateEmailSettings, enqueueTestEmail, enqueueReport, getEmailStatus, listEmailJobs,
@@ -421,6 +430,45 @@ apiRouter.patch('/users/:id/status', requireRole('ADMIN'), async (req: Authentic
     res.json({ success: true, user: updated });
   } catch (err: any) {
     res.status(errorStatus(err)).json({ error: err.message || 'Failed to change user status.' });
+  }
+});
+
+// Admin deletes or archives a user. ADMIN ONLY.
+// If user has historical sales, inventory, or audit transactions, they are archived (deactivated) instead.
+apiRouter.delete('/users/:id', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { id } = req.params;
+    const result = await deleteOrArchiveUser(id, req.userId);
+    await recordAuditLog({
+      ...actorAudit(req),
+      action: result.action === 'deleted' ? 'USER_PERMANENTLY_DELETED' : 'USER_ARCHIVED',
+      entity: 'user',
+      entity_id: id,
+      new_value: { action: result.action, reason: result.reason },
+    });
+    res.json({ success: true, ...result });
+  } catch (err: any) {
+    res.status(errorStatus(err)).json({ error: err.message || 'Failed to delete/archive user.' });
+  }
+});
+
+// Admin sets / changes a user's PIN. ADMIN ONLY.
+apiRouter.post('/users/:id/pin', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { id } = req.params;
+    const { pin } = req.body || {};
+    if (!pin) return res.status(400).json({ error: 'PIN is required (4-6 digits).' });
+    const result = await adminSetUserPin(id, String(pin), req.userId);
+    await recordAuditLog({
+      ...actorAudit(req),
+      action: 'USER_PIN_CHANGED',
+      entity: 'user',
+      entity_id: id,
+      new_value: { changed_by: req.userName },
+    });
+    res.json(result);
+  } catch (err: any) {
+    res.status(errorStatus(err)).json({ error: err.message || 'Failed to update user PIN.' });
   }
 });
 
@@ -922,6 +970,74 @@ apiRouter.post('/sync/retry-failed', requireRole('ADMIN'), async (req: Authentic
     res.json({ success: true, requeued: r.rowCount || 0 });
   } catch (err: any) {
     sendError(res, err, 'Failed to re-queue failed events.', 'POST /sync/retry-failed');
+  }
+});
+
+// ADMIN: Run read-only shop consistency check comparing local PostgreSQL vs cloud
+apiRouter.get('/sync/consistency-check', requireRole('ADMIN'), async (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    const report = await runShopConsistencyCheck();
+    res.json(report);
+  } catch (err: any) {
+    sendError(res, err, 'Failed to run shop consistency check.', 'GET /sync/consistency-check');
+  }
+});
+
+// ADMIN: Controlled repair: Re-publish medicine baseline (reconciles cloud stock atomically)
+apiRouter.post('/sync/reconcile-baseline', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { medicine_id } = req.body || {};
+    if (!medicine_id) return res.status(400).json({ error: 'medicine_id is required.' });
+    const result = await reconcileMedicineBaseline(medicine_id, {
+      user_id: req.userId,
+      user_name: req.userName,
+      role: req.userRole,
+    });
+    res.json(result);
+  } catch (err: any) {
+    sendError(res, err, 'Failed to reconcile medicine baseline.', 'POST /sync/reconcile-baseline');
+  }
+});
+
+// ADMIN: Controlled repair: Re-publish catalogue metadata
+apiRouter.post('/sync/reconcile-catalogue', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { medicine_id } = req.body || {};
+    if (!medicine_id) return res.status(400).json({ error: 'medicine_id is required.' });
+    const result = await reconcileCatalogueMetadata(medicine_id, {
+      user_id: req.userId,
+      user_name: req.userName,
+      role: req.userRole,
+    });
+    res.json(result);
+  } catch (err: any) {
+    sendError(res, err, 'Failed to reconcile catalogue metadata.', 'POST /sync/reconcile-catalogue');
+  }
+});
+
+// ADMIN: Controlled repair: Re-publish user profile
+apiRouter.post('/sync/reconcile-user-profile', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { user_id } = req.body || {};
+    if (!user_id) return res.status(400).json({ error: 'user_id is required.' });
+    const result = await reconcileUserProfile(user_id, {
+      user_id: req.userId,
+      user_name: req.userName,
+      role: req.userRole,
+    });
+    res.json(result);
+  } catch (err: any) {
+    sendError(res, err, 'Failed to reconcile user profile.', 'POST /sync/reconcile-user-profile');
+  }
+});
+
+// ADMIN: Controlled repair: Push user credentials to cloud login mirror
+apiRouter.post('/sync/reconcile-credentials', requireRole('ADMIN'), async (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    const result = await reconcileUserCredentials();
+    res.json(result);
+  } catch (err: any) {
+    sendError(res, err, 'Failed to reconcile user credentials.', 'POST /sync/reconcile-credentials');
   }
 });
 

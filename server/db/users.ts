@@ -251,7 +251,7 @@ export async function createUser(data: {
 
 export async function updateUser(
   id: string,
-  updates: Partial<{ name: string; email: string; username: string | null; role: UserRole; phone: string; active: boolean }>,
+  updates: Partial<{ name: string; email: string; username: string | null; role: UserRole; phone: string; active: boolean; pin?: string }>,
   actorId?: string
 ): Promise<User> {
   return withTransaction((client) => updateUserTx(client, id, updates, actorId));
@@ -261,7 +261,7 @@ export async function updateUser(
 export async function updateUserTx(
   client: pg.PoolClient,
   id: string,
-  updates: Partial<{ name: string; email: string; username: string | null; role: UserRole; phone: string; active: boolean }>,
+  updates: Partial<{ name: string; email: string; username: string | null; role: UserRole; phone: string; active: boolean; pin?: string }>,
   actorId?: string
 ): Promise<User> {
   if (!isValidUuid(id)) throw new HttpError(400, 'User id must be a valid UUID.');
@@ -272,6 +272,10 @@ export async function updateUserTx(
   const active = updates.active !== undefined ? Boolean(updates.active) : undefined;
   const phone =
     updates.phone !== undefined ? (String(updates.phone).trim().slice(0, 50) || null) : undefined;
+  const pinHash =
+    updates.pin !== undefined && updates.pin !== null && String(updates.pin).trim() !== ''
+      ? hashCredential(validatePin(String(updates.pin))).combined
+      : undefined;
 
   const found = await client.query(`SELECT * FROM users WHERE id = $1 FOR UPDATE`, [id]);
   const target: UserRow | undefined = found.rows[0];
@@ -295,10 +299,23 @@ export async function updateUserTx(
          phone = CASE WHEN $4::boolean THEN $5 ELSE phone END,
          active = COALESCE($6, active),
          username = CASE WHEN $8::boolean THEN $9 ELSE username END,
+         pin_hash = CASE WHEN $10::boolean THEN $11 ELSE pin_hash END,
          updated_at = CURRENT_TIMESTAMP
        WHERE id = $7
        RETURNING ${PUBLIC_COLUMNS}`,
-      [name ?? null, email ?? null, role ?? null, phone !== undefined, phone ?? null, active ?? null, id, username !== undefined, username ?? null]
+      [
+        name ?? null,
+        email ?? null,
+        role ?? null,
+        phone !== undefined,
+        phone ?? null,
+        active ?? null,
+        id,
+        username !== undefined,
+        username ?? null,
+        pinHash !== undefined,
+        pinHash ?? null,
+      ]
     );
     const user = toUser(res.rows[0]);
     await enqueueSyncEvent(client, {
@@ -339,7 +356,7 @@ export async function changeUserPassword(data: {
 
 export async function adminResetUserPassword(data: {
   targetUserId: string;
-  newPassword: string;
+  newPassword?: string;
   newPin?: string;
   adminUserId?: string;
   adminPassword?: string;
@@ -369,3 +386,126 @@ export async function adminResetUserPassword(data: {
   const what = passwordHash && pinHash ? 'Password and PIN' : passwordHash ? 'Password' : 'PIN';
   return { success: true, message: `${what} for ${res.rows[0].name} was successfully reset.` };
 }
+
+export async function adminSetUserPin(
+  targetUserId: string,
+  newPin: string,
+  adminUserId?: string
+): Promise<{ success: boolean; message: string }> {
+  return adminResetUserPassword({ targetUserId, newPin, adminUserId });
+}
+
+export interface DeleteOrArchiveResult {
+  action: 'deleted' | 'archived';
+  id: string;
+  user?: User;
+  reason: string;
+}
+
+/**
+ * Safely deletes or archives a user.
+ * - Current admin cannot delete themselves.
+ * - Last active admin cannot be deleted or archived.
+ * - If account has historical references (sales, shifts, audit, movements, purchases, etc.):
+ *     archived and deactivated (active = false, sessions revoked).
+ * - If account has zero historical references:
+ *     permanently deleted from users table and sync event emitted.
+ */
+export async function deleteOrArchiveUser(
+  userId: string,
+  actorId?: string
+): Promise<DeleteOrArchiveResult> {
+  if (!isValidUuid(userId)) throw new HttpError(400, 'User id must be a valid UUID.');
+  if (actorId && actorId === userId) {
+    throw new HttpError(409, 'You cannot delete or archive your own account.');
+  }
+
+  return withTransaction(async (client) => {
+    const found = await client.query('SELECT * FROM users WHERE id = $1 FOR UPDATE', [userId]);
+    const target: UserRow | undefined = found.rows[0];
+    if (!target) throw new HttpError(404, 'User not found.');
+
+    // Protect last active administrator
+    if (target.role === 'ADMIN' && target.active) {
+      await assertAnotherActiveAdmin(client, userId);
+    }
+
+    // Check historical transaction references
+    const tablesToCheck = [
+      { table: 'sales', cols: ['cashier_id', 'voided_by'] },
+      { table: 'cashier_shifts', cols: ['cashier_id', 'opened_by', 'closed_by', 'reviewed_by'] },
+      { table: 'cashier_shift_corrections', cols: ['created_by'] },
+      { table: 'inventory_movements', cols: ['user_id'] },
+      { table: 'audit_logs', cols: ['user_id'] },
+      { table: 'purchases', cols: ['created_by'] },
+      { table: 'returns', cols: ['user_id', 'reviewed_by'] },
+      { table: 'expenses', cols: ['user_id'] },
+      { table: 'medicines', cols: ['created_by', 'updated_by'] },
+      { table: 'medicine_batches', cols: ['created_by'] },
+      { table: 'stocktakes', cols: ['started_by', 'approved_by'] },
+      { table: 'stocktake_lines', cols: ['counted_by'] },
+      { table: 'sync_events', cols: ['actor_user_id'] },
+    ];
+
+    let totalReferences = 0;
+    for (const { table, cols } of tablesToCheck) {
+      const conditions = cols.map((col) => `${col} = $1`).join(' OR ');
+      try {
+        const r = await client.query(`SELECT COUNT(*)::int AS count FROM ${table} WHERE ${conditions}`, [userId]);
+        totalReferences += Number(r.rows[0]?.count || 0);
+      } catch (err: any) {
+        // Table may not exist in minimal test schemas; continue checking
+      }
+    }
+
+    if (totalReferences > 0) {
+      // Historical references exist -> ARCHIVE / DEACTIVATE
+      const res = await client.query(
+        `UPDATE users SET active = FALSE, sessions_revoked_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+          WHERE id = $1 RETURNING ${PUBLIC_COLUMNS}`,
+        [userId]
+      );
+      const user = toUser(res.rows[0]);
+      await enqueueSyncEvent(client, {
+        event_type: 'USER_UPSERTED',
+        entity_type: 'user',
+        entity_id: userId,
+        operation: 'UPDATE',
+        data: async () => ({ user: await userJson(client, userId) }),
+        actor: { user_id: actorId || null },
+      });
+      return {
+        action: 'archived',
+        id: userId,
+        user,
+        reason: `User has ${totalReferences} historical transaction record(s). The account has been archived and deactivated instead of permanently deleted.`,
+      };
+    } else {
+      // Zero references -> PERMANENT DELETE
+      try {
+        await client.query('DELETE FROM user_name_history WHERE user_id = $1', [userId]);
+        await client.query('DELETE FROM user_roles WHERE user_id = $1', [userId]);
+        await client.query('UPDATE devices SET current_user_id = NULL WHERE current_user_id = $1', [userId]);
+      } catch (err: any) {
+        // Ignored if optional tables are not present
+      }
+
+      await client.query('DELETE FROM users WHERE id = $1', [userId]);
+      await enqueueSyncEvent(client, {
+        event_type: 'USER_DELETED',
+        entity_type: 'user',
+        entity_id: userId,
+        operation: 'DELETE',
+        data: { user: { id: userId, email: target.email, username: target.username } },
+        actor: { user_id: actorId || null },
+      });
+
+      return {
+        action: 'deleted',
+        id: userId,
+        reason: 'User had no historical transaction records and has been permanently deleted.',
+      };
+    }
+  });
+}
+

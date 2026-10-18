@@ -80,7 +80,11 @@ export function useRemoteSender(onApplied?: () => void) {
       setDraft(null);
       void loadStatus();
     } catch (err: any) {
-      setError(err instanceof ApiError ? err.message : 'Could not reach the online server. Nothing was queued; you can retry safely.');
+      if (err instanceof ApiError && err.status === 409) {
+        setError(`Stock / Data Conflict: ${err.message}. The shop's live inventory changed since this screen was opened. Please refresh to load the latest numbers, or perform an exact Physical Count.`);
+      } else {
+        setError(err instanceof ApiError ? err.message : 'Could not reach the online server. Nothing was queued; you can retry safely.');
+      }
     } finally {
       setSending(false);
     }
