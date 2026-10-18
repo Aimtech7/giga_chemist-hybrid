@@ -562,7 +562,7 @@ export async function checkoutSale(
       const prev = Number(l.batch.quantity_available);
       const next = prev - l.quantity;
       const upd = await client.query(
-        `UPDATE medicine_batches SET quantity_available = $1, status = $2, updated_at = CURRENT_TIMESTAMP
+        `UPDATE medicine_batches SET quantity_available = $1, status = $2, stock_version = stock_version + 1, updated_at = CURRENT_TIMESTAMP
          WHERE id = $3 RETURNING *`,
         [next, deriveBatchStatus(next, l.batch.expiry_date, l.batch.status), l.batch.id]
       );
@@ -704,7 +704,7 @@ export async function voidSaleTx(client: pg.PoolClient, saleId: string, reasonRa
       // Status re-derived: stock returned to an expired batch stays quarantined (not sellable).
       const status = deriveBatchStatus(next, batch.expiry_date, batch.status === 'exhausted' ? 'active' : batch.status);
       const upd = await client.query(
-        'UPDATE medicine_batches SET quantity_available = $1, status = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3 RETURNING *',
+        'UPDATE medicine_batches SET quantity_available = $1, status = $2, stock_version = stock_version + 1, updated_at = CURRENT_TIMESTAMP WHERE id = $3 RETURNING *',
         [next, status, batch.id]
       );
       touched.set(batch.id, upd.rows[0]);
