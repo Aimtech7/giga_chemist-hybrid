@@ -50,6 +50,9 @@ export const SyncCenter: React.FC<{ online: boolean }> = ({ online }) => {
   // Shop Consistency Scanner state
   const [consistencyReport, setConsistencyReport] = useState<any>(null);
   const [runningCheck, setRunningCheck] = useState(false);
+  const [parityReport, setParityReport] = useState<any>(null);
+  const [runningParity, setRunningParity] = useState(false);
+  const [reconcilingParity, setReconcilingParity] = useState(false);
 
   const load = useCallback(async () => {
     setBusy(true);
@@ -117,6 +120,35 @@ export const SyncCenter: React.FC<{ online: boolean }> = ({ online }) => {
     await runConsistencyCheck();
   };
 
+  const runStockParityCheck = async () => {
+    setRunningParity(true);
+    setMsg(null);
+    try {
+      const report = await apiFetch<any>('/api/sync/stock-parity/check', { method: 'POST' });
+      setParityReport(report);
+      setMsg({ ok: true, text: `Stock parity check completed: ${report.summary.matched} matched, ${report.summary.mismatch} mismatched.` });
+    } catch (err: any) {
+      setMsg({ ok: false, text: err?.message || 'Failed to check stock parity.' });
+    } finally {
+      setRunningParity(false);
+    }
+  };
+
+  const reconcileAllStockParity = async () => {
+    if (!window.confirm('Trigger authoritative baseline reconciliation for all mismatched medicines?\n\nDirection: LOCAL SHOP -> CLOUD (Local PostgreSQL is stock authority).')) return;
+    setReconcilingParity(true);
+    setMsg(null);
+    try {
+      const res = await apiFetch<any>('/api/sync/stock-parity/reconcile', { method: 'POST', body: { all: true } });
+      setMsg({ ok: true, text: `Reconciled ${res.reconciledCount || 0} medicine(s) with cloud.` });
+      await runStockParityCheck();
+    } catch (err: any) {
+      setMsg({ ok: false, text: err?.message || 'Failed to reconcile stock parity.' });
+    } finally {
+      setReconcilingParity(false);
+    }
+  };
+
   return (
     <div className="flex-1 overflow-y-auto p-3 space-y-3">
       <div className="flex items-center justify-between gap-2">
@@ -135,6 +167,14 @@ export const SyncCenter: React.FC<{ online: boolean }> = ({ online }) => {
                 {runningCheck ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Search className="w-3.5 h-3.5" />}
                 <span>Run Consistency Check</span>
               </button>
+              <button
+                className="px-3 py-1.5 rounded-lg border border-teal-300 bg-teal-50 hover:bg-teal-100 text-teal-800 text-xs font-semibold flex items-center gap-1.5 shadow-xs cursor-pointer disabled:opacity-50 transition"
+                disabled={runningParity}
+                onClick={runStockParityCheck}
+              >
+                {runningParity ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RotateCcw className="w-3.5 h-3.5" />}
+                <span>Check Stock Sync Now</span>
+              </button>
               <button className={btn} disabled={busy} onClick={() => void run(() => apiFetch('/api/sync/now', { body: {} }), 'Sync started')}><Send className="w-3.5 h-3.5" /> Sync now</button>
             </>
           )}
@@ -144,6 +184,66 @@ export const SyncCenter: React.FC<{ online: boolean }> = ({ online }) => {
       {msg && <div className={`text-xs rounded p-2 border ${msg.ok ? 'bg-emerald-50 border-emerald-200 text-emerald-800' : 'bg-rose-50 border-rose-200 text-rose-800'}`}>{msg.text}</div>}
 
       {/* Local Shop Consistency Audit & Controlled Reconciliation */}
+      {/* Stock Parity / Auto-Reconciliation Status Card */}
+      {!online && parityReport && (
+        <div className="bg-white border border-slate-200 rounded-xl p-3.5 space-y-3 shadow-xs">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              {parityReport.healthy ? (
+                <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
+              ) : (
+                <ShieldAlert className="w-5 h-5 text-rose-600 shrink-0" />
+              )}
+              <div>
+                <h2 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                  <span>Stock Parity</span>
+                  <span className="px-1.5 py-0.5 rounded text-[10px] bg-slate-100 text-slate-700 font-mono">LOCAL AUTHORITATIVE</span>
+                </h2>
+                <p className="text-[11px] text-slate-500">
+                  Last checked: {new Date(parityReport.timestamp).toLocaleTimeString()} · Cloud status: {parityReport.cloud_accessible ? 'Connected' : 'Offline / Unreachable'}
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              {parityReport.summary.mismatch > 0 && (
+                <button
+                  className="px-3 py-1 rounded-lg bg-rose-600 hover:bg-rose-700 text-white text-xs font-semibold flex items-center gap-1 shadow-xs cursor-pointer disabled:opacity-50 transition"
+                  disabled={reconcilingParity}
+                  onClick={reconcileAllStockParity}
+                >
+                  {reconcilingParity ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Wrench className="w-3.5 h-3.5" />}
+                  <span>Reconcile All Mismatched ({parityReport.summary.mismatch})</span>
+                </button>
+              )}
+              <button
+                className="text-xs text-slate-500 hover:text-slate-800 font-semibold cursor-pointer"
+                onClick={() => setParityReport(null)}
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
+            <div className="p-2.5 rounded-lg border border-slate-200 bg-emerald-50/50 text-emerald-950">
+              <div className="text-[10px] uppercase font-semibold text-emerald-700">Matched</div>
+              <div className="text-base font-bold font-mono">{parityReport.summary.matched}</div>
+            </div>
+            <div className="p-2.5 rounded-lg border border-slate-200 bg-sky-50/50 text-sky-950">
+              <div className="text-[10px] uppercase font-semibold text-sky-700">Syncing / Pending</div>
+              <div className="text-base font-bold font-mono">{parityReport.summary.syncing}</div>
+            </div>
+            <div className={`p-2.5 rounded-lg border ${parityReport.summary.mismatch > 0 ? 'bg-rose-50 border-rose-200 text-rose-950' : 'bg-slate-50 border-slate-200 text-slate-800'}`}>
+              <div className="text-[10px] uppercase font-semibold text-slate-600">Mismatch</div>
+              <div className="text-base font-bold font-mono">{parityReport.summary.mismatch}</div>
+            </div>
+            <div className="p-2.5 rounded-lg border border-slate-200 bg-slate-50 text-slate-800">
+              <div className="text-[10px] uppercase font-semibold text-slate-600">Reconciled</div>
+              <div className="text-base font-bold font-mono">{parityReport.summary.reconciled}</div>
+            </div>
+          </div>
+        </div>
+      )}
       {!online && consistencyReport && (
         <div className="bg-white border border-slate-200 rounded-xl p-3 space-y-3 shadow-xs">
           <div className="flex items-center justify-between">

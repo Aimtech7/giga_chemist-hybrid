@@ -375,3 +375,354 @@ export async function adminUpdateMedicinePricing(params: UpdatePricingParams): P
     return saved;
   });
 }
+
+/**
+ * Computes deterministic canonical SHA-256 fingerprint for a medicine and its active batches.
+ */
+export function computeMedicineStockFingerprint(
+  medicineId: string,
+  stockVersion: number | string,
+  currentStock: number,
+  batches: Array<{ id: string; quantity_available: number; stock_version?: number | string; status: string }>
+): string {
+  const sortedBatches = [...batches].sort((a, b) => a.id.localeCompare(b.id));
+  const raw = [
+    medicineId,
+    stockVersion,
+    currentStock,
+    ...sortedBatches.map((b) => `${b.id}:${b.quantity_available}:${b.stock_version ?? 1}:${b.status}`),
+  ].join('|');
+  return crypto.createHash('sha256').update(raw).digest('hex');
+}
+
+export interface MedicineDeletePreview {
+  medicine_id: string;
+  name: string;
+  sku: string;
+  barcode: string;
+  current_stock: number;
+  status: string;
+  version: number;
+  batches_count: number;
+  references: {
+    sales: number;
+    sale_items: number;
+    purchases: number;
+    purchase_items: number;
+    returns: number;
+    inventory_movements: number;
+    stocktakes: number;
+    pending_sync_events: number;
+  };
+  outcome: 'PERMANENT_DELETE' | 'ARCHIVE_REQUIRED';
+  stock_blocks_delete: boolean;
+  pending_sync_blocks_delete: boolean;
+  can_permanent_delete: boolean;
+}
+
+/**
+ * Previews whether a medicine can be permanently deleted or must be safely archived.
+ */
+export async function previewMedicineDeletion(
+  medicineId: string,
+  client?: pg.PoolClient
+): Promise<MedicineDeletePreview> {
+  const id = requireUuid(medicineId, 'medicine_id');
+  const q = client || pgPool;
+
+  const medRes = await q.query(
+    'SELECT id, name, sku, barcode, current_stock, status, version FROM medicines WHERE id = $1',
+    [id]
+  );
+  if (medRes.rows.length === 0) throw new HttpError(404, `Medicine ${id} not found.`);
+  const m = medRes.rows[0];
+
+  const [saleItems, purchaseItems, returns, movements, stocktakes, batches, pendingSync] = await Promise.all([
+    q.query('SELECT count(*)::int AS c FROM sale_items WHERE medicine_id = $1', [id]),
+    q.query('SELECT count(*)::int AS c FROM purchase_items WHERE medicine_id = $1', [id]),
+    q.query('SELECT count(*)::int AS c FROM returns WHERE medicine_id = $1', [id]),
+    q.query('SELECT count(*)::int AS c FROM inventory_movements WHERE medicine_id = $1', [id]),
+    q.query('SELECT count(*)::int AS c FROM stocktake_lines WHERE medicine_id = $1', [id]),
+    q.query('SELECT count(*)::int AS c FROM medicine_batches WHERE medicine_id = $1', [id]),
+    q.query("SELECT count(*)::int AS c FROM sync_events WHERE entity_type = 'medicine' AND entity_id = $1 AND status <> 'SYNCED'", [id]),
+  ]);
+
+  const siCount = saleItems.rows[0]?.c || 0;
+  const piCount = purchaseItems.rows[0]?.c || 0;
+  const retCount = returns.rows[0]?.c || 0;
+  const movCount = movements.rows[0]?.c || 0;
+  const stCount = stocktakes.rows[0]?.c || 0;
+  const batchCount = batches.rows[0]?.c || 0;
+  const pendingCount = pendingSync.rows[0]?.c || 0;
+
+  const totalHistory = siCount + piCount + retCount + movCount + stCount;
+  const currentStock = Number(m.current_stock) || 0;
+  const stockBlocks = currentStock > 0;
+  const pendingBlocks = pendingCount > 0;
+  const canPermanent = totalHistory === 0 && !stockBlocks && !pendingBlocks;
+
+  return {
+    medicine_id: m.id,
+    name: m.name,
+    sku: m.sku || '',
+    barcode: m.barcode || '',
+    current_stock: currentStock,
+    status: m.status || 'active',
+    version: Number(m.version) || 1,
+    batches_count: batchCount,
+    references: {
+      sales: siCount,
+      sale_items: siCount,
+      purchases: piCount,
+      purchase_items: piCount,
+      returns: retCount,
+      inventory_movements: movCount,
+      stocktakes: stCount,
+      pending_sync_events: pendingCount,
+    },
+    outcome: canPermanent ? 'PERMANENT_DELETE' : 'ARCHIVE_REQUIRED',
+    stock_blocks_delete: stockBlocks,
+    pending_sync_blocks_delete: pendingBlocks,
+    can_permanent_delete: canPermanent,
+  };
+}
+
+/**
+ * Atomically deletes or archives a medicine according to historical references and stock rules.
+ */
+export async function deleteOrArchiveMedicineTx(
+  client: pg.PoolClient,
+  medicineId: string,
+  actor: MedicineActor,
+  options?: {
+    expected_version?: number;
+    expected_status?: string;
+    expected_current_stock?: number;
+    reason?: string;
+  }
+): Promise<{ action: 'DELETED' | 'ARCHIVED'; medicine_id: string; reason: string }> {
+  const id = requireUuid(medicineId, 'medicine_id');
+
+  // Enforce ADMIN role requirement server-side
+  if (actor.role !== 'ADMIN') {
+    throw new HttpError(403, 'Permission denied: only an Administrator may delete or archive medicines.');
+  }
+
+  // Lock medicine row
+  const lockedRes = await client.query('SELECT * FROM medicines WHERE id = $1 FOR UPDATE', [id]);
+  if (lockedRes.rows.length === 0) {
+    const tomb = await client.query('SELECT medicine_id, notes FROM medicine_tombstones WHERE medicine_id = $1', [id]);
+    if (tomb.rows.length > 0) {
+      return {
+        action: 'DELETED',
+        medicine_id: id,
+        reason: tomb.rows[0].notes || 'Already permanently deleted.',
+      };
+    }
+    throw new HttpError(404, `Medicine ${id} not found.`);
+  }
+  const m = lockedRes.rows[0];
+
+  // Optimistic concurrency validation
+  if (options?.expected_version !== undefined && Number(m.version) !== options.expected_version) {
+    throw new HttpError(409, `Medicine version conflict: expected ${options.expected_version}, but currently at ${m.version}. Refresh and retry.`);
+  }
+  if (options?.expected_status !== undefined && m.status !== options.expected_status) {
+    throw new HttpError(409, `Medicine status conflict: expected ${options.expected_status}, but currently "${m.status}".`);
+  }
+  if (options?.expected_current_stock !== undefined && Number(m.current_stock) !== options.expected_current_stock) {
+    throw new HttpError(409, `Medicine stock conflict: expected ${options.expected_current_stock}, but currently ${m.current_stock}.`);
+  }
+
+  const currentStock = Number(m.current_stock) || 0;
+  if (currentStock > 0) {
+    throw new HttpError(
+      409,
+      `Cannot delete medicine "${m.name}" because it still has sellable stock (${currentStock} units). Stock must be adjusted to 0 first through an auditable workflow.`
+    );
+  }
+
+  // Check pending sync events
+  const pendingSync = await client.query(
+    "SELECT count(*)::int AS c FROM sync_events WHERE entity_type = 'medicine' AND entity_id = $1 AND status <> 'SYNCED'",
+    [id]
+  );
+  if ((pendingSync.rows[0]?.c || 0) > 0) {
+    throw new HttpError(409, 'Cannot delete medicine while unsynced events are pending in the outbox. Wait for sync to complete.');
+  }
+
+  // Check all historical business references
+  const [si, pi, ret, mov, st] = await Promise.all([
+    client.query('SELECT count(*)::int AS c FROM sale_items WHERE medicine_id = $1', [id]),
+    client.query('SELECT count(*)::int AS c FROM purchase_items WHERE medicine_id = $1', [id]),
+    client.query('SELECT count(*)::int AS c FROM returns WHERE medicine_id = $1', [id]),
+    client.query('SELECT count(*)::int AS c FROM inventory_movements WHERE medicine_id = $1', [id]),
+    client.query('SELECT count(*)::int AS c FROM stocktake_lines WHERE medicine_id = $1', [id]),
+  ]);
+
+  const totalHistory =
+    (si.rows[0]?.c || 0) +
+    (pi.rows[0]?.c || 0) +
+    (ret.rows[0]?.c || 0) +
+    (mov.rows[0]?.c || 0) +
+    (st.rows[0]?.c || 0);
+
+  if (totalHistory > 0) {
+    // -------------------------------------------------------------------------
+    // B. ARCHIVE / RETIRE
+    // -------------------------------------------------------------------------
+    await client.query(
+      `UPDATE medicines
+          SET status = 'archived', updated_by = $2, updated_at = CURRENT_TIMESTAMP, version = version + 1
+        WHERE id = $1`,
+      [id, cleanUuid(actor.user_id)]
+    );
+    await client.query(
+      `UPDATE medicine_batches
+          SET status = 'archived', updated_at = CURRENT_TIMESTAMP
+        WHERE medicine_id = $1 AND status <> 'exhausted'`,
+      [id]
+    );
+
+    const auditDetail = {
+      medicine_name: m.name,
+      historical_references: totalHistory,
+      reason: options?.reason || 'Historical business records exist; archived to maintain audit integrity',
+    };
+
+    await recordAuditLog(
+      {
+        ...actor,
+        action: 'MEDICINE_ARCHIVED_BY_DELETE_REQUEST',
+        entity: 'medicine',
+        entity_id: id,
+        previous_value: { status: m.status },
+        new_value: { status: 'archived', details: auditDetail },
+      },
+      client
+    );
+
+    await enqueueSyncEvent(client, {
+      event_type: 'MEDICINE_ARCHIVED',
+      entity_type: 'medicine',
+      entity_id: id,
+      operation: 'ARCHIVE',
+      data: async () => ({ medicine_id: id, status: 'archived', reason: auditDetail.reason }),
+      actor,
+    });
+
+    return {
+      action: 'ARCHIVED',
+      medicine_id: id,
+      reason: auditDetail.reason,
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // A. PERMANENT DELETE (Safe unused medicine)
+  // ---------------------------------------------------------------------------
+  // Remove safe dependent non-historical rows
+  await client.query('DELETE FROM medicine_batches WHERE medicine_id = $1', [id]);
+  await client.query('DELETE FROM price_history WHERE medicine_id = $1', [id]);
+
+  // Permanently delete medicine row
+  await client.query('DELETE FROM medicines WHERE id = $1', [id]);
+
+  // Record tombstone to prevent resurrection from delayed sync replays
+  await client.query(
+    `INSERT INTO medicine_tombstones (medicine_id, deletion_seq, actor_id, actor_name, notes)
+     VALUES ($1, COALESCE((SELECT MAX(seq) FROM sync_events), 0) + 1, $2, $3, $4)
+     ON CONFLICT (medicine_id) DO UPDATE SET deletion_seq = EXCLUDED.deletion_seq`,
+    [id, cleanUuid(actor.user_id), actor.user_name, options?.reason || 'Permanent deletion of unused medicine']
+  );
+
+  await recordAuditLog(
+    {
+      ...actor,
+      action: 'MEDICINE_PERMANENTLY_DELETED',
+      entity: 'medicine',
+      entity_id: id,
+      previous_value: { name: m.name, sku: m.sku, barcode: m.barcode },
+      new_value: null,
+    },
+    client
+  );
+
+  await enqueueSyncEvent(client, {
+    event_type: 'MEDICINE_DELETED',
+    entity_type: 'medicine',
+    entity_id: id,
+    operation: 'DELETE',
+    data: async () => ({ medicine_id: id, reason: options?.reason || 'Permanent deletion of unused medicine' }),
+    actor,
+  });
+
+  return {
+    action: 'DELETED',
+    medicine_id: id,
+    reason: options?.reason || 'Permanently deleted from database.',
+  };
+}
+
+/**
+ * Restores an archived medicine back to active status.
+ */
+export async function restoreMedicineTx(
+  client: pg.PoolClient,
+  medicineId: string,
+  actor: MedicineActor
+): Promise<Medicine> {
+  const id = requireUuid(medicineId, 'medicine_id');
+
+  if (actor.role !== 'ADMIN') {
+    throw new HttpError(403, 'Permission denied: only an Administrator may restore medicines.');
+  }
+
+  const lockedRes = await client.query('SELECT * FROM medicines WHERE id = $1 FOR UPDATE', [id]);
+  if (lockedRes.rows.length === 0) throw new HttpError(404, `Medicine ${id} not found.`);
+  const m = lockedRes.rows[0];
+
+  if (m.status !== 'archived') {
+    throw new HttpError(400, `Medicine "${m.name}" is not archived (current status: "${m.status}").`);
+  }
+
+  await client.query(
+    `UPDATE medicines
+        SET status = 'active', updated_by = $2, updated_at = CURRENT_TIMESTAMP, version = version + 1
+      WHERE id = $1`,
+    [id, cleanUuid(actor.user_id)]
+  );
+
+  await client.query(
+    `UPDATE medicine_batches
+        SET status = 'active', updated_at = CURRENT_TIMESTAMP
+      WHERE medicine_id = $1 AND quantity_available > 0`,
+    [id]
+  );
+
+  const saved = (await getMedicineById(id, client))!;
+
+  await recordAuditLog(
+    {
+      ...actor,
+      action: 'MEDICINE_RESTORED',
+      entity: 'medicine',
+      entity_id: id,
+      previous_value: { status: 'archived' },
+      new_value: { status: 'active' },
+    },
+    client
+  );
+
+  await enqueueSyncEvent(client, {
+    event_type: 'MEDICINE_UPDATED',
+    entity_type: 'medicine',
+    entity_id: id,
+    operation: 'RESTORE',
+    data: async () => ({ medicine: await medicineJson(client, id) }),
+    actor,
+  });
+
+  return saved;
+}
+

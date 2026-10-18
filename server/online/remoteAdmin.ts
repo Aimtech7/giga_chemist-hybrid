@@ -72,6 +72,7 @@ export const ACTIONS: Record<string, CommandType> = {
   // Full-write Global Admin (cloud migration 006)
   'medicine-create': 'MEDICINE_CREATE',
   'medicine-active': 'MEDICINE_SET_ACTIVE',
+  'medicine-delete': 'MEDICINE_DELETE',
   'batch-create': 'BATCH_CREATE',
   'batch-update': 'BATCH_UPDATE',
   'batch-active': 'BATCH_SET_ACTIVE',

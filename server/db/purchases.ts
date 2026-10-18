@@ -236,7 +236,7 @@ async function receiveIntoStock(
       const upd = await client.query(
         `UPDATE medicine_batches SET quantity_available = $1, quantity_received = quantity_received + $2,
            expiry_date = $3, expiry_status = $4, purchase_price = $5, supplier_id = $6,
-           purchase_invoice = $7, received_date = $8, status = $9, updated_at = CURRENT_TIMESTAMP
+           purchase_invoice = $7, received_date = $8, status = $9, stock_version = stock_version + 1, updated_at = CURRENT_TIMESTAMP
          WHERE id = $10 RETURNING *`,
         [next, it.quantity, expiry, deriveExpiryStatus(expiry), fromCents(it.priceCents), p.supplierId, p.invoice, p.today,
          deriveBatchStatus(next, expiry, b.status === 'exhausted' ? 'active' : b.status), b.id]
