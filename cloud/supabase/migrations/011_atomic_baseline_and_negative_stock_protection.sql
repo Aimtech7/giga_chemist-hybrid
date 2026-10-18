@@ -23,9 +23,9 @@ SELECT shop_id, medicine_id, batch_id, has_baseline,
        last_reported_quantity,
        (has_baseline AND last_reported_quantity IS NOT NULL
         AND last_reported_quantity <> baseline_quantity + delta_since_baseline) AS drift_detected,
+       last_movement_at,
        reconciliation_required,
-       reconciliation_reason,
-       last_movement_at
+       reconciliation_reason
 FROM giga_cloud.stock_levels;
 
 -- Update giga_online.batch_stock to expose reconciliation_required
@@ -36,19 +36,19 @@ SELECT s.medicine_id, s.batch_id,
        s.reconciliation_reason
 FROM giga_cloud.stock_levels s WHERE s.shop_id = giga_online.current_shop();
 
--- Expose notes and created_by in giga_online.medicine_batches
+-- Expose notes and created_by in giga_online.medicine_batches (appended at end)
 CREATE OR REPLACE VIEW giga_online.medicine_batches AS
 SELECT b.batch_id AS id, (b.data->>'branch_id')::uuid AS branch_id, b.medicine_id, b.batch_number, (b.data->>'supplier_id')::uuid AS supplier_id,
        NULL::int AS quantity_received, COALESCE(bs.quantity, 0) AS quantity_available,
        (b.data->>'purchase_price')::numeric AS purchase_price, (b.data->>'selling_price_override')::numeric AS selling_price_override,
        (b.data->>'manufacturing_date')::date AS manufacturing_date, b.expiry_date, (b.data->>'received_date')::date AS received_date,
-       b.data->>'purchase_invoice' AS purchase_invoice, b.data->>'notes' AS notes, (b.data->>'created_by')::uuid AS created_by,
-       b.expiry_status, b.status, b.updated_at AS created_at, b.updated_at
+       b.data->>'purchase_invoice' AS purchase_invoice, b.expiry_status, b.status, b.updated_at AS created_at, b.updated_at,
+       b.data->>'notes' AS notes, (b.data->>'created_by')::uuid AS created_by
 FROM giga_cloud.medicine_batches b
 LEFT JOIN giga_online.batch_stock bs ON bs.batch_id = b.batch_id
 WHERE b.shop_id = giga_online.current_shop();
 
--- Expose reconciliation_required on giga_online.medicines
+-- Expose reconciliation_required on giga_online.medicines (appended at end)
 CREATE OR REPLACE VIEW giga_online.medicines AS
 SELECT m.medicine_id AS id, (m.data->>'branch_id')::uuid AS branch_id, m.name, m.data->>'generic_name' AS generic_name,
        m.data->>'brand_name' AS brand_name, m.sku, m.barcode, (m.data->>'category_id')::uuid AS category_id,
@@ -56,10 +56,10 @@ SELECT m.medicine_id AS id, (m.data->>'branch_id')::uuid AS branch_id, m.name, m
        m.data->>'manufacturer' AS manufacturer, m.data->>'description' AS description,
        m.purchase_price, m.selling_price, m.wholesale_price, m.min_selling_price,
        COALESCE((SELECT SUM(bs.quantity) FROM giga_online.batch_stock bs WHERE bs.medicine_id = m.medicine_id), 0)::int AS current_stock,
-       COALESCE((SELECT bool_or(bs.reconciliation_required) FROM giga_online.batch_stock bs WHERE bs.medicine_id = m.medicine_id), FALSE) AS stock_reconciliation_required,
        m.reorder_level, m.data->>'unit' AS unit, (m.data->>'prescription_required')::boolean AS prescription_required,
        m.status, m.local_version AS version, (m.data->>'created_by')::uuid AS created_by, (m.data->>'updated_by')::uuid AS updated_by,
-       (m.data->>'created_at')::timestamptz AS created_at, (m.data->>'updated_at')::timestamptz AS updated_at
+       (m.data->>'created_at')::timestamptz AS created_at, (m.data->>'updated_at')::timestamptz AS updated_at,
+       COALESCE((SELECT bool_or(bs.reconciliation_required) FROM giga_online.batch_stock bs WHERE bs.medicine_id = m.medicine_id), FALSE) AS stock_reconciliation_required
 FROM giga_cloud.medicines m WHERE m.shop_id = giga_online.current_shop();
 
 -- Enhanced apply_movements: detects negative stock without silent clamping
