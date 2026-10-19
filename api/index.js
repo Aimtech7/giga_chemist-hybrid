@@ -536,66 +536,6 @@ async function getSalesReport(rangeIn, scope, q = pgPool) {
   };
 }
 
-// server/db/medicines.ts
-var MEDICINE_SELECT = `
-  SELECT
-    m.id, m.branch_id, m.name, m.generic_name, m.brand_name, m.sku, m.barcode,
-    COALESCE(c.name, m.medicine_type, 'General') AS category,
-    m.medicine_type, m.dosage_strength, m.dosage_form, m.manufacturer, m.description,
-    COALESCE(m.purchase_price, 0)::float AS purchase_price,
-    COALESCE(m.selling_price, 0)::float AS selling_price,
-    m.wholesale_price::float AS wholesale_price,
-    COALESCE(m.min_selling_price, m.selling_price, 0)::float AS min_selling_price,
-    COALESCE(m.current_stock, 0)::int AS current_stock,
-    COALESCE(m.reorder_level, 20)::int AS reorder_level,
-    COALESCE(m.unit, 'Unit') AS unit,
-    COALESCE(m.prescription_required, false) AS prescription_required,
-    COALESCE(m.status, 'active') AS status,
-    COALESCE(m.version, 1)::int AS version,
-    m.created_at, m.updated_at
-  FROM medicines m
-  LEFT JOIN categories c ON m.category_id = c.id`;
-function toMedicine(r) {
-  return {
-    id: r.id,
-    branch_id: r.branch_id || void 0,
-    name: r.name,
-    generic_name: r.generic_name || r.name,
-    brand_name: r.brand_name || "",
-    sku: r.sku || "",
-    barcode: r.barcode || "",
-    category: r.category || "General",
-    medicine_type: r.medicine_type || "",
-    dosage_strength: r.dosage_strength || "",
-    dosage_form: r.dosage_form || "Tablet",
-    manufacturer: r.manufacturer || "",
-    description: r.description || "",
-    purchase_price: Number(r.purchase_price) || 0,
-    selling_price: Number(r.selling_price) || 0,
-    // NULL = no wholesale price set. Never substituted with the retail price.
-    wholesale_price: r.wholesale_price != null ? Number(r.wholesale_price) : null,
-    min_selling_price: Number(r.min_selling_price) || 0,
-    current_stock: Number(r.current_stock) || 0,
-    reorder_level: Number(r.reorder_level) || 0,
-    unit: r.unit || "Unit",
-    prescription_required: Boolean(r.prescription_required),
-    status: r.status || "active",
-    version: Number(r.version) || 1,
-    created_at: r.created_at ? new Date(r.created_at).toISOString() : "",
-    updated_at: r.updated_at ? new Date(r.updated_at).toISOString() : "",
-    created_by: "Admin",
-    updated_by: "Admin"
-  };
-}
-async function getAllMedicines(q = pgPool) {
-  const res = await q.query(`${MEDICINE_SELECT} ORDER BY m.name ASC`);
-  return res.rows.map(toMedicine);
-}
-async function getMedicineById(id, q = pgPool) {
-  const res = await q.query(`${MEDICINE_SELECT} WHERE m.id = $1`, [requireUuid(id, "medicine id")]);
-  return res.rows[0] ? toMedicine(res.rows[0]) : null;
-}
-
 // server/db/shifts.ts
 var toCents = (n) => Math.round(Number(n || 0) * 100);
 var fromCents = (c) => c / 100;
@@ -1372,6 +1312,66 @@ async function getTodaySalesSummary(options, q = pgPool) {
   };
 }
 
+// server/db/medicines.ts
+var MEDICINE_SELECT = `
+  SELECT
+    m.id, m.branch_id, m.name, m.generic_name, m.brand_name, m.sku, m.barcode,
+    COALESCE(c.name, m.medicine_type, 'General') AS category,
+    m.medicine_type, m.dosage_strength, m.dosage_form, m.manufacturer, m.description,
+    COALESCE(m.purchase_price, 0)::float AS purchase_price,
+    COALESCE(m.selling_price, 0)::float AS selling_price,
+    m.wholesale_price::float AS wholesale_price,
+    COALESCE(m.min_selling_price, m.selling_price, 0)::float AS min_selling_price,
+    COALESCE(m.current_stock, 0)::int AS current_stock,
+    COALESCE(m.reorder_level, 20)::int AS reorder_level,
+    COALESCE(m.unit, 'Unit') AS unit,
+    COALESCE(m.prescription_required, false) AS prescription_required,
+    COALESCE(m.status, 'active') AS status,
+    COALESCE(m.version, 1)::int AS version,
+    m.created_at, m.updated_at
+  FROM medicines m
+  LEFT JOIN categories c ON m.category_id = c.id`;
+function toMedicine(r) {
+  return {
+    id: r.id,
+    branch_id: r.branch_id || void 0,
+    name: r.name,
+    generic_name: r.generic_name || r.name,
+    brand_name: r.brand_name || "",
+    sku: r.sku || "",
+    barcode: r.barcode || "",
+    category: r.category || "General",
+    medicine_type: r.medicine_type || "",
+    dosage_strength: r.dosage_strength || "",
+    dosage_form: r.dosage_form || "Tablet",
+    manufacturer: r.manufacturer || "",
+    description: r.description || "",
+    purchase_price: Number(r.purchase_price) || 0,
+    selling_price: Number(r.selling_price) || 0,
+    // NULL = no wholesale price set. Never substituted with the retail price.
+    wholesale_price: r.wholesale_price != null ? Number(r.wholesale_price) : null,
+    min_selling_price: Number(r.min_selling_price) || 0,
+    current_stock: Number(r.current_stock) || 0,
+    reorder_level: Number(r.reorder_level) || 0,
+    unit: r.unit || "Unit",
+    prescription_required: Boolean(r.prescription_required),
+    status: r.status || "active",
+    version: Number(r.version) || 1,
+    created_at: r.created_at ? new Date(r.created_at).toISOString() : "",
+    updated_at: r.updated_at ? new Date(r.updated_at).toISOString() : "",
+    created_by: "Admin",
+    updated_by: "Admin"
+  };
+}
+async function getAllMedicines(q = pgPool) {
+  const res = await q.query(`${MEDICINE_SELECT} ORDER BY m.name ASC`);
+  return res.rows.map(toMedicine);
+}
+async function getMedicineById(id, q = pgPool) {
+  const res = await q.query(`${MEDICINE_SELECT} WHERE m.id = $1`, [requireUuid(id, "medicine id")]);
+  return res.rows[0] ? toMedicine(res.rows[0]) : null;
+}
+
 // server/db/batches.ts
 var BATCH_SELECT = `
   SELECT b.id, b.branch_id, b.medicine_id, COALESCE(m.name, 'Pharmaceutical Item') AS medicine_name,
@@ -1718,8 +1718,7 @@ var HIGH_CONFLICT_TYPES = [
   "BATCH_CREATE",
   "PURCHASE_RECEIVE",
   "RETURN_APPROVE",
-  "SALE_VOID",
-  "MEDICINE_DELETE"
+  "SALE_VOID"
 ];
 var ALL_SHOPS_TYPES = ["PRICE_UPDATE", "MEDICINE_METADATA_UPDATE", "CATEGORY_UPSERT", "SETTINGS_UPDATE"];
 var STOCK_REMOVE_REASONS = ["Damaged", "Expired", "Lost", "Physical stock correction", "Other"];
@@ -2101,14 +2100,6 @@ function validateCommandPayload(type, payload) {
       onlyKeys(p, ["medicine_id", "active", "reason"], "MEDICINE_SET_ACTIVE");
       return { medicine_id: uuid(p.medicine_id, "medicine_id"), active: bool(p.active, "active"), reason: reasonText(p.reason, true) };
     }
-    case "MEDICINE_DELETE": {
-      onlyKeys(p, ["medicine_id", "expected_version", "expected_status", "expected_current_stock", "reason"], "MEDICINE_DELETE");
-      const out = { medicine_id: uuid(p.medicine_id, "medicine_id") };
-      if (p.expected_version !== void 0) out.expected_version = wholeNumber(p.expected_version, "expected_version", 1);
-      if (p.expected_status !== void 0) out.expected_status = text(p.expected_status, "expected_status");
-      if (p.expected_current_stock !== void 0) out.expected_current_stock = wholeNumber(p.expected_current_stock, "expected_current_stock", 0);
-      return withReason(out, p.reason);
-    }
     case "CATEGORY_UPSERT": {
       onlyKeys(p, ["name", "description"], "CATEGORY_UPSERT");
       const name2 = typeof p.name === "string" ? p.name.trim().slice(0, 100) : "";
@@ -2361,7 +2352,6 @@ var ACTIONS = {
   // Full-write Global Admin (cloud migration 006)
   "medicine-create": "MEDICINE_CREATE",
   "medicine-active": "MEDICINE_SET_ACTIVE",
-  "medicine-delete": "MEDICINE_DELETE",
   "batch-create": "BATCH_CREATE",
   "batch-update": "BATCH_UPDATE",
   "batch-active": "BATCH_SET_ACTIVE",

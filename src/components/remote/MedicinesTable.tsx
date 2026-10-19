@@ -1,5 +1,5 @@
 import React, { useMemo, useState } from 'react';
-import { ArrowDown, ArrowUp, ClipboardCheck, Eye, Layers, MinusCircle, PackagePlus, Pencil, Plus, Power, Search, Tag, Trash2, X } from 'lucide-react';
+import { ArrowDown, ArrowUp, ClipboardCheck, Eye, Layers, MinusCircle, PackagePlus, Pencil, Plus, Power, Search, Tag, X } from 'lucide-react';
 import { VirtualRows } from '../common/VirtualRows';
 import { buildCatalogue, queryCatalogue, summarize, type CatalogueRow, type ExpiryFilter, type SortKey, type StockState } from '../../services/medicineSearch';
 import type { Medicine, MedicineBatch } from '../../types';
@@ -10,7 +10,7 @@ import type { Medicine, MedicineBatch } from '../../types';
  * in view are mounted (windowing), so 2,000+ medicines scroll smoothly with no "Show more".
  * The catalogue is the shop's cloud copy: browsing and searching work while the shop PC is offline.
  */
-export type RowAction = 'view' | 'details' | 'price' | 'add' | 'remove' | 'count' | 'batch-new' | 'active' | 'delete';
+export type RowAction = 'view' | 'details' | 'price' | 'add' | 'remove' | 'count' | 'batch-new' | 'active';
 
 const STOCK_BADGE: Record<StockState, { label: string; cls: string }> = {
   in: { label: 'IN STOCK', cls: 'text-emerald-800 bg-emerald-50 border-emerald-200' },
@@ -97,7 +97,6 @@ export const MedicinesTable: React.FC<{
           {actionBtn(m.id, 'count', 'Physical count', ClipboardCheck)}
           {actionBtn(m.id, 'batch-new', 'Manage batches (new batch)', Layers)}
           {actionBtn(m.id, 'active', m.status === 'active' ? 'Deactivate' : 'Activate', Power)}
-          {actionBtn(m.id, 'delete', 'Delete medicine', Trash2)}
         </div>
       </div>
     );

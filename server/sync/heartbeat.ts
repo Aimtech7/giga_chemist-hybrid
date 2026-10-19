@@ -114,13 +114,7 @@ async function buildStatus(worker: WorkerSnapshot) {
                                      MAX(value) FILTER (WHERE key = 'last_error') AS last_error
                                 FROM sync_state`);
   const inv = await q<any>(`
-    SELECT (SELECT COALESCE(SUM(current_stock), 0)::int FROM medicines WHERE status <> 'archived') AS stock_total_units,
-           (SELECT COUNT(*)::int FROM medicines WHERE status <> 'archived') AS medicine_count,
-           (SELECT COUNT(*)::int FROM medicine_batches WHERE status <> 'archived') AS batch_count,
-           (SELECT COALESCE(MAX(seq), 0)::bigint FROM sync_events) AS stock_sequence,
-           (SELECT MAX(checked_at)::text FROM stock_parity_log) AS stock_parity_checked_at,
-           (SELECT COUNT(*)::int FROM stock_parity_log WHERE status = 'PERSISTENT_MISMATCH' AND reconciled = FALSE) AS stock_mismatch_count,
-       (SELECT COUNT(*) FROM medicines WHERE status = 'active' AND current_stock > 0 AND current_stock <= COALESCE(reorder_level, 0))::int AS low_stock,
+    SELECT (SELECT COUNT(*) FROM medicines WHERE status = 'active' AND current_stock > 0 AND current_stock <= COALESCE(reorder_level, 0))::int AS low_stock,
            (SELECT COUNT(*) FROM medicines WHERE status = 'active' AND current_stock <= 0)::int AS out_of_stock,
            (SELECT COUNT(*) FROM medicine_batches WHERE quantity_available > 0 AND expiry_date > CURRENT_DATE
               AND expiry_date <= CURRENT_DATE + 30)::int AS near_expiry,

@@ -20,7 +20,6 @@ import {
   WifiOff,
   X,
   XCircle,
-  Trash2,
 } from 'lucide-react';
 import { apiFetch, ApiError } from '../../services/http';
 import {
@@ -43,7 +42,6 @@ import { Sheet, StatusBadge, STATUS_TEXT, ago, when, inputCls, labelCls, btnPrim
 import { AlertsTab, CommandDetail, HealthTab, InsightsTab, SecurityTab, StaffTab } from './RemoteOps';
 import { UsersTab } from './UserManagement';
 import { getSelectedShop, isGlobalAdminAccount } from '../../services/shopContext';
-import { DeleteMedicineModal } from '../medicines/DeleteMedicineModal';
 import { MedicinesTable } from './MedicinesTable';
 import type { Medicine, MedicineBatch, PharmacySettings, User } from '../../types';
 
@@ -63,7 +61,7 @@ interface Props {
   initialStockFilter?: 'all' | 'in' | 'low' | 'out' | 'expiring';
 }
 
-type ActionKind = 'add' | 'remove' | 'count' | 'price' | 'details' | 'expiry' | 'active' | 'batch-new' | 'batch-edit' | 'batch-active' | 'delete';
+type ActionKind = 'add' | 'remove' | 'count' | 'price' | 'details' | 'expiry' | 'active' | 'batch-new' | 'batch-edit' | 'batch-active';
 
 export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings, initialTab, initialStockFilter }) => {
   const [tab, setTab] = useState<Tab>(initialTab || 'medicines');
@@ -376,7 +374,6 @@ export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings, initi
                 ['batch-edit', 'Edit Batch', Pencil],
                 ['batch-active', 'Batch On / Off', Power],
                 ['active', selected.status === 'active' ? 'Deactivate Medicine' : 'Activate Medicine', Power],
-                ['delete', 'Delete Medicine', Trash2],
               ] as [ActionKind, string, any][]).map(([kind, label, Icon]) => (
                 <button key={kind} onClick={() => { setSendError(null); setForm({ kind, batchId: selectedBatches[0]?.id }); }}
                   className="flex items-center gap-2 px-3 py-3 rounded-xl bg-white border border-slate-200 hover:border-teal-600 text-sm font-semibold text-slate-800">
@@ -440,22 +437,7 @@ export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings, initi
         <CreateMedicineSheet categories={categories} currency={cur} onCancel={() => setCreating(false)} onReview={(d) => { setSendError(null); setDraft(d); }} />
       )}
 
-      {form && form.kind === 'delete' && selected && (
-        <DeleteMedicineModal
-          isOpen={true}
-          medicine={selected}
-          isRemote={true}
-          shopId={status?.shop_id}
-          onClose={() => setForm(null)}
-          onDeleted={() => {
-            setForm(null);
-            setSelectedId(null);
-            void loadCatalog(); void loadStatus();
-          }}
-        />
-      )}
-
-      {form && form.kind !== 'delete' && selected && !draft && (
+      {form && selected && !draft && (
         <ActionSheet
           kind={form.kind}
           medicine={selected}
@@ -548,7 +530,7 @@ const ActionSheet: React.FC<{
   const titles: Record<ActionKind, string> = {
     add: 'Add Stock', remove: 'Remove Stock', count: 'Set Physical Count', price: 'Edit Price', details: 'Edit Medicine', expiry: 'Edit Expiry',
     active: medicine.status === 'active' ? 'Deactivate Medicine' : 'Activate Medicine', 'batch-new': 'New Batch', 'batch-edit': 'Edit Batch',
-    'batch-active': 'Batch On / Off', delete: 'Delete Medicine',
+    'batch-active': 'Batch On / Off',
   };
   const [allShops, setAllShops] = useState(false);
   const canAllShops = isGlobalAdminAccount() && (kind === 'price' || kind === 'details');

@@ -5,7 +5,6 @@ import { pgPool, cleanUuid, HttpError, requireUuid, withTransaction } from './cl
 import { ensureDevice } from './devices';
 import { collectAudit, collectMovement } from '../sync/collector';
 import { enqueueSyncEvent, rowJson } from '../sync/outbox';
-import { computeMedicineStockFingerprint } from './medicines';
 import type { InventoryMovement } from '../../src/types';
 
 export async function getAllMovements(): Promise<InventoryMovement[]> {
@@ -123,33 +122,12 @@ export async function reconcileMedicineStock(client: pg.PoolClient, medicineId: 
           WHERE medicine_id = $1 AND status = 'active'
             AND (expiry_date IS NULL OR expiry_date > CURRENT_DATE)
         ), 0),
-        stock_version = stock_version + 1,
         version = version + 1,
         updated_at = CURRENT_TIMESTAMP
     WHERE id = $1
     RETURNING *
   `, [medicineId]);
-  const row = res.rows[0];
-  if (row) {
-    const batchesRes = await client.query(
-      'SELECT id, quantity_available, stock_version, status FROM medicine_batches WHERE medicine_id = $1 ORDER BY id',
-      [medicineId]
-    );
-    const fp = computeMedicineStockFingerprint(
-      medicineId,
-      row.stock_version,
-      row.current_stock,
-      batchesRes.rows.map((b) => ({
-        id: b.id,
-        quantity_available: Number(b.quantity_available) || 0,
-        stock_version: b.stock_version,
-        status: b.status || 'active',
-      }))
-    );
-    await client.query('UPDATE medicines SET stock_fingerprint = $2 WHERE id = $1', [medicineId, fp]);
-    row.stock_fingerprint = fp;
-  }
-  return row;
+  return res.rows[0];
 }
 
 /** Persists the calling terminal in devices (FK target) on this transaction; unusable ids map to SERVER. */
@@ -306,7 +284,7 @@ export async function adminSetStock(params: AdminSetStockParams) {
       previousQty = Number(batch.quantity_available) || 0;
       const upd = await client.query(`
         UPDATE medicine_batches
-        SET quantity_available = $1, status = $2, stock_version = stock_version + 1, updated_at = CURRENT_TIMESTAMP
+        SET quantity_available = $1, status = $2, updated_at = CURRENT_TIMESTAMP
         WHERE id = $3
         RETURNING *
       `, [newStock, deriveBatchStatus(newStock, batch.expiry_date, batch.status), batch.id]);
@@ -423,7 +401,6 @@ export async function adminAddStockTx(client: pg.PoolClient, params: AdminAddSto
           purchase_price = COALESCE($6, purchase_price),
           selling_price_override = COALESCE($7, selling_price_override),
           status = $8,
-          stock_version = stock_version + 1,
           updated_at = CURRENT_TIMESTAMP
       WHERE id = $9
       RETURNING *
@@ -521,7 +498,7 @@ export async function adminRemoveStockTx(client: pg.PoolClient, params: AdminRem
   const newQty = previousQty - quantity;
   const upd = await client.query(`
     UPDATE medicine_batches
-    SET quantity_available = $1, status = $2, stock_version = stock_version + 1, updated_at = CURRENT_TIMESTAMP
+    SET quantity_available = $1, status = $2, updated_at = CURRENT_TIMESTAMP
     WHERE id = $3
     RETURNING *
   `, [newQty, deriveBatchStatus(newQty, batch.expiry_date, batch.status), batchId]);
@@ -703,7 +680,6 @@ export async function adminPhysicalStockCountTx(client: pg.PoolClient, params: A
       const upd = await client.query(`
         UPDATE medicine_batches
         SET quantity_available = $1, expiry_date = $2, expiry_status = $3, status = $4,
-            stock_version = stock_version + 1,
             updated_at = CURRENT_TIMESTAMP
         WHERE id = $5
         RETURNING *

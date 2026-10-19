@@ -340,7 +340,7 @@ export async function approveReturnTx(
     if (restock) {
       const status = deriveBatchStatus(next, batch.expiry_date, batch.status === 'exhausted' ? 'active' : batch.status);
       savedBatch = (await client.query(
-        'UPDATE medicine_batches SET quantity_available = $1, status = $2, stock_version = stock_version + 1, updated_at = CURRENT_TIMESTAMP WHERE id = $3 RETURNING *',
+        'UPDATE medicine_batches SET quantity_available = $1, status = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3 RETURNING *',
         [next, status, batch.id]
       )).rows[0];
     }
