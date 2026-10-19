@@ -132,7 +132,7 @@ export interface Medicine {
   reorder_level: number;
   unit: string;
   prescription_required: boolean;
-  status: 'active' | 'inactive' | 'archived';
+  status: 'active' | 'inactive';
   created_at: string;
   updated_at: string;
   created_by: string;
@@ -159,7 +159,7 @@ export interface MedicineBatch {
   purchase_invoice: string;
   created_by: string;
   created_at: string;
-  status: 'active' | 'quarantined' | 'recalled' | 'exhausted' | 'archived';
+  status: 'active' | 'quarantined' | 'recalled' | 'exhausted';
 }
 
 export type MovementReason =

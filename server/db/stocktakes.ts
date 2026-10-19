@@ -171,7 +171,7 @@ export async function approveStocktake(id: string, actor: StocktakeActor, body: 
           problems.push(`${l.medicine_name} batch ${l.batch_number}: ${now} now, variance ${variance}`);
           continue;
         }
-        await client.query(`UPDATE medicine_batches SET quantity_available = $2, status = $3, stock_version = stock_version + 1, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+        await client.query(`UPDATE medicine_batches SET quantity_available = $2, status = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
           [batch.id, next, deriveBatchStatus(next, batch.expiry_date, batch.status)]);
         const mv = await insertMovement(client, {
           medicine_id: medicineId, batch_id: batch.id, previous_quantity: now, new_quantity: next,
