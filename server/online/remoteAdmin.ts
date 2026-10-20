@@ -4,6 +4,7 @@ import type pg from 'pg';
 import { HttpError, isValidUuid } from '../db/client';
 import { getAllMedicines, getMedicineById } from '../db/medicines';
 import { classifyConflict } from '../sync/conflicts';
+import { classifyRejection, sanitizePayloadPreview } from '../sync/rejectionCategories';
 import {
   validateCommandPayload, commandEntity, commandExpectation, STOCK_REMOVE_REASONS, ASSIGNABLE_ROLES, HIGH_CONFLICT_TYPES, ALL_SHOPS_TYPES,
   EXPENSE_CATEGORIES, EXPENSE_PAYMENT_METHODS, RETURN_DISPOSITIONS, PRICE_FIELDS, METADATA_FIELDS, type CommandType,
@@ -676,6 +677,235 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
           entity: commandEntity(x.command_type, x.payload),
         })),
         rejected_events: events.map((x: any) => ({ id: Number(x.id), event_type: x.event_type, error: safeError(x.error), rejected_at: x.rejected_at, conflict: classifyConflict(x.event_type, x.error) })),
+      };
+    });
+  }));
+
+  /** Rejected Changes Center: Full list of rejected events with safe preview and clear category */
+  r.get('/admin/sync/rejected-changes', requireAdmin, route('GET /admin/sync/rejected-changes', async (req) => {
+    const global = deps.isGlobalAdmin(req.onlineUser);
+    const shopId = isAllShopsScope(req) && global ? null : deps.shopId(req);
+
+    return deps.withCloud(async (c) => {
+      const q = shopId
+        ? `SELECT r.id, r.shop_id, r.idempotency_key, r.event_type, r.error, r.payload, r.rejected_at,
+                  s.shop_code, s.name AS shop_name,
+                  p.idempotency_key IS NOT NULL AS already_processed
+             FROM giga_cloud.rejected_events r
+             JOIN giga_cloud.shops s ON s.shop_id = r.shop_id
+             LEFT JOIN giga_cloud.processed_events p ON p.shop_id = r.shop_id AND p.idempotency_key = r.idempotency_key
+            WHERE r.shop_id = $1
+            ORDER BY r.rejected_at DESC LIMIT 200`
+        : `SELECT r.id, r.shop_id, r.idempotency_key, r.event_type, r.error, r.payload, r.rejected_at,
+                  s.shop_code, s.name AS shop_name,
+                  p.idempotency_key IS NOT NULL AS already_processed
+             FROM giga_cloud.rejected_events r
+             JOIN giga_cloud.shops s ON s.shop_id = r.shop_id
+             LEFT JOIN giga_cloud.processed_events p ON p.shop_id = r.shop_id AND p.idempotency_key = r.idempotency_key
+            ORDER BY r.rejected_at DESC LIMIT 200`;
+      const params = shopId ? [shopId] : [];
+      const res = await c.query(q, params);
+
+      const items = res.rows.map((row: any) => {
+        const p = row.payload || {};
+        const classification = classifyRejection(row.event_type, row.error);
+        const cloudStatus = row.already_processed ? 'PROCESSED' : 'REJECTED';
+        const preview = sanitizePayloadPreview(row.event_type, p);
+
+        return {
+          id: String(row.id),
+          shop_id: row.shop_id,
+          shop_code: row.shop_code,
+          shop_name: row.shop_name,
+          idempotency_key: row.idempotency_key,
+          event_type: row.event_type,
+          entity_type: p.entity_type || (row.event_type.startsWith('SALE') ? 'sale' : row.event_type.startsWith('MEDICINE') ? 'medicine' : 'entity'),
+          entity_id: p.entity_id || null,
+          local_seq: p.local_seq != null ? Number(p.local_seq) : null,
+          business_ref: p.business_ref || null,
+          device_id: p.device_id || null,
+          actor_name: p.actor_name || null,
+          created_at: p.occurred_at || row.rejected_at,
+          rejected_at: row.rejected_at,
+          cloud_status: cloudStatus,
+          rejection: {
+            category: classification.category,
+            human_reason: classification.human_reason,
+            technical_error: classification.technical_error,
+            is_eligible_for_retry: classification.is_eligible_for_retry,
+            is_permanent_failure: classification.is_permanent_failure,
+          },
+          sanitized_preview: preview,
+        };
+      });
+
+      return {
+        total: items.length,
+        items,
+      };
+    });
+  }));
+
+  /** Safe Retry Preview: prechecks rejected events before retry */
+  r.post('/admin/sync/rejected-changes/preview', requireAdmin, route('POST /admin/sync/rejected-changes/preview', async (req) => {
+    if (!deps.isGlobalAdmin(req.onlineUser)) {
+      throw new HttpError(403, 'Forbidden: Global Administrator only.', { code: 'GLOBAL_ADMIN_ONLY' });
+    }
+    const ids = Array.isArray(req.body?.event_ids) ? req.body.event_ids.map(String) : [];
+    const all = req.body?.all === true;
+    const shopId = deps.shopId(req);
+
+    return deps.withCloud(async (c) => {
+      const q = all
+        ? `SELECT r.id, r.shop_id, r.idempotency_key, r.event_type, r.error, r.payload, r.rejected_at,
+                  p.idempotency_key IS NOT NULL AS already_processed
+             FROM giga_cloud.rejected_events r
+             LEFT JOIN giga_cloud.processed_events p ON p.shop_id = r.shop_id AND p.idempotency_key = r.idempotency_key
+            WHERE r.shop_id = $1`
+        : `SELECT r.id, r.shop_id, r.idempotency_key, r.event_type, r.error, r.payload, r.rejected_at,
+                  p.idempotency_key IS NOT NULL AS already_processed
+             FROM giga_cloud.rejected_events r
+             LEFT JOIN giga_cloud.processed_events p ON p.shop_id = r.shop_id AND p.idempotency_key = r.idempotency_key
+            WHERE r.shop_id = $1 AND (r.id::text = ANY($2::text[]) OR r.idempotency_key = ANY($2::text[]))`;
+      const params = all ? [shopId] : [shopId, ids];
+      const rows = (await c.query(q, params)).rows;
+
+      let alreadyProcessedCount = 0;
+      let safeToRetryCount = 0;
+      let stillIncompatibleCount = 0;
+      let permanentFailuresCount = 0;
+      let conflictsReviewRequiredCount = 0;
+
+      const previewItems = rows.map((r: any) => {
+        const classification = classifyRejection(r.event_type, r.error);
+        const isProcessed = Boolean(r.already_processed);
+
+        if (isProcessed) {
+          alreadyProcessedCount++;
+        } else if (classification.is_permanent_failure) {
+          permanentFailuresCount++;
+        } else if (classification.category === 'PROTOCOL_INCOMPATIBLE' || classification.category === 'UNSUPPORTED_EVENT_TYPE') {
+          stillIncompatibleCount++;
+        } else if (classification.category === 'CONCURRENCY_CONFLICT') {
+          conflictsReviewRequiredCount++;
+        } else if (classification.is_eligible_for_retry) {
+          safeToRetryCount++;
+        } else {
+          conflictsReviewRequiredCount++;
+        }
+
+        return {
+          id: String(r.id),
+          idempotency_key: r.idempotency_key,
+          event_type: r.event_type,
+          cloud_status: isProcessed ? 'PROCESSED' : 'REJECTED',
+          category: classification.category,
+          human_reason: classification.human_reason,
+          safe_to_retry: classification.is_eligible_for_retry && !isProcessed,
+          already_processed: isProcessed,
+        };
+      });
+
+      return {
+        selected: rows.length,
+        already_processed_count: alreadyProcessedCount,
+        safe_to_retry_count: safeToRetryCount,
+        still_incompatible_count: stillIncompatibleCount,
+        permanent_failures_count: permanentFailuresCount,
+        conflicts_review_required_count: conflictsReviewRequiredCount,
+        items: previewItems,
+      };
+    });
+  }));
+
+  /** Global Admin manual retry of rejected events (gated server-side) */
+  r.post('/admin/sync/rejected-changes/retry', requireAdmin, commandRateLimit, route('POST /admin/sync/rejected-changes/retry', async (req) => {
+    if (!deps.isGlobalAdmin(req.onlineUser)) {
+      throw new HttpError(403, 'Forbidden: Only Global Administrators may retry rejected changes.', { code: 'GLOBAL_ADMIN_ONLY' });
+    }
+    const ids = Array.isArray(req.body?.event_ids) ? req.body.event_ids.map(String) : [];
+    const allEligible = req.body?.all_eligible === true;
+    const shopId = deps.shopId(req);
+
+    return deps.withCloud(async (c) => {
+      const q = allEligible
+        ? `SELECT r.id, r.idempotency_key, r.event_type, r.error, r.payload,
+                  p.idempotency_key IS NOT NULL AS already_processed
+             FROM giga_cloud.rejected_events r
+             LEFT JOIN giga_cloud.processed_events p ON p.shop_id = r.shop_id AND p.idempotency_key = r.idempotency_key
+            WHERE r.shop_id = $1`
+        : `SELECT r.id, r.idempotency_key, r.event_type, r.error, r.payload,
+                  p.idempotency_key IS NOT NULL AS already_processed
+             FROM giga_cloud.rejected_events r
+             LEFT JOIN giga_cloud.processed_events p ON p.shop_id = r.shop_id AND p.idempotency_key = r.idempotency_key
+            WHERE r.shop_id = $1 AND (r.id::text = ANY($2::text[]) OR r.idempotency_key = ANY($2::text[]))`;
+      const params = allEligible ? [shopId] : [shopId, ids];
+      const rows = (await c.query(q, params)).rows;
+
+      if (rows.length === 0) {
+        return { success: true, retried_count: 0, already_applied_count: 0, message: 'No matching rejected events found.' };
+      }
+
+      const alreadyProcessedKeys: string[] = [];
+      const eligibleToRetryKeys: string[] = [];
+      const eligibleEventIds: string[] = [];
+
+      for (const r of rows) {
+        if (r.already_processed) {
+          alreadyProcessedKeys.push(r.idempotency_key);
+        } else {
+          const classification = classifyRejection(r.event_type, r.error);
+          if (classification.is_eligible_for_retry) {
+            eligibleToRetryKeys.push(r.idempotency_key);
+            const evId = r.payload?.event_id;
+            if (evId && isValidUuid(evId)) eligibleEventIds.push(evId);
+          }
+        }
+      }
+
+      // Clean up already processed events from cloud rejected_events (zero retransmissions)
+      if (alreadyProcessedKeys.length > 0) {
+        await c.query(
+          `DELETE FROM giga_cloud.rejected_events WHERE shop_id = $1 AND idempotency_key = ANY($2::text[])`,
+          [shopId, alreadyProcessedKeys]
+        );
+      }
+
+      // If eligible events to retry, queue SYNC_RETRY_FAILED command to shop
+      let commandId: string | null = null;
+      if (eligibleToRetryKeys.length > 0 || eligibleEventIds.length > 0) {
+        const cmdPayload: any = {
+          reason: `Global Admin manual retry of ${eligibleToRetryKeys.length} rejected event(s)`,
+        };
+        if (eligibleEventIds.length > 0 && !allEligible) {
+          cmdPayload.event_ids = eligibleEventIds;
+        }
+        const queued = await queueForShop(req, shopId, 'SYNC_RETRY_FAILED', cmdPayload, crypto.randomUUID());
+        commandId = queued.command_id;
+      }
+
+      // Audit log: GLOBAL_ADMIN_SYNC_RETRY
+      await deps.securityEvent(
+        req,
+        'GLOBAL_ADMIN_SYNC_RETRY',
+        req.onlineUser.email,
+        req.onlineUser.id,
+        {
+          shop_id: shopId,
+          total_selected: rows.length,
+          already_applied_count: alreadyProcessedKeys.length,
+          retried_count: eligibleToRetryKeys.length,
+          command_id: commandId,
+        }
+      );
+
+      return {
+        success: true,
+        total_selected: rows.length,
+        already_applied_count: alreadyProcessedKeys.length,
+        retried_count: eligibleToRetryKeys.length,
+        command_id: commandId,
+        message: `Processed ${alreadyProcessedKeys.length} already-applied event(s); queued retry for ${eligibleToRetryKeys.length} eligible event(s).`,
       };
     });
   }));

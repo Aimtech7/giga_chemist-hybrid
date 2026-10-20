@@ -636,9 +636,13 @@ export function validateCommandPayload(type: string, payload: unknown): Record<s
       return out;
     }
     case 'SYNC_RETRY_FAILED': {
-      onlyKeys(p, ['reason'], 'SYNC_RETRY_FAILED');
+      onlyKeys(p, ['reason', 'event_ids'], 'SYNC_RETRY_FAILED');
       const reason = reasonText(p.reason, false);
-      return reason ? { reason } : {};
+      const event_ids = Array.isArray(p.event_ids) ? p.event_ids.map((id: any) => uuid(id, 'event_id')) : undefined;
+      const out: any = {};
+      if (reason) out.reason = reason;
+      if (event_ids) out.event_ids = event_ids;
+      return out;
     }
     case 'USER_SESSION_REVOKE': {
       onlyKeys(p, ['user_id', 'reason'], 'USER_SESSION_REVOKE');

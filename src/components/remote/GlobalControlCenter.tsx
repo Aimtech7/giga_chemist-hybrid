@@ -48,8 +48,11 @@ export const GlobalControlCenter: React.FC<{ settings: PharmacySettings; focusSh
   const shops = (data?.shops || []).filter((s) => !focusShopId || s.shop_id === focusShopId);
   const t = data?.totals || {};
 
-  const stat = (label: string, value: React.ReactNode, tone?: 'bad' | 'warn') => (
-    <div className="rounded-lg bg-slate-50 px-2 py-1.5">
+  const stat = (label: string, value: React.ReactNode, tone?: 'bad' | 'warn', onClick?: () => void) => (
+    <div
+      onClick={onClick}
+      className={`rounded-lg bg-slate-50 px-2 py-1.5 ${onClick ? 'cursor-pointer hover:bg-slate-100 transition' : ''}`}
+    >
       <div className={`text-sm font-bold ${tone === 'bad' ? 'text-rose-700' : tone === 'warn' ? 'text-amber-700' : 'text-slate-900'}`}>{value}</div>
       <div className="text-[10px] uppercase tracking-wide text-slate-500">{label}</div>
     </div>
@@ -90,7 +93,11 @@ export const GlobalControlCenter: React.FC<{ settings: PharmacySettings; focusSh
                 ['Expiring 30 d', String(t.expiring_30d ?? 0)],
                 ['Pending / rejected', `${t.pending_commands ?? 0} / ${t.rejected_commands_7d ?? 0}`],
               ] as [string, string][]).map(([k, v]) => (
-                <div key={k} className="rounded-lg bg-slate-800 py-2">
+                <div
+                  key={k}
+                  onClick={k.includes('rejected') ? () => navigateTo('sync') : undefined}
+                  className={`rounded-lg bg-slate-800 py-2 ${k.includes('rejected') ? 'cursor-pointer hover:bg-slate-700 transition' : ''}`}
+                >
                   <div className="text-sm font-bold">{v}</div>
                   <div className="text-[10px] uppercase tracking-wide text-slate-400">{k}</div>
                 </div>
@@ -138,7 +145,7 @@ export const GlobalControlCenter: React.FC<{ settings: PharmacySettings; focusSh
                     {stat('Expiring 30 d', s.expiring_30d, s.expiring_30d ? 'warn' : undefined)}
                     {stat('Active staff', s.active_staff)}
                     {stat('Pending cmds', s.pending_commands, s.pending_commands ? 'warn' : undefined)}
-                    {stat('Rejected 7 d', s.rejected_commands_7d, s.rejected_commands_7d ? 'bad' : undefined)}
+                    {stat('Rejected 7 d', s.rejected_commands_7d, s.rejected_commands_7d ? 'bad' : undefined, () => navigateTo('sync'))}
                     {stat('Expired w/ stock', s.expired_with_stock, s.expired_with_stock ? 'bad' : undefined)}
                   </div>
                 </>
