@@ -28,6 +28,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { spawnSync } from 'child_process';
+import { fileURLToPath } from 'url';
 
 const argv = process.argv.slice(2);
 const cmd = argv[0] || 'check';
@@ -56,7 +57,8 @@ function readEnvFile(name = '.env') {
 }
 const ENV = readEnvFile('.env');
 const ONLINE_ENV = readEnvFile('.env.online');
-const setting = (k, d) => process.env[k] ?? ENV[k] ?? d;
+const resolveConfig = (k, d) => process.env[k] ?? ENV[k] ?? ONLINE_ENV[k] ?? d;
+const setting = resolveConfig;
 
 const CFG = {
   branch: setting('UPDATE_BRANCH', 'production'),
@@ -240,14 +242,12 @@ async function waitPortFree(ms = 30_000) {
 }
 
 async function checkCloudCompatibility(commit) {
-  if (process.env.UPDATER_SKIP_COMPATIBILITY_CHECK === 'true') return { ok: true };
-  const mode = String(setting('APP_MODE', 'local')).toLowerCase();
+  if (process.env.UPDATER_SKIP_COMPATIBILITY_CHECK === 'true') {
+    log('OPERATOR OVERRIDE: UPDATER_SKIP_COMPATIBILITY_CHECK=true supplied; bypassing cloud compatibility check');
+    return { ok: true, bypassed: true };
+  }
+  const mode = String(resolveConfig('APP_MODE', 'local')).toLowerCase();
   if (mode !== 'hybrid') return { ok: true };
-  const online = { ...ONLINE_ENV, ...process.env };
-  const cloudUrl = online.CLOUD_API_URL || online.SUPABASE_URL;
-  const shopId = online.SHOP_ID;
-  const shopToken = online.SHOP_TOKEN;
-  if (!cloudUrl || !shopId || !shopToken) return { ok: true };
 
   let targetPkg = {};
   try {
@@ -255,41 +255,128 @@ async function checkCloudCompatibility(commit) {
   } catch {
     return { ok: true };
   }
-  const reqSchema = Number(targetPkg.required_cloud_schema_version) || 1;
-  const protoVer = Number(targetPkg.sync_protocol_version) || 1;
+  const reqSchema = Number(targetPkg.required_cloud_schema_version);
+  const protoVer = Number(targetPkg.sync_protocol_version);
+  if (!reqSchema && !protoVer) return { ok: true };
+
+  const effectiveReqSchema = reqSchema || 1;
+  const effectiveProtoVer = protoVer || 1;
+
+  // Resolve cloud configuration using precedence: process.env -> .env -> .env.online
+  const cloudUrl = resolveConfig('SUPABASE_URL') || resolveConfig('CLOUD_API_URL');
+  const shopId = resolveConfig('SHOP_ID');
+  const shopToken = resolveConfig('SYNC_SHOP_TOKEN') || resolveConfig('SHOP_TOKEN');
+  const apiKey = resolveConfig('SUPABASE_ANON_KEY') || resolveConfig('CLOUD_ANON_KEY') || shopToken;
+
+  const missingFields = [];
+  if (!cloudUrl) missingFields.push('SUPABASE_URL');
+  if (!shopId) missingFields.push('SHOP_ID');
+  if (!shopToken) missingFields.push('SYNC_SHOP_TOKEN');
+  if (!apiKey) missingFields.push('SUPABASE_ANON_KEY');
+
+  if (missingFields.length > 0) {
+    return {
+      ok: false,
+      error: 'CLOUD_COMPATIBILITY_CONFIG_MISSING',
+      detail: `Missing required cloud configuration fields: ${missingFields.join(', ')}`,
+    };
+  }
+
+  let cloudHost = 'unknown';
+  try {
+    cloudHost = new URL(cloudUrl).host;
+  } catch {
+    cloudHost = 'invalid-url';
+  }
 
   try {
     const url = `${cloudUrl.replace(/\/+$/, '')}/rest/v1/rpc/gc_check_compatibility`;
     const headers = {
       'Content-Type': 'application/json',
-      apikey: online.CLOUD_ANON_KEY || online.SUPABASE_ANON_KEY || shopToken,
+      apikey: apiKey,
     };
-    const body = JSON.stringify({ p_shop_id: shopId, p_token: shopToken, p_protocol_version: protoVer });
+    const body = JSON.stringify({
+      p_shop_id: shopId,
+      p_token: shopToken,
+      p_protocol_version: effectiveProtoVer,
+    });
     const res = await fetch(url, { method: 'POST', headers, body, signal: AbortSignal.timeout(8000) });
     if (!res.ok) {
-      // Fallback to gc_ping if gc_check_compatibility is not present
-      const pingUrl = `${cloudUrl.replace(/\/+$/, '')}/rest/v1/rpc/gc_ping`;
-      const pingRes = await fetch(pingUrl, { method: 'POST', headers, body: JSON.stringify({ p_shop_id: shopId, p_token: shopToken }), signal: AbortSignal.timeout(8000) });
-      if (pingRes.ok) {
-        const pingData = await pingRes.json();
-        const cloudSchema = Number(pingData.schema_version) || 1;
-        if (cloudSchema < reqSchema) {
-          return { ok: false, error: 'CLOUD_SCHEMA_TOO_OLD', detail: `Cloud schema (${cloudSchema}) is older than required (${reqSchema})` };
+      // Fallback probe via gc_ping only to distinguish CLOUD_SCHEMA_TOO_OLD from other issues
+      try {
+        const pingUrl = `${cloudUrl.replace(/\/+$/, '')}/rest/v1/rpc/gc_ping`;
+        const pingRes = await fetch(pingUrl, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ p_shop_id: shopId, p_token: shopToken }),
+          signal: AbortSignal.timeout(8000),
+        });
+        if (pingRes.ok) {
+          const pingData = await pingRes.json();
+          const cloudSchema = Number(pingData?.schema_version) || 1;
+          if (cloudSchema < effectiveReqSchema) {
+            return {
+              ok: false,
+              error: 'CLOUD_SCHEMA_TOO_OLD',
+              detail: `Cloud schema version (${cloudSchema}) is older than required (${effectiveReqSchema})`,
+            };
+          }
+          return {
+            ok: false,
+            error: 'SYNC_PROTOCOL_INCOMPATIBLE',
+            detail: 'Cloud does not expose gc_check_compatibility protocol gate',
+          };
         }
+      } catch {
+        /* ping probe failed as well */
       }
-      return { ok: true };
+      return {
+        ok: false,
+        error: 'CLOUD_COMPATIBILITY_UNREACHABLE',
+        detail: `Cloud compatibility endpoint on ${cloudHost} returned HTTP ${res.status}`,
+      };
     }
+
     const data = await res.json();
-    if (data && data.compatible === false) {
-      return { ok: false, error: data.error || 'INCOMPATIBLE', detail: data.error };
+    if (!data || typeof data !== 'object') {
+      return {
+        ok: false,
+        error: 'CLOUD_COMPATIBILITY_UNREACHABLE',
+        detail: `Invalid response from compatibility check on ${cloudHost}`,
+      };
     }
-    if (data && data.cloud_schema_version && data.cloud_schema_version < reqSchema) {
-      return { ok: false, error: 'CLOUD_SCHEMA_TOO_OLD', detail: `Cloud schema (${data.cloud_schema_version}) is older than required (${reqSchema})` };
+
+    if (data.compatible === false) {
+      const errCode = data.error || 'SYNC_PROTOCOL_INCOMPATIBLE';
+      return {
+        ok: false,
+        error: errCode,
+        detail: `Cloud rejected compatibility: ${errCode} (cloud schema ${data.cloud_schema_version || 'unknown'}, protocol ${effectiveProtoVer})`,
+      };
     }
-    return { ok: true };
+
+    const cloudSchema = Number(data.cloud_schema_version) || 1;
+    if (cloudSchema < effectiveReqSchema) {
+      return {
+        ok: false,
+        error: 'CLOUD_SCHEMA_TOO_OLD',
+        detail: `Cloud schema (${cloudSchema}) is older than required (${effectiveReqSchema})`,
+      };
+    }
+
+    log(`compatibility check: COMPATIBLE (host: ${cloudHost}, cloud schema: ${cloudSchema}, protocol: ${effectiveProtoVer})`);
+    return {
+      ok: true,
+      detail: `Compatible: schema ${cloudSchema}, protocol ${effectiveProtoVer}`,
+    };
   } catch (err) {
-    log(`compatibility check warning: could not reach cloud (${err?.message || err})`);
-    return { ok: true };
+    const safeMsg = (err?.message || String(err)).slice(0, 200);
+    log(`compatibility check error: could not reach cloud host ${cloudHost} (${safeMsg})`);
+    return {
+      ok: false,
+      error: 'CLOUD_COMPATIBILITY_UNREACHABLE',
+      detail: `Could not reach cloud host ${cloudHost}: ${safeMsg}`,
+    };
   }
 }
 
@@ -535,18 +622,29 @@ async function main() {
       }
     }
   }
-  console.error('usage: updater.mjs check|auto|install [--commit sha]|rollback [--commit sha] [--root dir]');
+  if (cmd === 'compatibility-check') {
+    const commit = opt('--commit') || head();
+    const r = await checkCloudCompatibility(commit);
+    console.log(JSON.stringify(r));
+    return r.ok ? 0 : 1;
+  }
+  console.error('usage: updater.mjs check|auto|install [--commit sha]|rollback [--commit sha]|compatibility-check [--commit sha] [--root dir]');
   return 2;
 }
 
-main()
-  .then((code) => process.exit(code))
-  .catch((err) => {
-    log(`ERROR ${err?.message || err}`);
-    try {
-      writeState({ status: 'CHECK_FAILED', message: String(err?.message || err).slice(0, 300), checked_at: new Date().toISOString() });
-    } catch {
-      /* ignore */
-    }
-    process.exit(1);
-  });
+export { checkCloudCompatibility, resolveConfig };
+
+const isMain = process.argv[1] && path.resolve(process.argv[1]).toLowerCase() === fileURLToPath(import.meta.url).toLowerCase();
+if (isMain) {
+  main()
+    .then((code) => process.exit(code))
+    .catch((err) => {
+      log(`ERROR ${err?.message || err}`);
+      try {
+        writeState({ status: 'CHECK_FAILED', message: String(err?.message || err).slice(0, 300), checked_at: new Date().toISOString() });
+      } catch {
+        /* ignore */
+      }
+      process.exit(1);
+    });
+}
