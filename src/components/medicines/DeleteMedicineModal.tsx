@@ -28,6 +28,9 @@ export interface DeletePreviewData {
   has_pending_sync: boolean;
   outcome: 'PERMANENT_DELETE' | 'ARCHIVE_REQUIRED';
   block_reason: string | null;
+  shop_update_required?: boolean;
+  shop_update_message?: string | null;
+  disclaimer?: string;
 }
 
 interface DeleteMedicineModalProps {
@@ -79,6 +82,7 @@ export const DeleteMedicineModal: React.FC<DeleteMedicineModalProps> = ({
           headers: {
             Authorization: `Bearer ${token}`,
             'Content-Type': 'application/json',
+            ...(isRemote && shopId ? { 'X-GIGA-SHOP-ID': shopId } : {}),
           },
         });
 
@@ -109,7 +113,7 @@ export const DeleteMedicineModal: React.FC<DeleteMedicineModalProps> = ({
   const isConfirmValid = isPermanent
     ? confirmInput.trim().toUpperCase() === 'DELETE' || confirmInput.trim() === medicine.name.trim()
     : true;
-  const canSubmit = preview && !hasStock && !preview.has_pending_sync && isConfirmValid && !submitting;
+  const canSubmit = preview && !hasStock && !preview.has_pending_sync && !preview.shop_update_required && isConfirmValid && !submitting;
 
   const handleDelete = async () => {
     if (!canSubmit) return;
@@ -121,22 +125,19 @@ export const DeleteMedicineModal: React.FC<DeleteMedicineModalProps> = ({
       let res: Response;
 
       if (isRemote && shopId) {
-        res = await fetch(`/api/admin/commands`, {
+        res = await fetch(`/api/admin/commands/medicine-delete`, {
           method: 'POST',
           headers: {
             Authorization: `Bearer ${token}`,
             'Content-Type': 'application/json',
+            'X-GIGA-SHOP-ID': shopId,
           },
           body: JSON.stringify({
-            shop_id: shopId,
-            command_type: 'MEDICINE_DELETE',
-            payload: {
-              medicine_id: medicine.id,
-              expected_version: preview.medicine.version,
-              expected_status: preview.medicine.status,
-              expected_current_stock: preview.medicine.current_stock,
-              reason: reason.trim() || undefined,
-            },
+            medicine_id: medicine.id,
+            expected_version: preview.medicine.version,
+            expected_status: preview.medicine.status,
+            expected_current_stock: preview.medicine.current_stock,
+            reason: reason.trim() || undefined,
           }),
         });
       } else {
@@ -233,6 +234,19 @@ export const DeleteMedicineModal: React.FC<DeleteMedicineModalProps> = ({
                 </div>
               </div>
 
+              {/* Shop Update Required Alert */}
+              {preview?.shop_update_required && (
+                <div className="p-3 bg-amber-50 border border-amber-300 rounded-xl flex items-start gap-2.5 text-amber-900 text-xs font-medium">
+                  <ShieldAlert className="w-4 h-4 shrink-0 mt-0.5 text-amber-600" />
+                  <div>
+                    <div className="font-bold uppercase tracking-wider text-[10px] text-amber-800">SHOP UPDATE REQUIRED</div>
+                    <div className="mt-0.5 leading-relaxed">
+                      {preview.shop_update_message || 'Shop 1 must install the current GIGA CHEMIST release before Medicine Delete can be used.'}
+                    </div>
+                  </div>
+                </div>
+              )}
+
               {/* Stock Block Alert */}
               {hasStock && (
                 <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl flex items-start gap-2.5 text-rose-800 text-xs font-medium">
@@ -317,11 +331,14 @@ export const DeleteMedicineModal: React.FC<DeleteMedicineModalProps> = ({
                       ? 'This medicine has ZERO historical references and ZERO stock. It will be permanently removed from the database inside an atomic transaction.'
                       : 'This medicine has historical business records and cannot be permanently erased without corrupting financial audits. It will be removed from active POS and archived.'}
                   </p>
+                  <p className="text-[10px] text-slate-500 italic mt-2 pt-2 border-t border-slate-200/60">
+                    Final outcome will be decided using the shop's live PostgreSQL database. {preview.disclaimer || 'Final deletion eligibility is rechecked by the shop computer.'}
+                  </p>
                 </div>
               )}
 
               {/* Confirmation Input for Permanent Delete */}
-              {isPermanent && !hasStock && (
+              {isPermanent && !hasStock && !preview?.shop_update_required && (
                 <div className="space-y-1.5 pt-1">
                   <label className="text-xs font-semibold text-slate-700">
                     Type <span className="font-mono text-rose-600 font-bold">DELETE</span> or medicine name to confirm permanent destruction:

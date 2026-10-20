@@ -60,8 +60,19 @@ export const MedicinesTable: React.FC<{
   );
 
   const actionBtn = (id: string, a: RowAction, title: string, Icon: any) => (
-    <button key={a} title={title} aria-label={title} onClick={(e) => { e.stopPropagation(); onAction(id, a); }}
-      className="p-1.5 rounded-md border border-slate-200 hover:border-teal-600 hover:bg-teal-50 text-slate-600 hover:text-teal-800"><Icon className="w-3.5 h-3.5" /></button>
+    <button
+      key={a}
+      title={title}
+      aria-label={title}
+      onClick={(e) => { e.stopPropagation(); onAction(id, a); }}
+      className={`p-1.5 rounded-md border transition ${
+        a === 'delete'
+          ? 'border-rose-200 hover:border-rose-500 hover:bg-rose-50 text-slate-500 hover:text-rose-700'
+          : 'border-slate-200 hover:border-teal-600 hover:bg-teal-50 text-slate-600 hover:text-teal-800'
+      }`}
+    >
+      <Icon className="w-3.5 h-3.5" />
+    </button>
   );
 
   const row = (r: CatalogueRow) => {

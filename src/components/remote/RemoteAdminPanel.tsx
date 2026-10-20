@@ -340,6 +340,10 @@ export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings, initi
                 setSendError(null);
                 setSelectedId(id);
                 if (action !== 'view') {
+                  if (action === 'delete' && !isGlobalAdminAccount()) {
+                    setSendError('Only a Global Administrator can delete medicines.');
+                    return;
+                  }
                   const first = batches.filter((b) => b.medicine_id === id).sort((a, b) => (a.expiry_date || '9999').localeCompare(b.expiry_date || '9999'))[0];
                   setForm({ kind: action, batchId: first?.id });
                 }
@@ -378,13 +382,36 @@ export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings, initi
                 ['batch-edit', 'Edit Batch', Pencil],
                 ['batch-active', 'Batch On / Off', Power],
                 ['active', selected.status === 'active' ? 'Deactivate Medicine' : 'Activate Medicine', Power],
-                ['delete', 'Delete Medicine', Trash2],
               ] as [ActionKind, string, any][]).map(([kind, label, Icon]) => (
                 <button key={kind} onClick={() => { setSendError(null); setForm({ kind, batchId: selectedBatches[0]?.id }); }}
-                  className="flex items-center gap-2 px-3 py-3 rounded-xl bg-white border border-slate-200 hover:border-teal-600 text-sm font-semibold text-slate-800">
+                  className="flex items-center gap-2 px-3 py-3 rounded-xl bg-white border border-slate-200 hover:border-teal-600 text-sm font-semibold text-slate-800 transition">
                   <Icon className="w-4 h-4 text-teal-700" /> {label}
                 </button>
               ))}
+
+              {/* Destructive Action: Delete Medicine (distinct danger styling, mobile & desktop accessible) */}
+              <button
+                onClick={() => {
+                  if (!isGlobalAdminAccount()) {
+                    setSendError('Only a Global Administrator can delete medicines.');
+                    return;
+                  }
+                  setSendError(null);
+                  setForm({ kind: 'delete', batchId: selectedBatches[0]?.id });
+                }}
+                disabled={!isGlobalAdminAccount()}
+                title={isGlobalAdminAccount() ? 'Delete Medicine' : 'Global Administrator only'}
+                aria-label="Delete medicine"
+                className={`col-span-2 flex items-center justify-center gap-2 px-3 py-3 rounded-xl border text-sm font-bold transition ${
+                  isGlobalAdminAccount()
+                    ? 'bg-rose-50 border-rose-300 hover:bg-rose-100 hover:border-rose-400 text-rose-700 cursor-pointer shadow-xs'
+                    : 'bg-slate-50 border-slate-200 text-slate-400 cursor-not-allowed'
+                }`}
+              >
+                <Trash2 className={`w-4 h-4 ${isGlobalAdminAccount() ? 'text-rose-600' : 'text-slate-400'}`} />
+                DELETE MEDICINE
+                {!isGlobalAdminAccount() && <span className="ml-1 text-[10px] font-normal text-slate-400">(Global Admin Only)</span>}
+              </button>
             </div>
 
             <div className="bg-white border border-slate-200 rounded-xl overflow-x-auto">

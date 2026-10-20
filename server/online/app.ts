@@ -178,7 +178,7 @@ async function resolveShop(req: OnlineRequest, res: Response, next: NextFunction
     req.shopId = cfg.shopId;
     return next();
   }
-  const raw = req.headers[SHOP_HEADER];
+  const raw = req.headers[SHOP_HEADER] ?? (typeof req.query?.shop_id === 'string' ? req.query.shop_id : undefined);
   if (Array.isArray(raw)) return res.status(400).json({ error: 'Send X-GIGA-SHOP-ID once.', code: 'SHOP_ID_INVALID' });
   const wanted = String(raw || '').trim().toLowerCase();
   if (!wanted) {

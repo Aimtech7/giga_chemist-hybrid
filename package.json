@@ -51,6 +51,8 @@
     "scan:dist": "node scripts/scan-dist.mjs",
     "test:compatibility": "tsx scripts/integration/sync-compatibility.test.ts",
     "test:rejected-changes": "tsx scripts/integration/rejected-changes-and-zero-missed.test.ts",
+    "test:medicine-delete-and-parity": "tsx scripts/integration/medicine-delete-and-parity.test.ts",
+    "test:online-medicine-delete": "tsx scripts/integration/online-medicine-delete.test.ts",
     "updater:check": "node scripts/updater/updater.mjs check"
   },
   "dependencies": {
