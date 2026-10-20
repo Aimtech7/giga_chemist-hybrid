@@ -49,6 +49,7 @@
     "sandbox:online": "tsx scripts/dev/online-sandbox.ts",
     "test:medicine-search": "tsx scripts/integration/medicine-search.test.ts",
     "scan:dist": "node scripts/scan-dist.mjs",
+    "test:compatibility": "tsx scripts/integration/sync-compatibility.test.ts",
     "updater:check": "node scripts/updater/updater.mjs check"
   },
   "dependencies": {
@@ -59,6 +60,7 @@
     "@vitejs/plugin-react": "^6.1.1",
     "dexie": "^4.4.6",
     "dotenv": "^17.2.3",
+    "esbuild": "^0.28.2",
     "express": "^4.21.2",
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",
@@ -80,9 +82,10 @@
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "autoprefixer": "^10.4.21",
-    "esbuild": "^0.28.2",
     "pngjs": "^7.0.0"
   },
+  "sync_protocol_version": 2,
+  "required_cloud_schema_version": 13,
   "engines": {
     "node": ">=20.0.0"
   }

@@ -55,6 +55,9 @@ import {
   getAppMode,
   isSupabaseConfigured,
   requireUuid,
+  previewMedicineDeletion,
+  deleteOrArchiveMedicineTx,
+  restoreMedicineTx,
 } from './db/index';
 import {
   createJwtToken,
@@ -64,6 +67,7 @@ import {
   type JwtPayload,
 } from './auth';
 import { getSyncStatus, syncWorker } from './sync/worker';
+import { runStockParityAudit, reconcileSelectedStockParity } from './sync/stockParity';
 import {
   runShopConsistencyCheck,
   reconcileMedicineBaseline,
@@ -78,14 +82,15 @@ import {
 } from './email/service';
 import { runBackup, getBackupStatus } from './ops/backup';
 import { getSystemHealth } from './ops/health';
+import { listLocalAlerts, acknowledgeLocalAlert } from './ops/alerts';
 import { appVersion, currentCommit } from './ops/runtime';
 import { pgPool, isValidUuid } from './db/client';
 import { buildHistoryRouter } from './http/historyRoutes';
 import { buildInventoryRouter } from './http/inventoryRoutes';
 import { createDraftPurchaseTx } from './db/purchases';
 import { getPriceHistory } from './db/priceHistory';
-import { acknowledgeLocalAlert, listLocalAlerts } from './ops/alerts';
-import { classifyConflict } from './sync/conflicts';
+import { classifyConflict, classifyFailure } from './sync/conflicts';
+import { getFailedEventsDiagnostics, safeRetryFailedEvents } from './sync/retry';
 import { businessDaySummary } from './db/businessDay';
 import { integrityReport } from './db/integrity';
 import { approveStocktake, cancelStocktake, countLine, createStocktake, getStocktake, listStocktakes, reopenStocktake, startCounting, submitStocktake } from './db/stocktakes';
@@ -446,7 +451,7 @@ apiRouter.delete('/users/:id', requireRole('ADMIN'), async (req: AuthenticatedRe
       entity_id: id,
       new_value: { action: result.action, reason: result.reason },
     });
-    res.json({ success: true, ...result });
+    res.json({ success: true, action: (result as any).action, medicine_id: (result as any).medicine_id, reason: (result as any).reason });
   } catch (err: any) {
     res.status(errorStatus(err)).json({ error: err.message || 'Failed to delete/archive user.' });
   }
@@ -584,6 +589,37 @@ async function handlePricingUpdate(req: AuthenticatedRequest, res: Response) {
 }
 apiRouter.patch('/medicines/:id/pricing', requireRole('ADMIN'), handlePricingUpdate);
 apiRouter.patch('/medicines/:id/price', requireRole('ADMIN'), handlePricingUpdate);
+
+apiRouter.get('/medicines/:id/delete-preview', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const preview = await previewMedicineDeletion(req.params.id);
+    res.json(preview);
+  } catch (err: any) {
+    sendError(res, err, 'Failed to preview medicine deletion.', 'GET /medicines/:id/delete-preview');
+  }
+});
+
+apiRouter.delete('/medicines/:id', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const result = await withTransaction((client) =>
+      deleteOrArchiveMedicineTx(client, req.params.id, actorAudit(req), req.body || {})
+    );
+    res.json({ success: true, action: result.action, medicine_id: result.medicine_id, reason: result.reason });
+  } catch (err: any) {
+    sendError(res, err, 'Failed to delete/archive medicine.', 'DELETE /medicines/:id');
+  }
+});
+
+apiRouter.post('/medicines/:id/restore', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const restored = await withTransaction((client) =>
+      restoreMedicineTx(client, req.params.id, actorAudit(req))
+    );
+    res.json({ success: true, medicine: restored });
+  } catch (err: any) {
+    sendError(res, err, 'Failed to restore medicine.', 'POST /medicines/:id/restore');
+  }
+});
 
 // Medicine categories (formulary metadata; same access as the medicine list)
 apiRouter.get('/categories', requirePermission('medicine.view'), async (req: AuthenticatedRequest, res: Response) => {
@@ -941,35 +977,53 @@ apiRouter.get('/sync/center', requireRole('ADMIN'), async (_req: AuthenticatedRe
     sendError(res, err, 'Could not load the sync center.', 'GET /sync/center');
   }
 });
+
+// ADMIN: Failed events detailed diagnostics (no secrets, grouped by failure category and event type)
+apiRouter.get('/sync/failed-events/diagnostics', requireRole('ADMIN'), async (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    const report = await getFailedEventsDiagnostics();
+    res.json(report);
+  } catch (err: any) {
+    sendError(res, err, 'Could not load failed events diagnostics.', 'GET /sync/failed-events/diagnostics');
+  }
+});
+
 apiRouter.post('/sync/events/:id/retry', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
   try {
     if (!isValidUuid(req.params.id)) return res.status(400).json({ error: 'Event id must be a UUID.' });
-    const r = await pgPool.query(`UPDATE sync_events SET status = 'PENDING', next_attempt_at = CURRENT_TIMESTAMP WHERE id = $1 AND status = 'FAILED' RETURNING id, event_type`, [req.params.id]);
-    if (!r.rows[0]) return res.status(409).json({ error: 'Only a FAILED event can be retried.' });
-    await recordAuditLog({ ...actorAudit(req), action: 'SYNC_EVENT_REQUEUED', entity: 'sync_event', entity_id: req.params.id, new_value: { event_type: r.rows[0].event_type } });
-    syncWorker.wake(false);
-    res.json({ success: true, requeued: 1 });
+    const result = await safeRetryFailedEvents([req.params.id]);
+    if (result.total === 0) return res.status(409).json({ error: 'Only a FAILED event can be retried.' });
+    await recordAuditLog({
+      ...actorAudit(req),
+      action: 'SYNC_EVENT_REQUEUED',
+      entity: 'sync_event',
+      entity_id: req.params.id,
+      new_value: { already_applied_by_cloud: result.already_applied_by_cloud, requeued_for_retry: result.requeued_for_retry },
+    });
+    res.json({ success: true, ...result });
   } catch (err: any) {
-    sendError(res, err, 'Could not re-queue the event.', 'POST /sync/events/:id/retry');
+    sendError(res, err, 'Could not safely retry the event.', 'POST /sync/events/:id/retry');
   }
 });
 
 apiRouter.post('/sync/retry-failed', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const r = await pgPool.query(
-      `UPDATE sync_events SET status = 'PENDING', next_attempt_at = CURRENT_TIMESTAMP WHERE status = 'FAILED' RETURNING id`
-    );
+    const eventIds = Array.isArray(req.body?.event_ids) ? req.body.event_ids.filter(isValidUuid) : undefined;
+    const result = await safeRetryFailedEvents(eventIds);
     await recordAuditLog({
       ...actorAudit(req),
       action: 'SYNC_FAILED_EVENTS_REQUEUED',
       entity: 'sync',
       entity_id: 'sync_events',
-      new_value: { requeued: r.rowCount || 0 },
+      new_value: {
+        total: result.total,
+        already_applied_by_cloud: result.already_applied_by_cloud,
+        requeued_for_retry: result.requeued_for_retry,
+      },
     });
-    syncWorker.wake(false);
-    res.json({ success: true, requeued: r.rowCount || 0 });
+    res.json({ success: true, ...result });
   } catch (err: any) {
-    sendError(res, err, 'Failed to re-queue failed events.', 'POST /sync/retry-failed');
+    sendError(res, err, 'Failed to safely retry failed events.', 'POST /sync/retry-failed');
   }
 });
 
@@ -996,6 +1050,46 @@ apiRouter.post('/sync/reconcile-baseline', requireRole('ADMIN'), async (req: Aut
     res.json(result);
   } catch (err: any) {
     sendError(res, err, 'Failed to reconcile medicine baseline.', 'POST /sync/reconcile-baseline');
+  }
+});
+
+// ADMIN: Run continuous stock parity audit
+apiRouter.get('/sync/stock-parity', requireRole('ADMIN'), async (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    const report = await runStockParityAudit({ autoReconcile: false });
+    res.json(report);
+  } catch (err: any) {
+    sendError(res, err, 'Failed to run stock parity check.', 'GET /sync/stock-parity');
+  }
+});
+
+apiRouter.post('/sync/stock-parity/check', requireRole('ADMIN'), async (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    const report = await runStockParityAudit({ autoReconcile: false });
+    res.json(report);
+  } catch (err: any) {
+    sendError(res, err, 'Failed to run stock parity check.', 'POST /sync/stock-parity/check');
+  }
+});
+
+apiRouter.post('/sync/stock-parity/reconcile', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { medicine_ids, all } = req.body || {};
+    let targets: string[] = Array.isArray(medicine_ids) ? medicine_ids : [];
+    if (all) {
+      const audit = await runStockParityAudit({ autoReconcile: false });
+      targets = audit.items
+        .filter((it) => it.status === 'PERSISTENT_MISMATCH')
+        .map((it) => it.medicine_id);
+    }
+    const result = await reconcileSelectedStockParity(targets, {
+      user_id: req.userId,
+      user_name: req.userName,
+      role: req.userRole,
+    });
+    res.json({ success: true, ...result });
+  } catch (err: any) {
+    sendError(res, err, 'Failed to reconcile stock parity.', 'POST /sync/stock-parity/reconcile');
   }
 });
 

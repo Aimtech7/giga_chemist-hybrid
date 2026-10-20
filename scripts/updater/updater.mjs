@@ -42,19 +42,20 @@ const LOCK_FILE = path.join(RUNTIME, 'update.lock');
 const MAINT_LOCK = path.join(RUNTIME, 'maintenance.lock');
 const LOG_FILE = path.join(ROOT, 'logs', 'update.log');
 
-function readEnvFile() {
+function readEnvFile(name = '.env') {
   const out = {};
   try {
-    for (const line of fs.readFileSync(path.join(ROOT, '.env'), 'utf-8').replace(/^\uFEFF/, '').split(/\r?\n/)) {
+    for (const line of fs.readFileSync(path.join(ROOT, name), 'utf-8').replace(/^\uFEFF/, '').split(/\r?\n/)) {
       const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/);
       if (m) out[m[1]] = m[2].replace(/^["']|["']$/g, '');
     }
   } catch {
-    /* no .env: defaults */
+    /* no file: defaults */
   }
   return out;
 }
-const ENV = readEnvFile();
+const ENV = readEnvFile('.env');
+const ONLINE_ENV = readEnvFile('.env.online');
 const setting = (k, d) => process.env[k] ?? ENV[k] ?? d;
 
 const CFG = {
@@ -225,6 +226,7 @@ function stopServer() {
   }
 }
 async function waitPortFree(ms = 30_000) {
+  if (CFG.restart === 'none') return true;
   const end = Date.now() + ms;
   while (Date.now() < end) {
     try {
@@ -235,6 +237,60 @@ async function waitPortFree(ms = 30_000) {
     }
   }
   return false;
+}
+
+async function checkCloudCompatibility(commit) {
+  if (process.env.UPDATER_SKIP_COMPATIBILITY_CHECK === 'true') return { ok: true };
+  const mode = String(setting('APP_MODE', 'local')).toLowerCase();
+  if (mode !== 'hybrid') return { ok: true };
+  const online = { ...ONLINE_ENV, ...process.env };
+  const cloudUrl = online.CLOUD_API_URL || online.SUPABASE_URL;
+  const shopId = online.SHOP_ID;
+  const shopToken = online.SHOP_TOKEN;
+  if (!cloudUrl || !shopId || !shopToken) return { ok: true };
+
+  let targetPkg = {};
+  try {
+    targetPkg = JSON.parse(git(['show', `${commit}:package.json`], { quiet: true }).out);
+  } catch {
+    return { ok: true };
+  }
+  const reqSchema = Number(targetPkg.required_cloud_schema_version) || 1;
+  const protoVer = Number(targetPkg.sync_protocol_version) || 1;
+
+  try {
+    const url = `${cloudUrl.replace(/\/+$/, '')}/rest/v1/rpc/gc_check_compatibility`;
+    const headers = {
+      'Content-Type': 'application/json',
+      apikey: online.CLOUD_ANON_KEY || online.SUPABASE_ANON_KEY || shopToken,
+    };
+    const body = JSON.stringify({ p_shop_id: shopId, p_token: shopToken, p_protocol_version: protoVer });
+    const res = await fetch(url, { method: 'POST', headers, body, signal: AbortSignal.timeout(8000) });
+    if (!res.ok) {
+      // Fallback to gc_ping if gc_check_compatibility is not present
+      const pingUrl = `${cloudUrl.replace(/\/+$/, '')}/rest/v1/rpc/gc_ping`;
+      const pingRes = await fetch(pingUrl, { method: 'POST', headers, body: JSON.stringify({ p_shop_id: shopId, p_token: shopToken }), signal: AbortSignal.timeout(8000) });
+      if (pingRes.ok) {
+        const pingData = await pingRes.json();
+        const cloudSchema = Number(pingData.schema_version) || 1;
+        if (cloudSchema < reqSchema) {
+          return { ok: false, error: 'CLOUD_SCHEMA_TOO_OLD', detail: `Cloud schema (${cloudSchema}) is older than required (${reqSchema})` };
+        }
+      }
+      return { ok: true };
+    }
+    const data = await res.json();
+    if (data && data.compatible === false) {
+      return { ok: false, error: data.error || 'INCOMPATIBLE', detail: data.error };
+    }
+    if (data && data.cloud_schema_version && data.cloud_schema_version < reqSchema) {
+      return { ok: false, error: 'CLOUD_SCHEMA_TOO_OLD', detail: `Cloud schema (${data.cloud_schema_version}) is older than required (${reqSchema})` };
+    }
+    return { ok: true };
+  } catch (err) {
+    log(`compatibility check warning: could not reach cloud (${err?.message || err})`);
+    return { ok: true };
+  }
 }
 
 async function healthy(expectedCommit, timeoutMs = CFG.healthTimeoutMs) {
@@ -296,7 +352,7 @@ const clearMaintenance = () => {
 // ------------------------------------------------------------------ build steps
 function buildActivate(commit, { lint }) {
   git(['checkout', '--quiet', '--detach', commit]);
-  npm(['ci', '--no-audit', '--no-fund']);
+  npm(['ci', '--include=dev', '--no-audit', '--no-fund']);
   if (lint && !CFG.skipLint) npm(['run', 'lint']);
   npm(['run', 'build']);
   normalizeTree();
@@ -369,6 +425,13 @@ async function install(requested) {
     // 3. The current version must be healthy (database reachable) before we start.
     const pre = await healthy(null, Math.min(CFG.healthTimeoutMs, 30_000));
     if (!pre.ok) return finish('REFUSED', `current version not healthy before the update (${pre.detail})`);
+
+    // 3b. Cloud compatibility check (refuse update if cloud schema is too old or application too old)
+    const compat = await checkCloudCompatibility(target);
+    if (!compat.ok) {
+      log(`install: REFUSED (${compat.error}: ${compat.detail})`);
+      return finish('REFUSED', `${compat.error}: ${compat.detail}`);
+    }
 
     // 4. Verified backup BEFORE any change.
     log(`install: backup before ${previous.slice(0, 12)} -> ${target.slice(0, 12)}`);
