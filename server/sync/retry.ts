@@ -1,4 +1,4 @@
-import { pgPool } from '../db/client';
+import { pgPool, HttpError } from '../db/client';
 import { getSyncConfig } from './config';
 import { callCloud } from './cloudClient';
 import { syncWorker } from './worker';
@@ -67,7 +67,10 @@ export async function getFailedEventsDiagnostics(): Promise<DiagnosticsReport> {
   };
 }
 
-export async function safeRetryFailedEvents(eventIds?: string[]): Promise<{
+export async function safeRetryFailedEvents(
+  eventIds?: string[],
+  options?: { allowUnverifiedFallback?: boolean }
+): Promise<{
   success: boolean;
   total: number;
   already_applied_by_cloud: number;
@@ -87,15 +90,26 @@ export async function safeRetryFailedEvents(eventIds?: string[]): Promise<{
 
   const cfg = getSyncConfig();
   if (cfg.cloudConfigured) {
+    let statuses: Array<{ idempotency_key: string; status: string }> = [];
     try {
       const identity = await getShopIdentity();
       const keys = rows.map((r: any) => r.idempotency_key);
-      const statuses = await callCloud<Array<{ idempotency_key: string; status: string }>>('gc_check_event_statuses', {
+      statuses = await callCloud<Array<{ idempotency_key: string; status: string }>>('gc_check_event_statuses', {
         p_shop_id: identity.shop_id,
         p_token: cfg.shopToken,
-        p_idempotency_keys: keys,
+        p_keys: keys,
       });
+    } catch (err: any) {
+      if (options?.allowUnverifiedFallback) {
+        console.warn(`[SyncRetry] Cloud precheck failed; proceeding with explicit manual fallback: ${err?.message || err}`);
+      } else {
+        const error = new HttpError(502, `SAFE_RETRY_PRECHECK_FAILED: Cloud event status verification failed (${sanitizeText(err?.message || err)})`);
+        (error as any).code = 'SAFE_RETRY_PRECHECK_FAILED';
+        throw error;
+      }
+    }
 
+    if (statuses && Array.isArray(statuses)) {
       const statusMap = new Map((statuses || []).map((s) => [s.idempotency_key, s.status]));
       const toMarkSynced: string[] = [];
       const toRequeue: string[] = [];
@@ -105,6 +119,7 @@ export async function safeRetryFailedEvents(eventIds?: string[]): Promise<{
         if (cloudStatus === 'PROCESSED') {
           toMarkSynced.push(row.id);
         } else {
+          // NOT_FOUND or REJECTED: requeue original event to be safely processed
           toRequeue.push(row.id);
         }
       }
@@ -120,20 +135,23 @@ export async function safeRetryFailedEvents(eventIds?: string[]): Promise<{
           `UPDATE sync_events SET status = 'PENDING', next_attempt_at = CURRENT_TIMESTAMP WHERE id = ANY($1::uuid[])`,
           [toRequeue]
         );
+        syncWorker.wake(false);
       }
 
-      syncWorker.wake(false);
       return {
         success: true,
         total: rows.length,
         already_applied_by_cloud: toMarkSynced.length,
         requeued_for_retry: toRequeue.length,
       };
-    } catch (err: any) {
-      console.warn(`[SyncRetry] Could not query gc_check_event_statuses (${err?.message || err}); falling back to standard idempotent requeue.`);
     }
+  } else if (!options?.allowUnverifiedFallback) {
+    const error = new HttpError(502, 'SAFE_RETRY_PRECHECK_FAILED: Cloud is not configured to verify event statuses before retry.');
+    (error as any).code = 'SAFE_RETRY_PRECHECK_FAILED';
+    throw error;
   }
 
+  // Explicit emergency/manual fallback only
   const ids = rows.map((r: any) => r.id);
   await pgPool.query(
     `UPDATE sync_events SET status = 'PENDING', next_attempt_at = CURRENT_TIMESTAMP WHERE id = ANY($1::uuid[])`,
