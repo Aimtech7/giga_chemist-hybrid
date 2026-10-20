@@ -12,6 +12,8 @@ import {
   Lock,
   Eye,
   Tag,
+  Trash2,
+  RotateCcw,
 } from 'lucide-react';
 import { db } from '../../db/dexie';
 import { MedicineFormModal } from './MedicineFormModal';
@@ -22,6 +24,7 @@ import { searchMedicines } from '../../services/searchEngine';
 import { canViewCostData, isCashier } from '../../services/permissions';
 import { CATALOG_REFRESHED_EVENT, isCatalogForCurrentShop } from '../../services/syncEngine';
 import { CatalogStatusBanner } from '../common/CatalogStatusBanner';
+import { DeleteMedicineModal } from '../medicines/DeleteMedicineModal';
 import type { Category, Medicine, PharmacySettings, User } from '../../types';
 
 interface MedicineListProps {
@@ -43,6 +46,8 @@ export const MedicineList: React.FC<MedicineListProps> = ({ currentUser, setting
   const [adjustingMedicine, setAdjustingMedicine] = useState<Medicine | null>(null);
   const [pricingMedicine, setPricingMedicine] = useState<Medicine | null>(null);
   const [isPriceEditOpen, setIsPriceEditOpen] = useState(false);
+  const [deletingMedicine, setDeletingMedicine] = useState<Medicine | null>(null);
+  const [showArchived, setShowArchived] = useState(false);
 
   const isAdmin = currentUser?.role === 'ADMIN';
   const showCost = canViewCostData(currentUser);
@@ -51,7 +56,8 @@ export const MedicineList: React.FC<MedicineListProps> = ({ currentUser, setting
   const loadMedicines = async () => {
     // Cross-shop guard: a catalogue cached for another shop is never listed (the banner explains).
     const catalogOk = await isCatalogForCurrentShop();
-    const [list, cats] = await Promise.all([catalogOk ? db.medicines.toArray() : [], db.categories.orderBy('name').toArray()]);
+    const [rawList, cats] = await Promise.all([catalogOk ? db.medicines.toArray() : [], db.categories.orderBy('name').toArray()]);
+    const list = showArchived ? rawList : rawList.filter((m) => m.status !== 'archived');
     setMedicines(list);
     setCategories(cats);
   };
@@ -401,6 +407,37 @@ export const MedicineList: React.FC<MedicineListProps> = ({ currentUser, setting
                               >
                                 <PackagePlus className="w-3.5 h-3.5" />
                               </button>
+                              {m.status === 'archived' ? (
+                                <button
+                                  onClick={async () => {
+                                    if (!window.confirm(`Restore archived medicine "${m.name}" to active status?`)) return;
+                                    try {
+                                      const token = localStorage.getItem('token') || sessionStorage.getItem('token') || '';
+                                      const res = await fetch(`/api/medicines/${m.id}/restore`, {
+                                        method: 'POST',
+                                        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+                                      });
+                                      if (!res.ok) throw new Error('Failed to restore medicine.');
+                                      await db.medicines.update(m.id, { status: 'active' });
+                                      await loadMedicines();
+                                    } catch (err: any) {
+                                      alert(err.message || 'Error restoring medicine');
+                                    }
+                                  }}
+                                  className="p-1 rounded border border-emerald-300 hover:bg-emerald-50 text-emerald-700 transition cursor-pointer"
+                                  title="Restore Medicine (Admin)"
+                                >
+                                  <RotateCcw className="w-3.5 h-3.5" />
+                                </button>
+                              ) : (
+                                <button
+                                  onClick={() => setDeletingMedicine(m)}
+                                  className="p-1 rounded border border-rose-200 hover:bg-rose-50 text-rose-600 transition cursor-pointer"
+                                  title="Delete Medicine (Admin)"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              )}
                             </div>
                           ) : (
                             <span className="text-[10px] text-slate-400 italic">Read-only</span>
@@ -448,6 +485,20 @@ export const MedicineList: React.FC<MedicineListProps> = ({ currentUser, setting
             settings={settings}
             currentUser={currentUser}
             onAdjusted={loadMedicines}
+          />
+
+          <DeleteMedicineModal
+            isOpen={!!deletingMedicine}
+            onClose={() => setDeletingMedicine(null)}
+            medicine={deletingMedicine}
+            onDeleted={async (res) => {
+              if (res.action === 'DELETED' && deletingMedicine) {
+                await db.medicines.delete(deletingMedicine.id);
+              } else if (res.action === 'ARCHIVED' && deletingMedicine) {
+                await db.medicines.update(deletingMedicine.id, { status: 'archived' });
+              }
+              await loadMedicines();
+            }}
           />
         </>
       )}

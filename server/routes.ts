@@ -55,6 +55,9 @@ import {
   getAppMode,
   isSupabaseConfigured,
   requireUuid,
+  previewMedicineDeletion,
+  deleteOrArchiveMedicineTx,
+  restoreMedicineTx,
 } from './db/index';
 import {
   createJwtToken,
@@ -64,6 +67,7 @@ import {
   type JwtPayload,
 } from './auth';
 import { getSyncStatus, syncWorker } from './sync/worker';
+import { runStockParityAudit, reconcileSelectedStockParity } from './sync/stockParity';
 import {
   runShopConsistencyCheck,
   reconcileMedicineBaseline,
@@ -446,7 +450,7 @@ apiRouter.delete('/users/:id', requireRole('ADMIN'), async (req: AuthenticatedRe
       entity_id: id,
       new_value: { action: result.action, reason: result.reason },
     });
-    res.json({ success: true, ...result });
+    res.json({ success: true, action: (result as any).action, medicine_id: (result as any).medicine_id, reason: (result as any).reason });
   } catch (err: any) {
     res.status(errorStatus(err)).json({ error: err.message || 'Failed to delete/archive user.' });
   }
@@ -584,6 +588,37 @@ async function handlePricingUpdate(req: AuthenticatedRequest, res: Response) {
 }
 apiRouter.patch('/medicines/:id/pricing', requireRole('ADMIN'), handlePricingUpdate);
 apiRouter.patch('/medicines/:id/price', requireRole('ADMIN'), handlePricingUpdate);
+
+apiRouter.get('/medicines/:id/delete-preview', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const preview = await previewMedicineDeletion(req.params.id);
+    res.json(preview);
+  } catch (err: any) {
+    sendError(res, err, 'Failed to preview medicine deletion.', 'GET /medicines/:id/delete-preview');
+  }
+});
+
+apiRouter.delete('/medicines/:id', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const result = await withTransaction((client) =>
+      deleteOrArchiveMedicineTx(client, req.params.id, actorAudit(req), req.body || {})
+    );
+    res.json({ success: true, action: result.action, medicine_id: result.medicine_id, reason: result.reason });
+  } catch (err: any) {
+    sendError(res, err, 'Failed to delete/archive medicine.', 'DELETE /medicines/:id');
+  }
+});
+
+apiRouter.post('/medicines/:id/restore', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const restored = await withTransaction((client) =>
+      restoreMedicineTx(client, req.params.id, actorAudit(req))
+    );
+    res.json({ success: true, medicine: restored });
+  } catch (err: any) {
+    sendError(res, err, 'Failed to restore medicine.', 'POST /medicines/:id/restore');
+  }
+});
 
 // Medicine categories (formulary metadata; same access as the medicine list)
 apiRouter.get('/categories', requirePermission('medicine.view'), async (req: AuthenticatedRequest, res: Response) => {
@@ -996,6 +1031,46 @@ apiRouter.post('/sync/reconcile-baseline', requireRole('ADMIN'), async (req: Aut
     res.json(result);
   } catch (err: any) {
     sendError(res, err, 'Failed to reconcile medicine baseline.', 'POST /sync/reconcile-baseline');
+  }
+});
+
+// ADMIN: Run continuous stock parity audit
+apiRouter.get('/sync/stock-parity', requireRole('ADMIN'), async (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    const report = await runStockParityAudit({ autoReconcile: false });
+    res.json(report);
+  } catch (err: any) {
+    sendError(res, err, 'Failed to run stock parity check.', 'GET /sync/stock-parity');
+  }
+});
+
+apiRouter.post('/sync/stock-parity/check', requireRole('ADMIN'), async (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    const report = await runStockParityAudit({ autoReconcile: false });
+    res.json(report);
+  } catch (err: any) {
+    sendError(res, err, 'Failed to run stock parity check.', 'POST /sync/stock-parity/check');
+  }
+});
+
+apiRouter.post('/sync/stock-parity/reconcile', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { medicine_ids, all } = req.body || {};
+    let targets: string[] = Array.isArray(medicine_ids) ? medicine_ids : [];
+    if (all) {
+      const audit = await runStockParityAudit({ autoReconcile: false });
+      targets = audit.items
+        .filter((it) => it.status === 'PERSISTENT_MISMATCH')
+        .map((it) => it.medicine_id);
+    }
+    const result = await reconcileSelectedStockParity(targets, {
+      user_id: req.userId,
+      user_name: req.userName,
+      role: req.userRole,
+    });
+    res.json({ success: true, ...result });
+  } catch (err: any) {
+    sendError(res, err, 'Failed to reconcile stock parity.', 'POST /sync/stock-parity/reconcile');
   }
 });
 

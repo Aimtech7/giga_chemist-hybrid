@@ -2,7 +2,7 @@ import type pg from 'pg';
 import { HttpError, isValidUuid, withTransaction } from '../db/client';
 import { recordAuditLog } from '../db/audit';
 import { assertExpected, assertExpectedQuantity } from '../db/concurrency';
-import { applyPricingUpdate, createMedicineTx, getMedicineById, updateMedicineDetailsTx, type MedicineActor } from '../db/medicines';
+import { applyPricingUpdate, createMedicineTx, deleteOrArchiveMedicineTx, getMedicineById, updateMedicineDetailsTx, type MedicineActor } from '../db/medicines';
 import { updatePharmacySettingsTx } from '../db/settings';
 import {
   adminAddStockTx, adminCreateBatchTx, adminEditBatchExpiryTx, adminPhysicalStockCountTx, adminRemoveStockTx,
@@ -201,6 +201,18 @@ const HANDLERS: Record<string, Handler> = {
     } as any, client);
     await medicineEvent(client, cmd, 'MEDICINE_UPDATED', p.medicine_id);
     return { medicine_id: p.medicine_id, name: saved.name, previous_status: before.status, status: saved.status };
+  },
+
+  async MEDICINE_DELETE(client, cmd) {
+    const p = validateCommandPayload('MEDICINE_DELETE', cmd.payload);
+    const actor = cloudActor(cmd);
+    const res = await deleteOrArchiveMedicineTx(client, p.medicine_id, actor, {
+      expected_version: p.expected_version as number | undefined,
+      expected_status: p.expected_status as string | undefined,
+      expected_current_stock: p.expected_current_stock as number | undefined,
+      reason: p.reason as string | undefined,
+    });
+    return res;
   },
 
   async CATEGORY_UPSERT(client, cmd) {
