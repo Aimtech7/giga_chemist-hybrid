@@ -991,14 +991,19 @@ apiRouter.get('/sync/failed-events/diagnostics', requireRole('ADMIN'), async (_r
 apiRouter.post('/sync/events/:id/retry', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
   try {
     if (!isValidUuid(req.params.id)) return res.status(400).json({ error: 'Event id must be a UUID.' });
-    const result = await safeRetryFailedEvents([req.params.id]);
+    const allowFallback = req.body?.allow_unverified_fallback === true;
+    const result = await safeRetryFailedEvents([req.params.id], { allowUnverifiedFallback: allowFallback });
     if (result.total === 0) return res.status(409).json({ error: 'Only a FAILED event can be retried.' });
     await recordAuditLog({
       ...actorAudit(req),
       action: 'SYNC_EVENT_REQUEUED',
       entity: 'sync_event',
       entity_id: req.params.id,
-      new_value: { already_applied_by_cloud: result.already_applied_by_cloud, requeued_for_retry: result.requeued_for_retry },
+      new_value: {
+        already_applied_by_cloud: result.already_applied_by_cloud,
+        requeued_for_retry: result.requeued_for_retry,
+        allow_unverified_fallback: allowFallback,
+      },
     });
     res.json({ success: true, ...result });
   } catch (err: any) {

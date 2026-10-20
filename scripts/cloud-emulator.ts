@@ -26,7 +26,7 @@ const FUNCTIONS: Record<string, [string, string][]> = {
   gc_sync_user_credentials: [['p_shop_id', 'uuid'], ['p_token', 'text'], ['p_users', 'jsonb']],
   gc_fetch_user_credential: [['p_shop_id', 'uuid'], ['p_token', 'text'], ['p_local_user_id', 'uuid']],
   gc_credential_sync_preview: [['p_shop_id', 'uuid'], ['p_token', 'text'], ['p_users', 'jsonb']],
-  gc_check_event_statuses: [['p_shop_id', 'uuid'], ['p_token', 'text'], ['p_idempotency_keys', 'text[]']],
+  gc_check_event_statuses: [['p_shop_id', 'uuid'], ['p_token', 'text'], ['p_keys', 'text[]']],
   gc_check_compatibility: [['p_shop_id', 'uuid'], ['p_token', 'text'], ['p_protocol_version', 'integer']],
 };
 

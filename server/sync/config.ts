@@ -99,6 +99,10 @@ export function getSyncConfig(): SyncConfig {
   return cached;
 }
 
+export function resetSyncConfig(): void {
+  cached = null;
+}
+
 /** Host part of the cloud URL only (no path, no keys) for status/diagnostics. */
 export function cloudHost(cfg: SyncConfig = getSyncConfig()): string | null {
   try {
