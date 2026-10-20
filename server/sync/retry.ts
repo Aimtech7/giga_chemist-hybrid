@@ -1,3 +1,4 @@
+import type pg from 'pg';
 import { pgPool, HttpError } from '../db/client';
 import { getSyncConfig } from './config';
 import { callCloud } from './cloudClient';
@@ -69,19 +70,20 @@ export async function getFailedEventsDiagnostics(): Promise<DiagnosticsReport> {
 
 export async function safeRetryFailedEvents(
   eventIds?: string[],
-  options?: { allowUnverifiedFallback?: boolean }
+  options?: { allowUnverifiedFallback?: boolean; client?: pg.PoolClient }
 ): Promise<{
   success: boolean;
   total: number;
   already_applied_by_cloud: number;
   requeued_for_retry: number;
 }> {
+  const q = options?.client || pgPool;
   const query = eventIds && eventIds.length > 0
     ? `SELECT id, seq, idempotency_key, event_type, entity_id FROM sync_events WHERE status = 'FAILED' AND id = ANY($1::uuid[]) ORDER BY seq`
     : `SELECT id, seq, idempotency_key, event_type, entity_id FROM sync_events WHERE status = 'FAILED' ORDER BY seq`;
 
   const params = eventIds && eventIds.length > 0 ? [eventIds] : [];
-  const res = await pgPool.query(query, params);
+  const res = await q.query(query, params);
   const rows = res.rows;
 
   if (rows.length === 0) {
@@ -92,7 +94,7 @@ export async function safeRetryFailedEvents(
   if (cfg.cloudConfigured) {
     let statuses: Array<{ idempotency_key: string; status: string }> = [];
     try {
-      const identity = await getShopIdentity();
+      const identity = await getShopIdentity(options?.client);
       const keys = rows.map((r: any) => r.idempotency_key);
       statuses = await callCloud<Array<{ idempotency_key: string; status: string }>>('gc_check_event_statuses', {
         p_shop_id: identity.shop_id,
@@ -125,13 +127,13 @@ export async function safeRetryFailedEvents(
       }
 
       if (toMarkSynced.length > 0) {
-        await pgPool.query(
+        await q.query(
           `UPDATE sync_events SET status = 'SYNCED', synced_at = CURRENT_TIMESTAMP WHERE id = ANY($1::uuid[])`,
           [toMarkSynced]
         );
       }
       if (toRequeue.length > 0) {
-        await pgPool.query(
+        await q.query(
           `UPDATE sync_events SET status = 'PENDING', next_attempt_at = CURRENT_TIMESTAMP WHERE id = ANY($1::uuid[])`,
           [toRequeue]
         );
@@ -153,10 +155,17 @@ export async function safeRetryFailedEvents(
 
   // Explicit emergency/manual fallback only
   const ids = rows.map((r: any) => r.id);
-  await pgPool.query(
+  await q.query(
     `UPDATE sync_events SET status = 'PENDING', next_attempt_at = CURRENT_TIMESTAMP WHERE id = ANY($1::uuid[])`,
     [ids]
   );
+  syncWorker.wake(false);
+  return {
+    success: true,
+    total: rows.length,
+    already_applied_by_cloud: 0,
+    requeued_for_retry: ids.length,
+  };
   syncWorker.wake(false);
   return {
     success: true,

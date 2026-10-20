@@ -21,6 +21,7 @@ import { COMMAND_TYPES, USER_PROFILE_FIELDS, validateCommandPayload } from './co
 import { revokeUserSessionsTx, updateUserTx, unusablePinHash } from '../db/users';
 import type { FetchedCredential } from './credentials';
 import { readUpdateState } from '../ops/runtime';
+import { safeRetryFailedEvents } from './retry';
 
 /**
  * Inbound cloud -> shop commands: the ONE write path of remote (online) administration.
@@ -493,15 +494,22 @@ const HANDLERS: Record<string, Handler> = {
     return { user_id: p.user_id, before, after };
   },
 
-  // Re-sends the shop's FAILED outbox events (same ids + idempotency keys: never a duplicate in the cloud).
+  // Re-sends the shop's FAILED outbox events with mandatory cloud pre-check.
   async SYNC_RETRY_FAILED(client, cmd) {
     const p = validateCommandPayload('SYNC_RETRY_FAILED', cmd.payload);
-    const r = await client.query(`UPDATE sync_events SET status = 'PENDING', next_attempt_at = CURRENT_TIMESTAMP WHERE status = 'FAILED' RETURNING id`);
+    const eventIds = Array.isArray((p as any).event_ids) ? (p as any).event_ids : undefined;
+    const r = await safeRetryFailedEvents(eventIds, { client });
     await recordAuditLog({
       ...cloudActor(cmd), action: 'SYNC_FAILED_EVENTS_REQUEUED', entity: 'sync', entity_id: 'sync_events',
-      new_value: { requeued: r.rowCount || 0, reason: p.reason ?? null, command_id: cmd.command_id },
+      new_value: {
+        total: r.total,
+        already_applied_by_cloud: r.already_applied_by_cloud,
+        requeued: r.requeued_for_retry,
+        reason: p.reason ?? null,
+        command_id: cmd.command_id,
+      },
     } as any, client);
-    return { requeued: r.rowCount || 0 };
+    return { requeued: r.requeued_for_retry, already_applied: r.already_applied_by_cloud };
   },
 
   // Signs the account out of every shop terminal (its tokens issued before now are refused).

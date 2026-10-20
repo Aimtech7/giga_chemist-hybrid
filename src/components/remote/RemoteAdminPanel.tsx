@@ -43,6 +43,7 @@ import { AlertsTab, CommandDetail, HealthTab, InsightsTab, SecurityTab, StaffTab
 import { UsersTab } from './UserManagement';
 import { getSelectedShop, isGlobalAdminAccount } from '../../services/shopContext';
 import { MedicinesTable } from './MedicinesTable';
+import { SyncCenter } from '../sync/SyncCenter';
 import type { Medicine, MedicineBatch, PharmacySettings, User } from '../../types';
 
 /**
@@ -50,7 +51,7 @@ import type { Medicine, MedicineBatch, PharmacySettings, User } from '../../type
  * is QUEUED for the shop computer, which applies it to the authoritative local database and syncs
  * the result back. Nothing here says "changed" until the shop reports APPLIED.
  */
-export type RemoteTab = 'medicines' | 'changes' | 'health' | 'alerts' | 'insights' | 'staff' | 'users' | 'security' | 'shop';
+export type RemoteTab = 'medicines' | 'changes' | 'sync' | 'health' | 'alerts' | 'insights' | 'staff' | 'users' | 'security' | 'shop';
 type Tab = RemoteTab;
 
 interface Props {
@@ -278,17 +279,18 @@ export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings, initi
         <h1 className="text-base font-bold text-slate-900">Remote Admin</h1>
         <p className="text-[11px] text-slate-500">Changes are sent to the shop computer, which applies them to the shop database and syncs the result back.</p>
         <div className="flex gap-1 mt-2 bg-slate-100 p-1 rounded-lg overflow-x-auto">
-          {([['medicines', 'Medicines'], ['changes', 'Activity'], ['health', 'Health'], ['alerts', 'Alerts'], ['insights', 'Reports'],
+          {([['medicines', 'Medicines'], ['changes', 'Activity'], ['sync', 'Sync Center'], ['health', 'Health'], ['alerts', 'Alerts'], ['insights', 'Reports'],
             ['staff', 'Staff'], ...(isGlobalAdminAccount() ? [['users', 'Users']] : []), ['security', 'Security'], ['shop', 'Settings']] as [Tab, string][]).map(([id, label]) => (
             <button key={id} onClick={() => setTab(id)} className={`shrink-0 px-3 py-2 rounded-md text-xs font-semibold whitespace-nowrap ${tab === id ? 'bg-white text-teal-800 shadow-xs' : 'text-slate-600'}`}>
               {label}
               {id === 'changes' && status && status.commands.pending + status.commands.delivered > 0 ? ` (${status.commands.pending + status.commands.delivered})` : ''}
+              {id === 'sync' && status && status.commands.rejected > 0 ? ` (${status.commands.rejected} rejected)` : ''}
             </button>
           ))}
         </div>
       </div>
 
-      <div className={`flex-1 overflow-y-auto p-3 space-y-3 w-full mx-auto ${tab === 'medicines' ? '' : 'max-w-2xl'}`}>
+      <div className={`flex-1 overflow-y-auto p-3 space-y-3 w-full mx-auto ${tab === 'medicines' || tab === 'sync' ? '' : 'max-w-2xl'}`}>
         {shopCard}
 
         {notice && (
@@ -419,6 +421,7 @@ export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings, initi
           </div>
         )}
 
+        {tab === 'sync' && <SyncCenter online={true} />}
         {tab === 'health' && <HealthTab onDraft={(d) => { setSendError(null); setDraft(d); }} />}
         {tab === 'alerts' && <AlertsTab />}
         {tab === 'insights' && <InsightsTab currency={cur} />}

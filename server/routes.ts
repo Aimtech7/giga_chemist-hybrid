@@ -87,6 +87,8 @@ import { createDraftPurchaseTx } from './db/purchases';
 import { getPriceHistory } from './db/priceHistory';
 import { classifyConflict, classifyFailure } from './sync/conflicts';
 import { getFailedEventsDiagnostics, safeRetryFailedEvents } from './sync/retry';
+import { classifyRejection, sanitizePayloadPreview } from './sync/rejectionCategories';
+import { detectSequenceGaps, getSalesSyncWatermark, verifySalesSync, reconstructOrphanSaleEvent } from './sync/sequenceTracker';
 import { businessDaySummary } from './db/businessDay';
 import { integrityReport } from './db/integrity';
 import { approveStocktake, cancelStocktake, countLine, createStocktake, getStocktake, listStocktakes, reopenStocktake, startCounting, submitStocktake } from './db/stocktakes';
@@ -994,6 +996,98 @@ apiRouter.post('/sync/retry-failed', requireRole('ADMIN'), async (req: Authentic
     res.json({ success: true, ...result });
   } catch (err: any) {
     sendError(res, err, 'Failed to safely retry failed events.', 'POST /sync/retry-failed');
+  }
+});
+
+apiRouter.get('/sync/rejected-changes', requireRole('ADMIN'), async (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    const rows = (await pgPool.query(`
+      SELECT id, seq, event_type, entity_type, entity_id, business_ref,
+             created_at, last_attempt_at, attempt_count, status, last_error, payload
+        FROM sync_events
+       WHERE status = 'FAILED'
+       ORDER BY seq DESC
+       LIMIT 200
+    `)).rows;
+
+    const items = rows.map((r: any) => {
+      const p = typeof r.payload === 'string' ? JSON.parse(r.payload) : (r.payload || {});
+      const classification = classifyRejection(r.event_type, r.last_error);
+      const preview = sanitizePayloadPreview(r.event_type, p);
+      return {
+        id: String(r.id),
+        shop_id: 'local',
+        shop_code: 'LOCAL',
+        shop_name: 'Local Shop',
+        idempotency_key: r.idempotency_key,
+        event_type: r.event_type,
+        entity_type: r.entity_type,
+        entity_id: r.entity_id,
+        local_seq: Number(r.seq),
+        business_ref: r.business_ref,
+        device_id: p.device_id || null,
+        actor_name: r.actor_name || null,
+        created_at: r.created_at,
+        last_attempt_at: r.last_attempt_at,
+        attempt_count: r.attempt_count,
+        local_status: r.status,
+        cloud_status: 'FAILED',
+        rejection: {
+          category: classification.category,
+          human_reason: classification.human_reason,
+          technical_error: classification.technical_error,
+          is_eligible_for_retry: classification.is_eligible_for_retry,
+          is_permanent_failure: classification.is_permanent_failure,
+        },
+        sanitized_preview: preview,
+      };
+    });
+
+    res.json({ total: items.length, items });
+  } catch (err: any) {
+    sendError(res, err, 'Failed to fetch rejected changes.', 'GET /sync/rejected-changes');
+  }
+});
+
+apiRouter.get('/sync/sequence-diagnostics', requireRole('ADMIN'), async (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    const report = await detectSequenceGaps();
+    res.json(report);
+  } catch (err: any) {
+    sendError(res, err, 'Failed to detect sequence gaps.', 'GET /sync/sequence-diagnostics');
+  }
+});
+
+apiRouter.get('/sync/watermark', requireRole('ADMIN'), async (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    const watermark = await getSalesSyncWatermark();
+    res.json(watermark);
+  } catch (err: any) {
+    sendError(res, err, 'Failed to fetch sales sync watermark.', 'GET /sync/watermark');
+  }
+});
+
+apiRouter.get('/sync/verify-sales-sync', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const limit = Math.min(Math.max(parseInt(String(req.query.limit || '100'), 10) || 100, 1), 1000);
+    const report = await verifySalesSync(limit);
+    res.json(report);
+  } catch (err: any) {
+    sendError(res, err, 'Failed to verify sales sync.', 'GET /sync/verify-sales-sync');
+  }
+});
+
+apiRouter.post('/sync/recover-orphan-sale', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { sale_id } = req.body || {};
+    if (!sale_id || !isValidUuid(sale_id)) return res.status(400).json({ error: 'Valid sale_id UUID is required.' });
+    const result = await reconstructOrphanSaleEvent(sale_id, {
+      user_id: req.userId,
+      user_name: req.userName,
+    });
+    res.json({ success: true, ...result });
+  } catch (err: any) {
+    sendError(res, err, 'Failed to reconstruct orphan sale event.', 'POST /sync/recover-orphan-sale');
   }
 });
 

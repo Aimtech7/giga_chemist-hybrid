@@ -50,6 +50,7 @@
     "test:medicine-search": "tsx scripts/integration/medicine-search.test.ts",
     "scan:dist": "node scripts/scan-dist.mjs",
     "test:compatibility": "tsx scripts/integration/sync-compatibility.test.ts",
+    "test:rejected-changes": "tsx scripts/integration/rejected-changes-and-zero-missed.test.ts",
     "updater:check": "node scripts/updater/updater.mjs check"
   },
   "dependencies": {
