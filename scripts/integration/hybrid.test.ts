@@ -597,6 +597,10 @@ export async function hybridTests(ctx: Ctx, env: HybridEnv) {
   const s13 = await sell(ctx.cashierToken, 1);
   check(s13.status === 201, 'sale works with DNS failing', s13.data);
   if (s13.status !== 201) return;
-  const st13 = await waitFor(async () => (await api('GET', '/api/sync/status', ctx.adminToken)).data, (d) => d?.cloud_reachable === false && /DNS|unreachable/i.test(d?.last_error || ''), 15_000);
+  const st13 = await waitFor(async () => {
+    const data = (await api('GET', '/api/sync/status', ctx.adminToken)).data;
+    const st = await statusOf(s13.data.sale.id, 'SALE_COMPLETED');
+    return { data, st };
+  }, (x) => x.data?.cloud_reachable === false && /DNS|unreachable/i.test(x.data?.last_error || '') && x.st === 'PENDING', 20_000).then(x => x?.data);
   check(st13?.cloud_reachable === false && (await statusOf(s13.data.sale.id, 'SALE_COMPLETED')) === 'PENDING', 'event PENDING; status reports cloud unreachable', { reach: st13?.cloud_reachable, err: st13?.last_error });
 }

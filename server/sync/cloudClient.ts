@@ -18,7 +18,7 @@ export class CloudError extends Error {
 
 type RpcName = 'gc_ping' | 'gc_ingest_events' | 'gc_pull_commands' | 'gc_ack_command' | 'gc_heartbeat'
   | 'gc_sync_user_credentials' | 'gc_fetch_user_credential' | 'gc_credential_sync_preview'
-  | 'gc_inspect_shop_data';
+  | 'gc_inspect_shop_data' | 'gc_check_event_statuses' | 'gc_check_compatibility';
 
 export async function callCloud<T = any>(fn: RpcName, args: Record<string, unknown>): Promise<T> {
   const cfg = getSyncConfig();

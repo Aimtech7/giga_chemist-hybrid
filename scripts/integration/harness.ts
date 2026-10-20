@@ -1,4 +1,4 @@
-import 'dotenv/config';
+import './test-env';
 import crypto from 'crypto';
 import os from 'os';
 import path from 'path';
@@ -13,6 +13,9 @@ import { hashCredential } from '../../server/auth';
  * PC2 development database.
  */
 export const REQUIRED_DB = 'giga_chemist_dev';
+if (!process.env.LOCAL_DATABASE_URL && process.env.DATABASE_URL) {
+  process.env.LOCAL_DATABASE_URL = process.env.DATABASE_URL.replace(/\/giga_chemist([?].*)?$/, `/${REQUIRED_DB}$1`);
+}
 export const PORT = Number(process.env.ITEST_PORT || 3199);
 export const BASE = `http://127.0.0.1:${PORT}`;
 
