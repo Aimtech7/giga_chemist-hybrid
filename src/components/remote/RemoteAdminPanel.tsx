@@ -20,6 +20,7 @@ import {
   WifiOff,
   X,
   XCircle,
+  Trash2,
 } from 'lucide-react';
 import { apiFetch, ApiError } from '../../services/http';
 import {
@@ -42,6 +43,7 @@ import { Sheet, StatusBadge, STATUS_TEXT, ago, when, inputCls, labelCls, btnPrim
 import { AlertsTab, CommandDetail, HealthTab, InsightsTab, SecurityTab, StaffTab } from './RemoteOps';
 import { UsersTab } from './UserManagement';
 import { getSelectedShop, isGlobalAdminAccount } from '../../services/shopContext';
+import { DeleteMedicineModal } from '../medicines/DeleteMedicineModal';
 import { MedicinesTable } from './MedicinesTable';
 import { SyncCenter } from '../sync/SyncCenter';
 import type { Medicine, MedicineBatch, PharmacySettings, User } from '../../types';
@@ -62,7 +64,7 @@ interface Props {
   initialStockFilter?: 'all' | 'in' | 'low' | 'out' | 'expiring';
 }
 
-type ActionKind = 'add' | 'remove' | 'count' | 'price' | 'details' | 'expiry' | 'active' | 'batch-new' | 'batch-edit' | 'batch-active';
+type ActionKind = 'add' | 'remove' | 'count' | 'price' | 'details' | 'expiry' | 'active' | 'batch-new' | 'batch-edit' | 'batch-active' | 'delete';
 
 export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings, initialTab, initialStockFilter }) => {
   const [tab, setTab] = useState<Tab>(initialTab || 'medicines');
@@ -338,6 +340,10 @@ export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings, initi
                 setSendError(null);
                 setSelectedId(id);
                 if (action !== 'view') {
+                  if (action === 'delete' && !isGlobalAdminAccount()) {
+                    setSendError('Only a Global Administrator can delete medicines.');
+                    return;
+                  }
                   const first = batches.filter((b) => b.medicine_id === id).sort((a, b) => (a.expiry_date || '9999').localeCompare(b.expiry_date || '9999'))[0];
                   setForm({ kind: action, batchId: first?.id });
                 }
@@ -378,10 +384,34 @@ export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings, initi
                 ['active', selected.status === 'active' ? 'Deactivate Medicine' : 'Activate Medicine', Power],
               ] as [ActionKind, string, any][]).map(([kind, label, Icon]) => (
                 <button key={kind} onClick={() => { setSendError(null); setForm({ kind, batchId: selectedBatches[0]?.id }); }}
-                  className="flex items-center gap-2 px-3 py-3 rounded-xl bg-white border border-slate-200 hover:border-teal-600 text-sm font-semibold text-slate-800">
+                  className="flex items-center gap-2 px-3 py-3 rounded-xl bg-white border border-slate-200 hover:border-teal-600 text-sm font-semibold text-slate-800 transition">
                   <Icon className="w-4 h-4 text-teal-700" /> {label}
                 </button>
               ))}
+
+              {/* Destructive Action: Delete Medicine (distinct danger styling, mobile & desktop accessible) */}
+              <button
+                onClick={() => {
+                  if (!isGlobalAdminAccount()) {
+                    setSendError('Only a Global Administrator can delete medicines.');
+                    return;
+                  }
+                  setSendError(null);
+                  setForm({ kind: 'delete', batchId: selectedBatches[0]?.id });
+                }}
+                disabled={!isGlobalAdminAccount()}
+                title={isGlobalAdminAccount() ? 'Delete Medicine' : 'Global Administrator only'}
+                aria-label="Delete medicine"
+                className={`col-span-2 flex items-center justify-center gap-2 px-3 py-3 rounded-xl border text-sm font-bold transition ${
+                  isGlobalAdminAccount()
+                    ? 'bg-rose-50 border-rose-300 hover:bg-rose-100 hover:border-rose-400 text-rose-700 cursor-pointer shadow-xs'
+                    : 'bg-slate-50 border-slate-200 text-slate-400 cursor-not-allowed'
+                }`}
+              >
+                <Trash2 className={`w-4 h-4 ${isGlobalAdminAccount() ? 'text-rose-600' : 'text-slate-400'}`} />
+                DELETE MEDICINE
+                {!isGlobalAdminAccount() && <span className="ml-1 text-[10px] font-normal text-slate-400">(Global Admin Only)</span>}
+              </button>
             </div>
 
             <div className="bg-white border border-slate-200 rounded-xl overflow-x-auto">
@@ -440,7 +470,22 @@ export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings, initi
         <CreateMedicineSheet categories={categories} currency={cur} onCancel={() => setCreating(false)} onReview={(d) => { setSendError(null); setDraft(d); }} />
       )}
 
-      {form && selected && !draft && (
+      {form && form.kind === 'delete' && selected && (
+        <DeleteMedicineModal
+          isOpen={true}
+          medicine={selected}
+          isRemote={true}
+          shopId={status?.shop_id}
+          onClose={() => setForm(null)}
+          onDeleted={() => {
+            setForm(null);
+            setSelectedId(null);
+            void loadCatalog(); void loadStatus();
+          }}
+        />
+      )}
+
+      {form && form.kind !== 'delete' && selected && !draft && (
         <ActionSheet
           kind={form.kind}
           medicine={selected}
@@ -533,7 +578,7 @@ const ActionSheet: React.FC<{
   const titles: Record<ActionKind, string> = {
     add: 'Add Stock', remove: 'Remove Stock', count: 'Set Physical Count', price: 'Edit Price', details: 'Edit Medicine', expiry: 'Edit Expiry',
     active: medicine.status === 'active' ? 'Deactivate Medicine' : 'Activate Medicine', 'batch-new': 'New Batch', 'batch-edit': 'Edit Batch',
-    'batch-active': 'Batch On / Off',
+    'batch-active': 'Batch On / Off', delete: 'Delete Medicine',
   };
   const [allShops, setAllShops] = useState(false);
   const canAllShops = isGlobalAdminAccount() && (kind === 'price' || kind === 'details');

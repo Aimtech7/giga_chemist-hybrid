@@ -107,6 +107,9 @@ export function describeResult(c: RemoteCommand): string | null {
   if ('return_id' in r) return `Return ${r.status}${r.refund_amount != null ? `, refund ${r.refund_amount}` : ''}.`;
   if ('sale_id' in r) return `Receipt ${r.receipt_number}: ${r.status}.`;
   if ('sessions_revoked_at' in r) return `${r.name}: signed out of every shop terminal.`;
+  if ('action' in r && (r.action === 'DELETED' || r.action === 'ARCHIVED')) {
+    return `${r.action === 'DELETED' ? 'Permanently deleted' : 'Archived'}${r.reason ? `: ${r.reason}` : '.'}`;
+  }
   if ('name' in r) return `Saved: ${r.name}.`;
   return null;
 }
@@ -133,6 +136,7 @@ export function describeRequest(c: RemoteCommand): string {
   else if (t === 'SETTINGS_UPDATE') what = Object.keys(p).join(', ');
   else if (t === 'MEDICINE_METADATA_UPDATE') what = Object.keys(p).filter((k) => !['medicine_id', 'expected', 'reason'].includes(k)).join(', ');
   else if (t === 'MEDICINE_CREATE') what = `new: ${p.name}`;
+  else if (t === 'MEDICINE_DELETE') what = 'delete / archive';
   else if (t.endsWith('_SET_ACTIVE')) what = p.active ? 'activate' : 'deactivate';
   else if (t === 'BATCH_CREATE') what = `new batch ${p.batch_number} (${p.quantity ?? 0})`;
   else if (t === 'BATCH_UPDATE') what = Object.keys(p).filter((k) => !['medicine_id', 'batch_id', 'expected', 'reason'].includes(k)).join(', ');

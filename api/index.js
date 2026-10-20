@@ -536,6 +536,66 @@ async function getSalesReport(rangeIn, scope, q = pgPool) {
   };
 }
 
+// server/db/medicines.ts
+var MEDICINE_SELECT = `
+  SELECT
+    m.id, m.branch_id, m.name, m.generic_name, m.brand_name, m.sku, m.barcode,
+    COALESCE(c.name, m.medicine_type, 'General') AS category,
+    m.medicine_type, m.dosage_strength, m.dosage_form, m.manufacturer, m.description,
+    COALESCE(m.purchase_price, 0)::float AS purchase_price,
+    COALESCE(m.selling_price, 0)::float AS selling_price,
+    m.wholesale_price::float AS wholesale_price,
+    COALESCE(m.min_selling_price, m.selling_price, 0)::float AS min_selling_price,
+    COALESCE(m.current_stock, 0)::int AS current_stock,
+    COALESCE(m.reorder_level, 20)::int AS reorder_level,
+    COALESCE(m.unit, 'Unit') AS unit,
+    COALESCE(m.prescription_required, false) AS prescription_required,
+    COALESCE(m.status, 'active') AS status,
+    COALESCE(m.version, 1)::int AS version,
+    m.created_at, m.updated_at
+  FROM medicines m
+  LEFT JOIN categories c ON m.category_id = c.id`;
+function toMedicine(r) {
+  return {
+    id: r.id,
+    branch_id: r.branch_id || void 0,
+    name: r.name,
+    generic_name: r.generic_name || r.name,
+    brand_name: r.brand_name || "",
+    sku: r.sku || "",
+    barcode: r.barcode || "",
+    category: r.category || "General",
+    medicine_type: r.medicine_type || "",
+    dosage_strength: r.dosage_strength || "",
+    dosage_form: r.dosage_form || "Tablet",
+    manufacturer: r.manufacturer || "",
+    description: r.description || "",
+    purchase_price: Number(r.purchase_price) || 0,
+    selling_price: Number(r.selling_price) || 0,
+    // NULL = no wholesale price set. Never substituted with the retail price.
+    wholesale_price: r.wholesale_price != null ? Number(r.wholesale_price) : null,
+    min_selling_price: Number(r.min_selling_price) || 0,
+    current_stock: Number(r.current_stock) || 0,
+    reorder_level: Number(r.reorder_level) || 0,
+    unit: r.unit || "Unit",
+    prescription_required: Boolean(r.prescription_required),
+    status: r.status || "active",
+    version: Number(r.version) || 1,
+    created_at: r.created_at ? new Date(r.created_at).toISOString() : "",
+    updated_at: r.updated_at ? new Date(r.updated_at).toISOString() : "",
+    created_by: "Admin",
+    updated_by: "Admin"
+  };
+}
+async function getAllMedicines(q = pgPool) {
+  const res = await q.query(`${MEDICINE_SELECT} ORDER BY m.name ASC`);
+  return res.rows.map(toMedicine);
+}
+async function getMedicineById(id, q = pgPool) {
+  const res = await q.query(`${MEDICINE_SELECT} WHERE m.id = $1`, [requireUuid(id, "medicine id")]);
+  return res.rows[0] ? toMedicine(res.rows[0]) : null;
+}
+
 // server/db/shifts.ts
 var toCents = (n) => Math.round(Number(n || 0) * 100);
 var fromCents = (c) => c / 100;
@@ -1312,66 +1372,6 @@ async function getTodaySalesSummary(options, q = pgPool) {
   };
 }
 
-// server/db/medicines.ts
-var MEDICINE_SELECT = `
-  SELECT
-    m.id, m.branch_id, m.name, m.generic_name, m.brand_name, m.sku, m.barcode,
-    COALESCE(c.name, m.medicine_type, 'General') AS category,
-    m.medicine_type, m.dosage_strength, m.dosage_form, m.manufacturer, m.description,
-    COALESCE(m.purchase_price, 0)::float AS purchase_price,
-    COALESCE(m.selling_price, 0)::float AS selling_price,
-    m.wholesale_price::float AS wholesale_price,
-    COALESCE(m.min_selling_price, m.selling_price, 0)::float AS min_selling_price,
-    COALESCE(m.current_stock, 0)::int AS current_stock,
-    COALESCE(m.reorder_level, 20)::int AS reorder_level,
-    COALESCE(m.unit, 'Unit') AS unit,
-    COALESCE(m.prescription_required, false) AS prescription_required,
-    COALESCE(m.status, 'active') AS status,
-    COALESCE(m.version, 1)::int AS version,
-    m.created_at, m.updated_at
-  FROM medicines m
-  LEFT JOIN categories c ON m.category_id = c.id`;
-function toMedicine(r) {
-  return {
-    id: r.id,
-    branch_id: r.branch_id || void 0,
-    name: r.name,
-    generic_name: r.generic_name || r.name,
-    brand_name: r.brand_name || "",
-    sku: r.sku || "",
-    barcode: r.barcode || "",
-    category: r.category || "General",
-    medicine_type: r.medicine_type || "",
-    dosage_strength: r.dosage_strength || "",
-    dosage_form: r.dosage_form || "Tablet",
-    manufacturer: r.manufacturer || "",
-    description: r.description || "",
-    purchase_price: Number(r.purchase_price) || 0,
-    selling_price: Number(r.selling_price) || 0,
-    // NULL = no wholesale price set. Never substituted with the retail price.
-    wholesale_price: r.wholesale_price != null ? Number(r.wholesale_price) : null,
-    min_selling_price: Number(r.min_selling_price) || 0,
-    current_stock: Number(r.current_stock) || 0,
-    reorder_level: Number(r.reorder_level) || 0,
-    unit: r.unit || "Unit",
-    prescription_required: Boolean(r.prescription_required),
-    status: r.status || "active",
-    version: Number(r.version) || 1,
-    created_at: r.created_at ? new Date(r.created_at).toISOString() : "",
-    updated_at: r.updated_at ? new Date(r.updated_at).toISOString() : "",
-    created_by: "Admin",
-    updated_by: "Admin"
-  };
-}
-async function getAllMedicines(q = pgPool) {
-  const res = await q.query(`${MEDICINE_SELECT} ORDER BY m.name ASC`);
-  return res.rows.map(toMedicine);
-}
-async function getMedicineById(id, q = pgPool) {
-  const res = await q.query(`${MEDICINE_SELECT} WHERE m.id = $1`, [requireUuid(id, "medicine id")]);
-  return res.rows[0] ? toMedicine(res.rows[0]) : null;
-}
-
 // server/db/batches.ts
 var BATCH_SELECT = `
   SELECT b.id, b.branch_id, b.medicine_id, COALESCE(m.name, 'Pharmaceutical Item') AS medicine_name,
@@ -1957,7 +1957,8 @@ var HIGH_CONFLICT_TYPES = [
   "BATCH_CREATE",
   "PURCHASE_RECEIVE",
   "RETURN_APPROVE",
-  "SALE_VOID"
+  "SALE_VOID",
+  "MEDICINE_DELETE"
 ];
 var ALL_SHOPS_TYPES = ["PRICE_UPDATE", "MEDICINE_METADATA_UPDATE", "CATEGORY_UPSERT", "SETTINGS_UPDATE"];
 var STOCK_REMOVE_REASONS = ["Damaged", "Expired", "Lost", "Physical stock correction", "Other"];
@@ -2339,6 +2340,14 @@ function validateCommandPayload(type, payload) {
       onlyKeys(p, ["medicine_id", "active", "reason"], "MEDICINE_SET_ACTIVE");
       return { medicine_id: uuid(p.medicine_id, "medicine_id"), active: bool(p.active, "active"), reason: reasonText(p.reason, true) };
     }
+    case "MEDICINE_DELETE": {
+      onlyKeys(p, ["medicine_id", "expected_version", "expected_status", "expected_current_stock", "reason"], "MEDICINE_DELETE");
+      const out = { medicine_id: uuid(p.medicine_id, "medicine_id") };
+      if (p.expected_version !== void 0) out.expected_version = wholeNumber(p.expected_version, "expected_version", 1);
+      if (p.expected_status !== void 0) out.expected_status = text(p.expected_status, "expected_status");
+      if (p.expected_current_stock !== void 0) out.expected_current_stock = wholeNumber(p.expected_current_stock, "expected_current_stock", 0);
+      return withReason(out, p.reason);
+    }
     case "CATEGORY_UPSERT": {
       onlyKeys(p, ["name", "description"], "CATEGORY_UPSERT");
       const name2 = typeof p.name === "string" ? p.name.trim().slice(0, 100) : "";
@@ -2595,6 +2604,7 @@ var ACTIONS = {
   // Full-write Global Admin (cloud migration 006)
   "medicine-create": "MEDICINE_CREATE",
   "medicine-active": "MEDICINE_SET_ACTIVE",
+  "medicine-delete": "MEDICINE_DELETE",
   "batch-create": "BATCH_CREATE",
   "batch-update": "BATCH_UPDATE",
   "batch-active": "BATCH_SET_ACTIVE",
@@ -2799,9 +2809,29 @@ async function runtimeRow(deps, shopId) {
       [shopId]
     ))).rows[0] || null;
   } catch (err) {
-    if (err?.code === "42P01") return void 0;
-    throw err;
+    if (err?.code === "42P01" || err?.code === "3F000") return void 0;
+    return void 0;
   }
+}
+function shopSupportsMedicineDelete(rt) {
+  if (!rt) return { supported: true };
+  const commit = (rt.git_commit || rt.status?.git_commit || "").toLowerCase().trim();
+  const shortSha = commit ? commit.slice(0, 7) : "unknown";
+  const knownOldCommits = ["5fee286", "5fee286f59d7b80f291a126c0a4c745321705fef"];
+  if (knownOldCommits.some((c) => commit.startsWith(c) || c.length >= 7 && c.startsWith(commit))) {
+    return {
+      supported: false,
+      reason: `SHOP UPDATE REQUIRED: Shop 1 is currently running commit ${shortSha}. To safely use remote medicine delete, Shop 1 must install the current GIGA CHEMIST release.`
+    };
+  }
+  const capabilities = Array.isArray(rt.capabilities) ? rt.capabilities : Array.isArray(rt.status?.capabilities) ? rt.status.capabilities : null;
+  if (capabilities && !capabilities.includes("MEDICINE_DELETE")) {
+    return {
+      supported: false,
+      reason: `SHOP UPDATE REQUIRED: Shop 1 is currently running commit ${shortSha}. To safely use remote medicine delete, Shop 1 must install the current GIGA CHEMIST release.`
+    };
+  }
+  return { supported: true };
 }
 function buildRemoteAdminRouter(deps) {
   const r = express2.Router();
@@ -2873,6 +2903,22 @@ function buildRemoteAdminRouter(deps) {
       display.current_commit = rt.update_state.current_commit ?? null;
       display.available_version = rt.update_state.available_version ?? null;
     }
+    if (type === "MEDICINE_DELETE") {
+      if (!deps.isGlobalAdmin(u)) {
+        throw new HttpError(403, "Forbidden: Global Administrator only.", { code: "GLOBAL_ADMIN_ONLY" });
+      }
+      if (isAllShopsScope(req)) {
+        throw new HttpError(409, "All Shops is a read-only view. Select one shop to change it.", { code: "ALL_SHOPS_READ_ONLY" });
+      }
+      const rt = await runtimeRow(deps, shopId);
+      const cap = shopSupportsMedicineDelete(rt);
+      if (!cap.supported) {
+        throw new HttpError(409, cap.reason || "Shop 1 must install the current GIGA CHEMIST release before Medicine Delete can be used.", { code: "SHOP_UPDATE_REQUIRED" });
+      }
+      if ((payload.expected_current_stock || 0) > 0) {
+        throw new HttpError(409, `Cannot delete medicine because it still has stock (${payload.expected_current_stock} units). Stock must be adjusted to 0 first through an auditable workflow.`, { code: "MEDICINE_HAS_STOCK" });
+      }
+    }
     const online = await shopOnline(shopId);
     const highConflict = HIGH_CONFLICT_TYPES.includes(type);
     if (online === false) display.queued_while_shop_offline = true;
@@ -2918,6 +2964,26 @@ function buildRemoteAdminRouter(deps) {
     };
   }
   const requestSeed = (requestId) => typeof requestId === "string" && isValidUuid(requestId) ? requestId.toLowerCase() : null;
+  r.post("/admin/commands", requireAdmin2, commandRateLimit, route2("POST /admin/commands", async (req, res) => {
+    const rawType = req.body?.command_type || req.body?.type;
+    const action = req.body?.action || Object.entries(ACTIONS).find(([, v]) => v === rawType)?.[0];
+    const type = action && ACTIONS[action] || (typeof rawType === "string" && Object.values(ACTIONS).includes(rawType) ? rawType : null);
+    if (!type) throw new HttpError(400, "Valid command_type or action is required in request body.");
+    if (isAllShopsScope(req)) {
+      throw new HttpError(409, 'All Shops is a read-only view. Select one shop to change it, or use "Apply to all shops" where it is offered.', { code: "ALL_SHOPS_READ_ONLY" });
+    }
+    const body = req.body?.payload && typeof req.body.payload === "object" ? { ...req.body.payload } : req.body && typeof req.body === "object" && !Array.isArray(req.body) ? { ...req.body } : {};
+    delete body.command_type;
+    delete body.action;
+    delete body.payload;
+    const targetShop = typeof req.body?.shop_id === "string" && isValidUuid(req.body.shop_id) ? req.body.shop_id : deps.shopId(req);
+    const seed = requestSeed(body.request_id || req.body?.request_id);
+    delete body.request_id;
+    delete body.shop_id;
+    const out = await queueForShop(req, targetShop, type, body, seed);
+    res.status(202);
+    return out;
+  }));
   r.post("/admin/commands/:action", requireAdmin2, commandRateLimit, route2("POST /admin/commands", async (req, res) => {
     const type = ACTIONS[String(req.params.action)];
     if (!type) throw new HttpError(404, `Unknown remote action "${req.params.action}".`);
@@ -2990,6 +3056,104 @@ function buildRemoteAdminRouter(deps) {
     });
     res.status(202);
     return { command_type: type, fanout_group: seed, results };
+  }));
+  r.get("/admin/medicines/:id/delete-preview", requireAdmin2, route2("GET /admin/medicines/:id/delete-preview", async (req) => {
+    if (!deps.isGlobalAdmin(req.onlineUser)) {
+      throw new HttpError(403, "Forbidden: Global Administrator only.", { code: "GLOBAL_ADMIN_ONLY" });
+    }
+    if (isAllShopsScope(req)) {
+      throw new HttpError(400, "Cannot preview medicine deletion across All Shops. Select a specific shop.", { code: "ALL_SHOPS_NOT_ALLOWED" });
+    }
+    const medId = req.params.id;
+    if (!isValidUuid(medId)) throw new HttpError(400, "Valid medicine UUID is required.");
+    const shopId = typeof req.query.shop_id === "string" && isValidUuid(req.query.shop_id) ? req.query.shop_id : deps.shopId(req);
+    if (!shopId || !isValidUuid(shopId)) throw new HttpError(400, "Valid shop_id is required.", { code: "SHOP_ID_REQUIRED" });
+    const rt = await runtimeRow(deps, shopId);
+    const cap = shopSupportsMedicineDelete(rt);
+    const preview = await deps.withShopId(shopId, async (c) => {
+      const medRes = await c.query(
+        `SELECT id, name, sku, barcode, current_stock, status,
+                COALESCE(
+                  NULLIF(to_jsonb(medicines)->>'version', '')::int,
+                  NULLIF(to_jsonb(medicines)->>'local_version', '')::int,
+                  1
+                ) AS version
+           FROM medicines WHERE id = $1`,
+        [medId]
+      );
+      if (medRes.rows.length === 0) {
+        throw new HttpError(404, `Medicine ${medId} not found in cloud copy of shop.`);
+      }
+      const m = medRes.rows[0];
+      const currentStock = Number(m.current_stock) || 0;
+      const [siRes, piRes, retRes, movRes, batchRes] = await Promise.all([
+        c.query(`SELECT COUNT(*)::int AS items, COUNT(DISTINCT sale_id)::int AS sales FROM sale_items WHERE medicine_id = $1`, [medId]),
+        c.query(`SELECT COUNT(*)::int AS items, COUNT(DISTINCT purchase_id)::int AS purchases FROM purchase_items WHERE medicine_id = $1`, [medId]),
+        c.query(`SELECT COUNT(*)::int AS count FROM returns WHERE medicine_id = $1`, [medId]),
+        c.query(`SELECT COUNT(*)::int AS count FROM inventory_movements WHERE medicine_id = $1`, [medId]),
+        c.query(`SELECT COUNT(*)::int AS count FROM medicine_batches WHERE medicine_id = $1 AND status <> 'exhausted' AND status <> 'archived'`, [medId])
+      ]);
+      return {
+        m,
+        currentStock,
+        siCount: siRes.rows[0]?.items || 0,
+        salesCount: siRes.rows[0]?.sales || 0,
+        piCount: piRes.rows[0]?.items || 0,
+        purchasesCount: piRes.rows[0]?.purchases || 0,
+        retCount: retRes.rows[0]?.count || 0,
+        movCount: movRes.rows[0]?.count || 0,
+        activeBatches: batchRes.rows[0]?.count || 0
+      };
+    });
+    const pendingCmdRes = await deps.withCloud(
+      (cloudClient) => cloudClient.query(
+        `SELECT COUNT(*)::int AS count FROM giga_cloud.commands WHERE shop_id = $1 AND entity_id = $2 AND status = 'PENDING'`,
+        [shopId, medId]
+      )
+    ).catch(() => ({ rows: [{ count: 0 }] }));
+    const pendingCmdCount = pendingCmdRes.rows[0]?.count || 0;
+    const totalHistory = preview.siCount + preview.piCount + preview.retCount + preview.movCount;
+    const hasStock = preview.currentStock > 0;
+    const hasPendingSync = pendingCmdCount > 0;
+    const outcome = totalHistory === 0 && !hasStock && !hasPendingSync ? "PERMANENT_DELETE" : "ARCHIVE_REQUIRED";
+    let blockReason = null;
+    if (hasStock) {
+      blockReason = `Cannot delete this medicine while ${preview.currentStock} units remain in stock. Use an auditable stock adjustment first.`;
+    } else if (!cap.supported) {
+      blockReason = cap.reason || "Shop 1 must install the current GIGA CHEMIST release before Medicine Delete can be used.";
+    } else if (hasPendingSync) {
+      blockReason = "Pending remote commands or sync events exist for this medicine.";
+    }
+    return {
+      medicine: {
+        id: preview.m.id,
+        name: preview.m.name,
+        sku: preview.m.sku || null,
+        barcode: preview.m.barcode || null,
+        current_stock: preview.currentStock,
+        status: preview.m.status || "active",
+        version: Number(preview.m.version) || 1
+      },
+      references: {
+        sales: preview.salesCount,
+        sale_items: preview.siCount,
+        purchases: preview.purchasesCount,
+        purchase_items: preview.piCount,
+        returns: preview.retCount,
+        inventory_movements: preview.movCount,
+        stocktake_lines: 0,
+        active_batches: preview.activeBatches,
+        pending_sync_events: pendingCmdCount
+      },
+      total_historical_references: totalHistory,
+      has_stock: hasStock,
+      has_pending_sync: hasPendingSync,
+      outcome,
+      block_reason: blockReason,
+      shop_update_required: !cap.supported,
+      shop_update_message: cap.reason || null,
+      disclaimer: "Final deletion eligibility is rechecked by the shop computer."
+    };
   }));
   r.get("/admin/commands", requireAdmin2, route2("GET /admin/commands", async (req) => {
     const limit = Math.min(Math.max(Number(req.query.limit) || 30, 1), 200);
@@ -6106,7 +6270,7 @@ async function resolveShop(req, res, next) {
     req.shopId = cfg.shopId;
     return next();
   }
-  const raw = req.headers[SHOP_HEADER];
+  const raw = req.headers[SHOP_HEADER] ?? (typeof req.query?.shop_id === "string" ? req.query.shop_id : void 0);
   if (Array.isArray(raw)) return res.status(400).json({ error: "Send X-GIGA-SHOP-ID once.", code: "SHOP_ID_INVALID" });
   const wanted = String(raw || "").trim().toLowerCase();
   if (!wanted) {

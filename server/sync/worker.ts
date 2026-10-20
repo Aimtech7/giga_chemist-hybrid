@@ -8,6 +8,7 @@ import { getShopIdentity, reconcileShopIdentity } from './identity';
 import { collectRuntimeStatus } from './heartbeat';
 import { recordAuditLog } from '../db/audit';
 import { registerSyncWakeHandler } from './wake';
+import { runStockParityAudit } from './stockParity';
 
 /**
  * Background sync worker on the LOCAL server.
@@ -49,6 +50,7 @@ class SyncWorker {
   /** Commands whose apply failure was already logged (avoid one log line per cycle). */
   private loggedCommandErrors = new Set<string>();
   private lastHeartbeatAt = 0;
+  private lastParityAuditAt = 0;
   private heartbeatNotice = false;
   readonly workerId = `server-${process.pid}`;
 
@@ -175,6 +177,21 @@ class SyncWorker {
       );
       if (res.rowCount) console.log(`[Sync] Cloud reachable again; retrying ${res.rowCount} backed-off event(s) now.`);
       await this.pushDueEvents();
+    }
+  }
+
+  // -------------------------------------------------------------------------- stock parity audit
+  private async maybeAuditStockParity(force = false) {
+    const every = Math.max(30, Number(process.env.STOCK_PARITY_INTERVAL_SECONDS) || 120) * 1000;
+    if (!force && Date.now() - this.lastParityAuditAt < every) return;
+    this.lastParityAuditAt = Date.now();
+    try {
+      const rep = await runStockParityAudit({ autoReconcile: true });
+      if (rep.summary.reconciled > 0) {
+        console.log(`[Sync] Auto-reconciled ${rep.summary.reconciled} medicine(s) with stock parity drift.`);
+      }
+    } catch (err: any) {
+      console.warn('[Sync] Stock parity audit step warning:', err?.message || err);
     }
   }
 

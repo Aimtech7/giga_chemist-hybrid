@@ -32,6 +32,7 @@ export const COMMAND_TYPES = [
   // Full-write Global Admin (cloud migration 006)
   'MEDICINE_CREATE',
   'MEDICINE_SET_ACTIVE',
+  'MEDICINE_DELETE',
   'BATCH_CREATE',
   'BATCH_UPDATE',
   'BATCH_SET_ACTIVE',
@@ -69,7 +70,7 @@ export const STOCK_COMMAND_TYPES: readonly CommandType[] = ['STOCK_ADD', 'STOCK_
  * strongly before queueing them while the shop is offline (they are re-checked on delivery).
  */
 export const HIGH_CONFLICT_TYPES: readonly CommandType[] = [
-  'STOCK_ADD', 'STOCK_REMOVE', 'STOCK_SET', 'BATCH_CREATE', 'PURCHASE_RECEIVE', 'RETURN_APPROVE', 'SALE_VOID',
+  'STOCK_ADD', 'STOCK_REMOVE', 'STOCK_SET', 'BATCH_CREATE', 'PURCHASE_RECEIVE', 'RETURN_APPROVE', 'SALE_VOID', 'MEDICINE_DELETE',
 ];
 
 /**
@@ -452,6 +453,14 @@ export function validateCommandPayload(type: string, payload: unknown): Record<s
     case 'MEDICINE_SET_ACTIVE': {
       onlyKeys(p, ['medicine_id', 'active', 'reason'], 'MEDICINE_SET_ACTIVE');
       return { medicine_id: uuid(p.medicine_id, 'medicine_id'), active: bool(p.active, 'active'), reason: reasonText(p.reason, true) };
+    }
+    case 'MEDICINE_DELETE': {
+      onlyKeys(p, ['medicine_id', 'expected_version', 'expected_status', 'expected_current_stock', 'reason'], 'MEDICINE_DELETE');
+      const out: Record<string, any> = { medicine_id: uuid(p.medicine_id, 'medicine_id') };
+      if (p.expected_version !== undefined) out.expected_version = wholeNumber(p.expected_version, 'expected_version', 1);
+      if (p.expected_status !== undefined) out.expected_status = text(p.expected_status, 'expected_status');
+      if (p.expected_current_stock !== undefined) out.expected_current_stock = wholeNumber(p.expected_current_stock, 'expected_current_stock', 0);
+      return withReason(out, p.reason);
     }
     case 'CATEGORY_UPSERT': {
       onlyKeys(p, ['name', 'description'], 'CATEGORY_UPSERT');

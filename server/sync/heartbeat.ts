@@ -148,6 +148,7 @@ async function buildStatus(worker: WorkerSnapshot) {
     app_version: appVersion(),
     git_commit: currentCommit(),
     sync_protocol_version: 2,
+    capabilities: ['MEDICINE_DELETE', 'STOCK_PARITY', 'REJECTED_CHANGES', 'ATOMIC_BASELINE'],
     node_version: process.version,
     started_at: STARTED_AT,
     uptime_seconds: Math.round(process.uptime()),
