@@ -20,3 +20,39 @@ export function classifyConflict(commandType: string | null | undefined, error: 
   if (/(cannot .* (a|an) .* that is|already (voided|received|cancelled|approved|rejected|closed|reviewed)|invalid.state|not pending|is (closed|completed|cancelled))/.test(e)) return 'INVALID_STATE';
   return 'OTHER';
 }
+
+export const FAILURE_CATEGORIES = [
+  'SCHEMA_RPC_ERROR',
+  'VALIDATION_ERROR',
+  'UNSUPPORTED_EVENT_TYPE',
+  'SEQUENCE_PROBLEM',
+  'CLOUD_ERROR',
+  'CONCURRENCY_CONFLICT',
+  'OTHER',
+] as const;
+export type FailureCategory = (typeof FAILURE_CATEGORIES)[number];
+
+export function classifyFailure(eventType: string | null | undefined, error: string | null | undefined): FailureCategory {
+  const e = String(error || '').toLowerCase();
+  if (!e) return 'OTHER';
+  if (/function .* does not exist|column .* does not exist|syntax error|relation .* does not exist|type .* does not exist|operator does not exist|rpc error/.test(e)) {
+    return 'SCHEMA_RPC_ERROR';
+  }
+  if (/unknown event_type|unsupported event/.test(e)) {
+    return 'UNSUPPORTED_EVENT_TYPE';
+  }
+  if (/sequence|local_seq|gap|out of order|monotonic/.test(e)) {
+    return 'SEQUENCE_PROBLEM';
+  }
+  if (/is required|cannot be null|invalid format|invalid uuid|malformed|payload is missing|validation/.test(e)) {
+    return 'VALIDATION_ERROR';
+  }
+  if (/connection refused|timeout|network|econnrefused|enotfound|fetch failed|failed to fetch|500|502|503|504|upstream/.test(e)) {
+    return 'CLOUD_ERROR';
+  }
+  if (/stale|conflict|changed meanwhile|already|expected/.test(e)) {
+    return 'CONCURRENCY_CONFLICT';
+  }
+  return 'OTHER';
+}
+
