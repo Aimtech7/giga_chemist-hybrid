@@ -34,6 +34,14 @@ async function q<T = any>(sql: string, params: unknown[] = []): Promise<T | null
   }
 }
 
+async function qRows<T = any>(sql: string, params: unknown[] = []): Promise<T[]> {
+  try {
+    return (await pgPool.query(sql, params)).rows as T[];
+  } catch {
+    return [];
+  }
+}
+
 function disk(dir: string) {
   try {
     const s = fs.statfsSync(dir);
@@ -125,6 +133,14 @@ async function buildStatus(worker: WorkerSnapshot) {
            (SELECT COUNT(*) FROM medicine_batches WHERE quantity_available > 0 AND expiry_date > CURRENT_DATE
               AND expiry_date <= CURRENT_DATE + 30)::int AS near_expiry,
            (SELECT COUNT(*) FROM medicine_batches WHERE quantity_available > 0 AND expiry_date <= CURRENT_DATE)::int AS expired`);
+  const mismatches = await qRows<any>(`
+    SELECT l.medicine_id, m.name, l.local_stock, l.cloud_stock, l.local_stock_version, l.cloud_stock_version,
+           l.local_fingerprint, l.cloud_fingerprint, l.outcome, l.checked_at, l.details
+      FROM stock_parity_log l
+      JOIN medicines m ON m.id = l.medicine_id
+     WHERE l.outcome = 'PERSISTENT_MISMATCH' AND l.reconciled = FALSE
+     ORDER BY l.checked_at DESC LIMIT 50
+  `);
   let backup: any = null;
   try {
     const b = await getBackupStatus();
@@ -148,7 +164,16 @@ async function buildStatus(worker: WorkerSnapshot) {
     app_version: appVersion(),
     git_commit: currentCommit(),
     sync_protocol_version: 2,
-    capabilities: ['MEDICINE_DELETE', 'STOCK_PARITY', 'REJECTED_CHANGES', 'ATOMIC_BASELINE'],
+    capabilities: [
+      'MEDICINE_DELETE',
+      'STOCK_PARITY',
+      'REJECTED_CHANGES',
+      'ATOMIC_BASELINE',
+      'STOCK_OVERRIDE_ADD',
+      'STOCK_OVERRIDE_REMOVE',
+      'STOCK_OVERRIDE_SET',
+      'STOCK_SNAPSHOT_REQUEST',
+    ],
     node_version: process.version,
     started_at: STARTED_AT,
     uptime_seconds: Math.round(process.uptime()),
@@ -168,7 +193,7 @@ async function buildStatus(worker: WorkerSnapshot) {
       last_install: update.last_install ?? null, message: sanitizeText(update.message),
     } : null,
     restarts_last_hour: recentRestarts(1),
-    inventory: inv,
+    inventory: { ...inv, mismatches },
     staff,
     checks,
   };

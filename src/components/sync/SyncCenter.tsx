@@ -19,6 +19,7 @@ import {
 import { apiFetch } from '../../services/http';
 import { queueRemoteCommand } from '../../services/remoteAdmin';
 import { RejectedChangesView } from './RejectedChangesView';
+import { StockConflictsView } from './StockConflictsView';
 
 /**
  * SYNC & CONFLICT CONTROL CENTER (Administrator).
@@ -47,7 +48,7 @@ const Table: React.FC<{ cols: string[]; rows: React.ReactNode[][]; empty: string
 );
 
 export const SyncCenter: React.FC<{ online: boolean }> = ({ online }) => {
-  const [activeTab, setActiveTab] = useState<'queues' | 'rejected' | 'diagnostics'>('queues');
+  const [activeTab, setActiveTab] = useState<'queues' | 'rejected' | 'stock-conflicts' | 'diagnostics'>('queues');
   const [data, setData] = useState<any>(null);
   const [issues, setIssues] = useState<any>(null);
   const [busy, setBusy] = useState(false);
@@ -282,6 +283,16 @@ export const SyncCenter: React.FC<{ online: boolean }> = ({ online }) => {
         </button>
 
         <button
+          onClick={() => setActiveTab('stock-conflicts')}
+          className={`px-3 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1.5 ${
+            activeTab === 'stock-conflicts' ? 'bg-white text-teal-800 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+          }`}
+        >
+          <RotateCcw className="w-3.5 h-3.5 text-teal-700" />
+          <span>Stock Conflicts</span>
+        </button>
+
+        <button
           onClick={() => setActiveTab('diagnostics')}
           className={`px-3 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1.5 ${
             activeTab === 'diagnostics' ? 'bg-white text-teal-800 shadow-xs' : 'text-slate-600 hover:text-slate-900'
@@ -317,6 +328,11 @@ export const SyncCenter: React.FC<{ online: boolean }> = ({ online }) => {
       {/* VIEW 1: REJECTED CHANGES CENTER */}
       {activeTab === 'rejected' && (
         <RejectedChangesView online={online} onRefreshParent={load} />
+      )}
+
+      {/* VIEW 1B: STOCK CONFLICTS CENTER */}
+      {activeTab === 'stock-conflicts' && (
+        <StockConflictsView online={online} />
       )}
 
       {/* VIEW 2: SEQUENCE DIAGNOSTICS & SALES AUDIT */}

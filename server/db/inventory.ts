@@ -248,6 +248,7 @@ export function toBatchDto(r: any, medicineName?: string) {
     received_date: r.received_date || '',
     purchase_invoice: r.purchase_invoice || '',
     status: r.status || 'active',
+    stock_version: Number(r.stock_version) || 1,
     created_at: r.created_at ? new Date(r.created_at).toISOString() : new Date().toISOString(),
   };
 }
@@ -259,6 +260,7 @@ export function toMedicineStockDto(r: any) {
     name: r.name,
     current_stock: Number(r.current_stock) || 0,
     version: Number(r.version) || 1,
+    stock_version: Number(r.stock_version) || 1,
     updated_at: r.updated_at ? new Date(r.updated_at).toISOString() : new Date().toISOString(),
   };
 }

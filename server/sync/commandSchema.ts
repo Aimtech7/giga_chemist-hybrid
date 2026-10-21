@@ -60,17 +60,40 @@ export const COMMAND_TYPES = [
   // Sync control center (cloud migration 010): the shop re-sends its FAILED outbox events with their
   // ORIGINAL idempotency keys (the cloud answers DUPLICATE for anything it already has).
   'SYNC_RETRY_FAILED',
+  // Global Admin Stock Override & Snapshot (cloud migration 014)
+  'STOCK_OVERRIDE_ADD',
+  'STOCK_OVERRIDE_REMOVE',
+  'STOCK_OVERRIDE_SET',
+  'STOCK_SNAPSHOT_REQUEST',
 ] as const;
 export type CommandType = (typeof COMMAND_TYPES)[number];
 
-export const STOCK_COMMAND_TYPES: readonly CommandType[] = ['STOCK_ADD', 'STOCK_REMOVE', 'STOCK_SET'];
+export const STOCK_COMMAND_TYPES: readonly CommandType[] = [
+  'STOCK_ADD',
+  'STOCK_REMOVE',
+  'STOCK_SET',
+  'STOCK_OVERRIDE_ADD',
+  'STOCK_OVERRIDE_REMOVE',
+  'STOCK_OVERRIDE_SET',
+];
 
 /**
  * Commands that change stock quantities or need the shop's live state: the online app warns
  * strongly before queueing them while the shop is offline (they are re-checked on delivery).
  */
 export const HIGH_CONFLICT_TYPES: readonly CommandType[] = [
-  'STOCK_ADD', 'STOCK_REMOVE', 'STOCK_SET', 'BATCH_CREATE', 'PURCHASE_RECEIVE', 'RETURN_APPROVE', 'SALE_VOID', 'MEDICINE_DELETE',
+  'STOCK_ADD',
+  'STOCK_REMOVE',
+  'STOCK_SET',
+  'BATCH_CREATE',
+  'PURCHASE_RECEIVE',
+  'RETURN_APPROVE',
+  'SALE_VOID',
+  'MEDICINE_DELETE',
+  'STOCK_OVERRIDE_ADD',
+  'STOCK_OVERRIDE_REMOVE',
+  'STOCK_OVERRIDE_SET',
+  'STOCK_SNAPSHOT_REQUEST',
 ];
 
 /**
@@ -385,6 +408,80 @@ export function validateCommandPayload(type: string, payload: unknown): Record<s
       };
       if (p.batch_id) out.batch_id = uuid(p.batch_id, 'batch_id');
       else out.batch_number = batchNumber(p.batch_number);
+      return out;
+    }
+    case 'STOCK_OVERRIDE_ADD': {
+      onlyKeys(p, ['medicine_id', 'batch_id', 'batch_number', 'expiry_date', 'purchase_price', 'quantity', 'reason', 'cloud_quantity_seen', 'created_at', 'expires_at'], 'STOCK_OVERRIDE_ADD');
+      const out: Record<string, any> = {
+        medicine_id: uuid(p.medicine_id, 'medicine_id'),
+        quantity: wholeNumber(p.quantity, 'quantity', 1),
+        reason: reasonText(p.reason, true),
+      };
+      if (p.batch_id !== undefined && p.batch_id !== null && p.batch_id !== '') {
+        if (p.batch_number || p.expiry_date) throw new HttpError(400, 'Give either batch_id (existing batch) or batch_number + expiry_date (new batch), not both.');
+        out.batch_id = uuid(p.batch_id, 'batch_id');
+      } else {
+        out.batch_number = batchNumber(p.batch_number);
+        out.expiry_date = date(p.expiry_date);
+        if (p.purchase_price !== undefined && p.purchase_price !== null && p.purchase_price !== '') {
+          out.purchase_price = money(p.purchase_price, 'purchase_price', false);
+        }
+      }
+      if (p.cloud_quantity_seen !== undefined && p.cloud_quantity_seen !== null && p.cloud_quantity_seen !== '') {
+        out.cloud_quantity_seen = wholeNumber(p.cloud_quantity_seen, 'cloud_quantity_seen', 0);
+      }
+      if (typeof p.created_at === 'string') out.created_at = p.created_at;
+      if (typeof p.expires_at === 'string') out.expires_at = p.expires_at;
+      return out;
+    }
+    case 'STOCK_OVERRIDE_REMOVE': {
+      onlyKeys(p, ['medicine_id', 'batch_id', 'quantity', 'reason', 'notes', 'cloud_quantity_seen', 'created_at', 'expires_at'], 'STOCK_OVERRIDE_REMOVE');
+      const out: Record<string, any> = {
+        medicine_id: uuid(p.medicine_id, 'medicine_id'),
+        batch_id: uuid(p.batch_id, 'batch_id'),
+        quantity: wholeNumber(p.quantity, 'quantity', 1),
+        reason: reasonText(p.reason, true),
+      };
+      if (p.notes !== undefined) out.notes = text(p.notes, 'notes', { clearable: true });
+      if (p.cloud_quantity_seen !== undefined && p.cloud_quantity_seen !== null && p.cloud_quantity_seen !== '') {
+        out.cloud_quantity_seen = wholeNumber(p.cloud_quantity_seen, 'cloud_quantity_seen', 0);
+      }
+      if (typeof p.created_at === 'string') out.created_at = p.created_at;
+      if (typeof p.expires_at === 'string') out.expires_at = p.expires_at;
+      return out;
+    }
+    case 'STOCK_OVERRIDE_SET': {
+      onlyKeys(p, ['medicine_id', 'batch_id', 'batch_number', 'quantity', 'reason', 'cloud_quantity_seen', 'batch_counts', 'created_at', 'expires_at'], 'STOCK_OVERRIDE_SET');
+      const out: Record<string, any> = {
+        medicine_id: uuid(p.medicine_id, 'medicine_id'),
+        quantity: wholeNumber(p.quantity ?? 0, 'quantity', 0),
+        reason: reasonText(p.reason, true),
+      };
+      if (p.batch_id) out.batch_id = uuid(p.batch_id, 'batch_id');
+      else if (p.batch_number) out.batch_number = batchNumber(p.batch_number);
+      if (Array.isArray(p.batch_counts)) {
+        out.batch_counts = p.batch_counts.map((b: any, idx: number) => {
+          const item = obj(b);
+          onlyKeys(item, ['batch_id', 'quantity'], `batch_counts[${idx}]`);
+          return {
+            batch_id: uuid(item.batch_id, `batch_counts[${idx}].batch_id`),
+            quantity: wholeNumber(item.quantity, `batch_counts[${idx}].quantity`, 0),
+          };
+        });
+      }
+      if (p.cloud_quantity_seen !== undefined && p.cloud_quantity_seen !== null && p.cloud_quantity_seen !== '') {
+        out.cloud_quantity_seen = wholeNumber(p.cloud_quantity_seen, 'cloud_quantity_seen', 0);
+      }
+      if (typeof p.created_at === 'string') out.created_at = p.created_at;
+      if (typeof p.expires_at === 'string') out.expires_at = p.expires_at;
+      return out;
+    }
+    case 'STOCK_SNAPSHOT_REQUEST': {
+      onlyKeys(p, ['medicine_id', 'reason'], 'STOCK_SNAPSHOT_REQUEST');
+      const out: Record<string, any> = {};
+      if (p.medicine_id) out.medicine_id = uuid(p.medicine_id, 'medicine_id');
+      const r = reasonText(p.reason, false);
+      if (r) out.reason = r;
       return out;
     }
     case 'BATCH_EXPIRY_UPDATE': {

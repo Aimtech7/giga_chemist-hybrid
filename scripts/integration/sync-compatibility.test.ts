@@ -474,7 +474,7 @@ async function run() {
     mockRpcHandler = (fn, body, res) => {
       if (fn === 'gc_check_compatibility') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ compatible: true, protocol_version: body.p_protocol_version, cloud_schema_version: 13 }));
+        res.end(JSON.stringify({ compatible: true, protocol_version: body.p_protocol_version, cloud_schema_version: 14 }));
       } else {
         res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({}));
       }
@@ -561,14 +561,14 @@ async function run() {
     mockRpcHandler = (fn, body, res) => {
       if (fn === 'gc_check_compatibility') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ compatible: true, protocol_version: 2, cloud_schema_version: 13 }));
+        res.end(JSON.stringify({ compatible: true, protocol_version: 2, cloud_schema_version: 14 }));
       } else {
         res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({}));
       }
     };
 
     const rCompatible = await runUpdaterCompat(shop1Env);
-    check(rCompatible.code === 0 && rCompatible.parsed?.ok === true, 'compatible cloud schema 13 & protocol 2 succeeds');
+    check(rCompatible.code === 0 && rCompatible.parsed?.ok === true, 'compatible cloud schema 14 & protocol 2 succeeds');
 
   } finally {
     // Clean up test events from local database

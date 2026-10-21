@@ -53,6 +53,11 @@
     "test:rejected-changes": "tsx scripts/integration/rejected-changes-and-zero-missed.test.ts",
     "test:medicine-delete-and-parity": "tsx scripts/integration/medicine-delete-and-parity.test.ts",
     "test:online-medicine-delete": "tsx scripts/integration/online-medicine-delete.test.ts",
+    "test:bidirectional-sync": "tsx scripts/integration/bidirectional-sync.test.ts",
+    "test:stock-override": "tsx scripts/integration/stock-override.test.ts",
+    "test:online-admin-parity": "tsx scripts/integration/online-admin-parity.test.ts",
+    "test:pwa-update": "tsx scripts/integration/pwa-update.test.ts",
+    "test:auth-client-consistency": "tsx scripts/integration/auth-client-consistency.test.ts",
     "updater:check": "node scripts/updater/updater.mjs check"
   },
   "dependencies": {
@@ -88,7 +93,7 @@
     "pngjs": "^7.0.0"
   },
   "sync_protocol_version": 2,
-  "required_cloud_schema_version": 13,
+  "required_cloud_schema_version": 14,
   "engines": {
     "node": ">=20.0.0"
   }

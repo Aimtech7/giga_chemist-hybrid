@@ -132,7 +132,7 @@ async function run() {
         status: (c: number) => { statusCode = c; return res; },
         json: (b: any) => { jsonBody = b; return res; },
       };
-      await handler(req, res);
+      await (handler as any)(req, res, () => {});
       return { statusCode, body: jsonBody };
     }
 

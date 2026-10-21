@@ -45,8 +45,12 @@ export type RemoteAction =
   | 'return-reject'
   | 'sale-void'
   | 'user-session-revoke'
-  // Cashier shifts (cloud migration 009)
-  | 'shift-review';
+  | 'shift-review'
+  | 'medicine-delete'
+  | 'stock-override-add'
+  | 'stock-override-remove'
+  | 'stock-override-set'
+  | 'stock-snapshot-request';
 
 /** Actions a Global Administrator may apply to ALL shops (one independent command per shop). */
 export const ALL_SHOPS_ACTIONS: RemoteAction[] = ['price-update', 'medicine-update', 'category', 'settings'];
@@ -249,6 +253,11 @@ export const COMMAND_LABELS: Record<string, string> = {
   USER_PROFILE_UPDATE: 'Staff profile (name / username / email)',
   SYNC_RETRY_FAILED: 'Re-send failed sync events',
   SHIFT_REVIEW: 'Review cashier shift',
+  MEDICINE_DELETE: 'Delete / archive medicine',
+  STOCK_OVERRIDE_ADD: 'Global Admin Override: Add stock',
+  STOCK_OVERRIDE_REMOVE: 'Global Admin Override: Remove stock',
+  STOCK_OVERRIDE_SET: 'Global Admin Override: Set physical count',
+  STOCK_SNAPSHOT_REQUEST: 'Refresh stock baseline from shop',
 };
 
 // ---------------------------------------------------------------- health, alerts, insights, security
