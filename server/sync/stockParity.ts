@@ -253,12 +253,12 @@ export async function runStockParityAudit(options?: {
       // Insert into local stock_parity_log
       await pgPool.query(
         `INSERT INTO stock_parity_log (
-           medicine_id, local_stock, cloud_stock, local_version, cloud_version,
-           local_fingerprint, cloud_fingerprint, status, reconciled, reason, checked_at
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP)`,
+           medicine_id, local_stock, cloud_stock, local_stock_version, cloud_stock_version,
+           local_fingerprint, cloud_fingerprint, outcome, reconciled, details, checked_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, CURRENT_TIMESTAMP)`,
         [
           medId, localStock, cloudStock, localVersion, cloudVersion,
-          localFp, cloudFp, 'PERSISTENT_MISMATCH', false, mismatchItem.reason,
+          localFp, cloudFp, 'PERSISTENT_MISMATCH', false, JSON.stringify({ reason: mismatchItem.reason }),
         ]
       );
 
@@ -273,7 +273,7 @@ export async function runStockParityAudit(options?: {
 
           await pgPool.query(
             `UPDATE stock_parity_log
-                SET reconciled = TRUE, status = 'RECONCILED', updated_at = CURRENT_TIMESTAMP
+                SET reconciled = TRUE, outcome = 'RECONCILED'
               WHERE medicine_id = $1 AND reconciled = FALSE`,
             [medId]
           );

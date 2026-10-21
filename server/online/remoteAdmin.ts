@@ -62,6 +62,10 @@ export const ACTIONS: Record<string, CommandType> = {
   'stock-add': 'STOCK_ADD',
   'stock-remove': 'STOCK_REMOVE',
   'stock-set': 'STOCK_SET',
+  'stock-override-add': 'STOCK_OVERRIDE_ADD',
+  'stock-override-remove': 'STOCK_OVERRIDE_REMOVE',
+  'stock-override-set': 'STOCK_OVERRIDE_SET',
+  'stock-snapshot-request': 'STOCK_SNAPSHOT_REQUEST',
   'price-update': 'PRICE_UPDATE',
   'medicine-update': 'MEDICINE_METADATA_UPDATE',
   'batch-expiry': 'BATCH_EXPIRY_UPDATE',
@@ -321,6 +325,22 @@ export function shopSupportsMedicineDelete(rt: any): { supported: boolean; reaso
   return { supported: true };
 }
 
+export function shopSupportsStockOverride(rt: any, type: CommandType): { supported: boolean; reason?: string } {
+  if (!rt) return { supported: true };
+  const capabilities = Array.isArray(rt.capabilities)
+    ? rt.capabilities
+    : (Array.isArray(rt.status?.capabilities) ? rt.status.capabilities : null);
+  if (capabilities && !capabilities.includes(type)) {
+    const commit = (rt.git_commit || rt.status?.git_commit || '').toLowerCase().trim();
+    const shortSha = commit ? commit.slice(0, 7) : 'unknown';
+    return {
+      supported: false,
+      reason: `SHOP UPDATE REQUIRED: Shop 1 is currently running commit ${shortSha}. To safely use ${type}, Shop 1 must install the current GIGA CHEMIST release.`,
+    };
+  }
+  return { supported: true };
+}
+
 export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
   const r = express.Router();
   const { requireAdmin, route } = deps;
@@ -412,6 +432,28 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
       }
       if ((payload.expected_current_stock || 0) > 0) {
         throw new HttpError(409, `Cannot delete medicine because it still has stock (${payload.expected_current_stock} units). Stock must be adjusted to 0 first through an auditable workflow.`, { code: 'MEDICINE_HAS_STOCK' });
+      }
+    }
+    const OVERRIDE_COMMANDS: CommandType[] = ['STOCK_OVERRIDE_ADD', 'STOCK_OVERRIDE_REMOVE', 'STOCK_OVERRIDE_SET', 'STOCK_SNAPSHOT_REQUEST'];
+    if (OVERRIDE_COMMANDS.includes(type)) {
+      if (!deps.isGlobalAdmin(u)) {
+        throw new HttpError(403, 'Forbidden: Global Administrator only.', { code: 'GLOBAL_ADMIN_ONLY' });
+      }
+      if (isAllShopsScope(req)) {
+        throw new HttpError(409, 'All Shops is a read-only view. Select one shop to change it.', { code: 'ALL_SHOPS_READ_ONLY' });
+      }
+      const rt = await runtimeRow(deps, shopId);
+      const cap = shopSupportsStockOverride(rt, type);
+      if (!cap.supported) {
+        throw new HttpError(409, cap.reason || 'Shop 1 must install the current GIGA CHEMIST release before Stock Override can be used.', { code: 'SHOP_UPDATE_REQUIRED' });
+      }
+      if (type !== 'STOCK_SNAPSHOT_REQUEST') {
+        const now = new Date();
+        const expiresAt = new Date(now.getTime() + 10 * 60 * 1000);
+        body.created_at = now.toISOString();
+        body.expires_at = expiresAt.toISOString();
+        payload.created_at = body.created_at;
+        payload.expires_at = body.expires_at;
       }
     }
     const online = await shopOnline(shopId);
@@ -856,6 +898,65 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
         rejected_events: events.map((x: any) => ({ id: Number(x.id), event_type: x.event_type, error: safeError(x.error), rejected_at: x.rejected_at, conflict: classifyConflict(x.event_type, x.error) })),
       };
     });
+  }));
+
+  /** Stock Conflicts Center: mismatch inspectability and Global Admin override actions */
+  r.get('/admin/sync/stock-conflicts', requireAdmin, route('GET /admin/sync/stock-conflicts', async (req) => {
+    const shopId = deps.shopId(req);
+    const rt = await runtimeRow(deps, shopId);
+    const st = rt?.status || {};
+    const mismatches = Array.isArray(st.inventory?.mismatches) ? st.inventory.mismatches : [];
+
+    const conflicts = await deps.withShopId(shopId, async (c) => {
+      const cloudMeds = (await c.query(`
+        SELECT id, name, current_stock, stock_version, stock_fingerprint, updated_at
+          FROM medicines
+         WHERE status <> 'archived'
+      `)).rows;
+      const cloudBatches = (await c.query(`
+        SELECT id, medicine_id, batch_number, quantity_available, stock_version, expiry_date, updated_at
+          FROM medicine_batches
+         WHERE status <> 'archived'
+      `)).rows;
+
+      const medMap = new Map<string, any>(cloudMeds.map((m: any) => [m.id, m]));
+      const batchMap = new Map<string, any[]>();
+      for (const b of cloudBatches) {
+        const arr = batchMap.get(b.medicine_id) || [];
+        arr.push(b);
+        batchMap.set(b.medicine_id, arr);
+      }
+
+      return mismatches.map((mm: any) => {
+        const cloudMed = medMap.get(mm.medicine_id);
+        const batches = batchMap.get(mm.medicine_id) || [];
+        const primaryBatch = batches[0];
+        const cloudQty = cloudMed ? Number(cloudMed.current_stock) : Number(mm.cloud_stock ?? 0);
+        const shopQty = Number(mm.local_stock ?? 0);
+        return {
+          medicine_id: mm.medicine_id,
+          medicine_name: mm.name || cloudMed?.name || 'Unknown',
+          batch_id: primaryBatch?.id || null,
+          batch_number: primaryBatch?.batch_number || null,
+          cloud_quantity: cloudQty,
+          shop_quantity: shopQty,
+          cloud_version: cloudMed ? Number(cloudMed.stock_version ?? 1) : Number(mm.cloud_stock_version ?? 1),
+          shop_version: Number(mm.local_stock_version ?? 1),
+          difference: shopQty - cloudQty,
+          last_local_change: mm.checked_at || null,
+          last_cloud_sync: rt?.last_sync_at || cloudMed?.updated_at || null,
+          details: mm.details || null,
+        };
+      });
+    });
+
+    return {
+      shop_id: shopId,
+      healthy: conflicts.length === 0,
+      stock_mismatch_count: conflicts.length,
+      last_checked: st.inventory?.stock_parity_checked_at || rt?.reported_at || null,
+      conflicts,
+    };
   }));
 
   /** Rejected Changes Center: Full list of rejected events with safe preview and clear category */

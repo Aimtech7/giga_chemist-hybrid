@@ -92,6 +92,9 @@ export const Row: React.FC<{ k: string; children: React.ReactNode }> = ({ k, chi
 export function describeResult(c: RemoteCommand): string | null {
   const r = c.result;
   if (!r) return null;
+  if ('local_before' in r && 'local_after' in r) {
+    return `${c.command_type}: shop stock ${r.local_before} → ${r.local_after}. Medicine total now ${r.medicine_total_after}.`;
+  }
   if ('previous_quantity' in r && 'new_quantity' in r) {
     const d = Number(r.delta);
     return `Batch ${r.batch_number ?? ''}: ${r.previous_quantity} → ${r.new_quantity} (${d > 0 ? '+' : ''}${d}). Medicine stock now ${r.current_stock}.`;
@@ -124,6 +127,10 @@ export function describeRequest(c: RemoteCommand): string {
   if (t === 'STOCK_ADD') what = `+${p.quantity}`;
   else if (t === 'STOCK_REMOVE') what = `-${p.quantity} (${p.reason})`;
   else if (t === 'STOCK_SET') what = `count = ${p.quantity}`;
+  else if (t === 'STOCK_OVERRIDE_ADD') what = `OVERRIDE +${p.quantity} (${p.reason || 'Admin override'})`;
+  else if (t === 'STOCK_OVERRIDE_REMOVE') what = `OVERRIDE -${p.quantity} (${p.reason || 'Admin override'})`;
+  else if (t === 'STOCK_OVERRIDE_SET') what = `OVERRIDE count = ${p.quantity} (${p.reason || 'Admin override'})`;
+  else if (t === 'STOCK_SNAPSHOT_REQUEST') what = 'SNAPSHOT baseline request';
   else if (t === 'PRICE_UPDATE') {
     const before = d.prices_before || {};
     what = ['selling_price', 'wholesale_price', 'min_selling_price', 'purchase_price'].filter((k) => k in p)

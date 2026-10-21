@@ -46,6 +46,8 @@ export interface CloudCommand {
   command_type: string;
   payload: any;
   idempotency_key: string;
+  created_at?: string | null;
+  expires_at?: string | null;
   created_by?: string | null;
   /**
    * USER_CREATE / USER_CREDENTIAL_REFRESH only: the password hash fetched for this one account just
@@ -306,6 +308,311 @@ const HANDLERS: Record<string, Handler> = {
       medicine_id: p.medicine_id, batch_id: m.batch_id, batch_number: m.batch_number, counted_quantity: p.quantity,
       previous_quantity: m.previous_quantity, new_quantity: m.new_quantity, delta: m.delta,
       current_stock: out.total_stock, movement_id: m.id,
+    };
+  },
+
+  // ---------------------------------------------------------------- Global Admin explicit stock override
+  async STOCK_OVERRIDE_ADD(client, cmd) {
+    const p = validateCommandPayload('STOCK_OVERRIDE_ADD', cmd.payload);
+    const actor = cloudActor(cmd);
+    const identity = await getShopIdentity();
+
+    let batch = p.batch_id ? await batchOfMedicine(client, p.batch_id, p.medicine_id) : null;
+    let localBefore = batch ? Number(batch.quantity_available) : 0;
+    const batchVersionBefore = (batch as any)?.stock_version ?? 1;
+
+    const out = await adminAddStockTx(client, {
+      ...actor,
+      medicine_id: p.medicine_id,
+      quantity: p.quantity,
+      batch_number: batch ? batch.batch_number : p.batch_number,
+      expiry_date: batch ? undefined : p.expiry_date,
+      notes: remoteNote(cmd, `OVERRIDE ADD: ${p.reason}`),
+    });
+
+    const batchId = out.batch.id;
+    const localAfter = Number(out.batch.quantity_available);
+    const batchVersionAfter = Number(out.batch.stock_version);
+
+    await recordAuditLog({
+      action: 'GLOBAL_ADMIN_STOCK_OVERRIDE',
+      entity: 'medicine',
+      entity_id: p.medicine_id,
+      user_id: actor.user_id || undefined,
+      user_name: actor.user_name || 'CLOUD',
+      role: 'ADMIN',
+      new_value: {
+        admin_user_id: (cmd as any).created_by_user_id || null,
+        admin_email: cmd.created_by || null,
+        shop_id: identity.shop_id,
+        medicine_id: p.medicine_id,
+        batch_id: batchId,
+        operation: 'ADD',
+        cloud_quantity_seen: p.cloud_quantity_seen ?? null,
+        local_quantity_before: localBefore,
+        requested_quantity: p.quantity,
+        local_quantity_after: localAfter,
+        stock_version_before: batchVersionBefore,
+        stock_version_after: batchVersionAfter,
+        reason: p.reason,
+        command_id: cmd.command_id,
+        timestamp: new Date().toISOString(),
+      },
+    }, client);
+
+    return {
+      medicine_id: p.medicine_id,
+      batch_id: batchId,
+      operation: 'ADD',
+      local_before: localBefore,
+      local_after: localAfter,
+      medicine_total_after: Number(out.medicine.current_stock),
+      stock_version: Number(out.medicine.stock_version),
+      applied_at: new Date().toISOString(),
+    };
+  },
+
+  async STOCK_OVERRIDE_REMOVE(client, cmd) {
+    const p = validateCommandPayload('STOCK_OVERRIDE_REMOVE', cmd.payload);
+    const actor = cloudActor(cmd);
+    const identity = await getShopIdentity();
+
+    const batch = await batchOfMedicine(client, p.batch_id, p.medicine_id);
+    const localBefore = Number(batch.quantity_available);
+    if (localBefore < p.quantity) {
+      throw new HttpError(409, `INSUFFICIENT_LOCAL_STOCK: Cannot remove ${p.quantity} units; local shop quantity is ${localBefore}. Result cannot be negative.`, {
+        code: 'INSUFFICIENT_LOCAL_STOCK',
+        local_quantity: localBefore,
+        requested: p.quantity,
+      });
+    }
+
+    const batchVersionBefore = (batch as any).stock_version ?? 1;
+
+    const out = await adminRemoveStockTx(client, {
+      ...actor,
+      medicine_id: p.medicine_id,
+      batch_id: p.batch_id,
+      quantity: p.quantity,
+      reason: 'Physical stock correction',
+      notes: remoteNote(cmd, `OVERRIDE REMOVE: ${p.reason}${p.notes ? ` - ${p.notes}` : ''}`),
+    });
+
+    const localAfter = Number(out.batch.quantity_available);
+    const batchVersionAfter = Number(out.batch.stock_version);
+
+    await recordAuditLog({
+      action: 'GLOBAL_ADMIN_STOCK_OVERRIDE',
+      entity: 'medicine',
+      entity_id: p.medicine_id,
+      user_id: actor.user_id || undefined,
+      user_name: actor.user_name || 'CLOUD',
+      role: 'ADMIN',
+      new_value: {
+        admin_user_id: (cmd as any).created_by_user_id || null,
+        admin_email: cmd.created_by || null,
+        shop_id: identity.shop_id,
+        medicine_id: p.medicine_id,
+        batch_id: p.batch_id,
+        operation: 'REMOVE',
+        cloud_quantity_seen: p.cloud_quantity_seen ?? null,
+        local_quantity_before: localBefore,
+        requested_quantity: p.quantity,
+        local_quantity_after: localAfter,
+        stock_version_before: batchVersionBefore,
+        stock_version_after: batchVersionAfter,
+        reason: p.reason,
+        command_id: cmd.command_id,
+        timestamp: new Date().toISOString(),
+      },
+    }, client);
+
+    return {
+      medicine_id: p.medicine_id,
+      batch_id: p.batch_id,
+      operation: 'REMOVE',
+      local_before: localBefore,
+      local_after: localAfter,
+      medicine_total_after: Number(out.medicine.current_stock),
+      stock_version: Number(out.medicine.stock_version),
+      applied_at: new Date().toISOString(),
+    };
+  },
+
+  async STOCK_OVERRIDE_SET(client, cmd) {
+    const p = validateCommandPayload('STOCK_OVERRIDE_SET', cmd.payload);
+    const actor = cloudActor(cmd);
+    const identity = await getShopIdentity();
+
+    let counts: Array<{ batch_id?: string; batch_number: string; quantity: number }> = [];
+    let primaryBatchId = p.batch_id;
+    let localBefore = 0;
+    let batchVersionBefore = 1;
+
+    if (Array.isArray(p.batch_counts) && p.batch_counts.length > 0) {
+      counts = p.batch_counts.map((b: any) => ({ batch_id: b.batch_id, batch_number: '', quantity: b.quantity }));
+      primaryBatchId = p.batch_counts[0].batch_id;
+    } else if (p.batch_id) {
+      const b = await batchOfMedicine(client, p.batch_id, p.medicine_id);
+      localBefore = Number(b.quantity_available);
+      batchVersionBefore = (b as any).stock_version ?? 1;
+      counts = [{ batch_id: p.batch_id, batch_number: b.batch_number, quantity: p.quantity }];
+    } else if (p.batch_number) {
+      const b = (await client.query('SELECT id, quantity_available, stock_version FROM medicine_batches WHERE medicine_id = $1 AND UPPER(batch_number) = $2 FOR UPDATE',
+        [p.medicine_id, p.batch_number])).rows[0];
+      localBefore = b ? Number(b.quantity_available) : 0;
+      batchVersionBefore = b ? Number(b.stock_version) : 1;
+      primaryBatchId = b?.id;
+      counts = [{ batch_number: p.batch_number, quantity: p.quantity }];
+    } else {
+      const activeBatches = (await client.query('SELECT id, batch_number, quantity_available, stock_version FROM medicine_batches WHERE medicine_id = $1 AND status = \'active\' FOR UPDATE', [p.medicine_id])).rows;
+      if (activeBatches.length === 1) {
+        primaryBatchId = activeBatches[0].id;
+        localBefore = Number(activeBatches[0].quantity_available);
+        batchVersionBefore = Number(activeBatches[0].stock_version);
+        counts = [{ batch_id: primaryBatchId, batch_number: activeBatches[0].batch_number, quantity: p.quantity }];
+      } else {
+        throw new HttpError(400, 'Medicine has multiple active batches. Use the Stock Reconciliation Wizard to enter per-batch counts.', { code: 'MULTIPLE_BATCHES_ALLOCATION_REQUIRED' });
+      }
+    }
+
+    const out = await adminPhysicalStockCountTx(client, {
+      ...actor,
+      medicine_id: p.medicine_id,
+      counts,
+      notes: remoteNote(cmd, `OVERRIDE SET: ${p.reason}`),
+    });
+
+    const m = out.movements[0] || { new_quantity: p.quantity, previous_quantity: localBefore };
+    const localAfter = Number(m.new_quantity);
+
+    await recordAuditLog({
+      action: 'GLOBAL_ADMIN_STOCK_OVERRIDE',
+      entity: 'medicine',
+      entity_id: p.medicine_id,
+      user_id: actor.user_id || undefined,
+      user_name: actor.user_name || 'CLOUD',
+      role: 'ADMIN',
+      new_value: {
+        admin_user_id: (cmd as any).created_by_user_id || null,
+        admin_email: cmd.created_by || null,
+        shop_id: identity.shop_id,
+        medicine_id: p.medicine_id,
+        batch_id: primaryBatchId || null,
+        operation: 'SET',
+        cloud_quantity_seen: p.cloud_quantity_seen ?? null,
+        local_quantity_before: localBefore,
+        requested_quantity: p.quantity,
+        local_quantity_after: localAfter,
+        stock_version_before: batchVersionBefore,
+        stock_version_after: Number(out.medicine?.stock_version ?? batchVersionBefore + 1),
+        reason: p.reason,
+        command_id: cmd.command_id,
+        timestamp: new Date().toISOString(),
+      },
+    }, client);
+
+    return {
+      medicine_id: p.medicine_id,
+      batch_id: primaryBatchId || null,
+      operation: 'SET',
+      local_before: localBefore,
+      local_after: localAfter,
+      medicine_total_after: Number(out.total_stock),
+      stock_version: Number(out.medicine?.stock_version ?? 1),
+      applied_at: new Date().toISOString(),
+    };
+  },
+
+  async STOCK_SNAPSHOT_REQUEST(client, cmd) {
+    const p = validateCommandPayload('STOCK_SNAPSHOT_REQUEST', cmd.payload);
+    const actor = cloudActor(cmd);
+    const identity = await getShopIdentity();
+
+    await recordAuditLog({
+      action: 'STOCK_SNAPSHOT_REQUESTED',
+      entity: 'medicine',
+      entity_id: p.medicine_id || identity.shop_id,
+      user_id: actor.user_id || undefined,
+      user_name: actor.user_name || 'CLOUD',
+      role: 'ADMIN',
+      new_value: {
+        command_id: cmd.command_id,
+        reason: p.reason || 'Snapshot requested by Global Admin',
+      },
+    }, client);
+
+    let baselineResult: any = null;
+    if (p.medicine_id) {
+      const locked = (await client.query('SELECT id, current_stock, stock_version, stock_fingerprint, name FROM medicines WHERE id = $1 FOR UPDATE', [p.medicine_id])).rows[0];
+      if (!locked) throw new HttpError(404, 'Medicine not found in this shop.');
+      const batches = (await client.query(
+        `SELECT id, medicine_id, batch_number, quantity_available, expiry_date, expiry_status, status, supplier_id,
+                purchase_price, selling_price_override, received_date, manufacturing_date, purchase_invoice, notes, created_by, stock_version
+           FROM medicine_batches WHERE medicine_id = $1 ORDER BY id`,
+        [p.medicine_id]
+      )).rows;
+      await enqueueSyncEvent(client, {
+        event_type: 'MEDICINE_BASELINE',
+        entity_type: 'medicine',
+        entity_id: p.medicine_id,
+        operation: 'RECONCILIATION',
+        data: async () => ({
+          medicine: await medicineJson(client, p.medicine_id),
+          batches,
+        }),
+        actor,
+        business_ref: 'STOCK_SNAPSHOT_PUBLISHED',
+      });
+      baselineResult = {
+        medicine_id: p.medicine_id,
+        current_stock: Number(locked.current_stock),
+        stock_version: Number(locked.stock_version),
+        stock_fingerprint: locked.stock_fingerprint,
+        batches_count: batches.length,
+      };
+    } else {
+      const meds = (await client.query('SELECT id FROM medicines WHERE status <> \'archived\'')).rows;
+      for (const m of meds) {
+        const batches = (await client.query(
+          `SELECT id, medicine_id, batch_number, quantity_available, expiry_date, expiry_status, status, supplier_id,
+                  purchase_price, selling_price_override, received_date, manufacturing_date, purchase_invoice, notes, created_by, stock_version
+             FROM medicine_batches WHERE medicine_id = $1 ORDER BY id`,
+          [m.id]
+        )).rows;
+        await enqueueSyncEvent(client, {
+          event_type: 'MEDICINE_BASELINE',
+          entity_type: 'medicine',
+          entity_id: m.id,
+          operation: 'RECONCILIATION',
+          data: async () => ({
+            medicine: await medicineJson(client, m.id),
+            batches,
+          }),
+          actor,
+          business_ref: 'STOCK_SNAPSHOT_PUBLISHED',
+        });
+      }
+      baselineResult = { published_medicines: meds.length };
+    }
+
+    await recordAuditLog({
+      action: 'STOCK_SNAPSHOT_PUBLISHED',
+      entity: 'medicine',
+      entity_id: p.medicine_id || identity.shop_id,
+      user_id: actor.user_id || undefined,
+      user_name: actor.user_name || 'CLOUD',
+      role: 'ADMIN',
+      new_value: {
+        command_id: cmd.command_id,
+        ...baselineResult,
+      },
+    }, client);
+
+    return {
+      published: true,
+      ...baselineResult,
+      applied_at: new Date().toISOString(),
     };
   },
 
@@ -680,6 +987,25 @@ export async function applyCloudCommand(cmd: CloudCommand): Promise<CommandOutco
     try {
       if (String(cmd.shop_id || '').toLowerCase() !== identity.shop_id.toLowerCase()) {
         throw new HttpError(403, 'Command is addressed to a different shop.');
+      }
+      if (['STOCK_OVERRIDE_ADD', 'STOCK_OVERRIDE_REMOVE', 'STOCK_OVERRIDE_SET'].includes(cmd.command_type)) {
+        const now = Date.now();
+        let expired = false;
+        const expiresAt = cmd.payload?.expires_at || cmd.expires_at;
+        const createdAt = cmd.payload?.created_at || cmd.created_at;
+        if (expiresAt) {
+          const exp = new Date(expiresAt).getTime();
+          if (!Number.isNaN(exp) && now > exp) expired = true;
+        }
+        if (!expired && createdAt) {
+          const created = new Date(createdAt).getTime();
+          if (!Number.isNaN(created) && now - created > 10 * 60 * 1000) expired = true;
+        }
+        if (expired) {
+          throw new HttpError(409, 'STOCK_OVERRIDE_EXPIRED: The stock override command has expired (>10 minutes). Refresh stock from shop and try again.', {
+            code: 'STOCK_OVERRIDE_EXPIRED',
+          });
+        }
       }
       const handler = HANDLERS[cmd.command_type];
       if (!handler) throw new HttpError(400, `Unsupported command type "${cmd.command_type}".`);

@@ -1958,7 +1958,11 @@ var HIGH_CONFLICT_TYPES = [
   "PURCHASE_RECEIVE",
   "RETURN_APPROVE",
   "SALE_VOID",
-  "MEDICINE_DELETE"
+  "MEDICINE_DELETE",
+  "STOCK_OVERRIDE_ADD",
+  "STOCK_OVERRIDE_REMOVE",
+  "STOCK_OVERRIDE_SET",
+  "STOCK_SNAPSHOT_REQUEST"
 ];
 var ALL_SHOPS_TYPES = ["PRICE_UPDATE", "MEDICINE_METADATA_UPDATE", "CATEGORY_UPSERT", "SETTINGS_UPDATE"];
 var STOCK_REMOVE_REASONS = ["Damaged", "Expired", "Lost", "Physical stock correction", "Other"];
@@ -2268,6 +2272,80 @@ function validateCommandPayload(type, payload) {
       };
       if (p.batch_id) out.batch_id = uuid(p.batch_id, "batch_id");
       else out.batch_number = batchNumber(p.batch_number);
+      return out;
+    }
+    case "STOCK_OVERRIDE_ADD": {
+      onlyKeys(p, ["medicine_id", "batch_id", "batch_number", "expiry_date", "purchase_price", "quantity", "reason", "cloud_quantity_seen", "created_at", "expires_at"], "STOCK_OVERRIDE_ADD");
+      const out = {
+        medicine_id: uuid(p.medicine_id, "medicine_id"),
+        quantity: wholeNumber(p.quantity, "quantity", 1),
+        reason: reasonText(p.reason, true)
+      };
+      if (p.batch_id !== void 0 && p.batch_id !== null && p.batch_id !== "") {
+        if (p.batch_number || p.expiry_date) throw new HttpError(400, "Give either batch_id (existing batch) or batch_number + expiry_date (new batch), not both.");
+        out.batch_id = uuid(p.batch_id, "batch_id");
+      } else {
+        out.batch_number = batchNumber(p.batch_number);
+        out.expiry_date = date(p.expiry_date);
+        if (p.purchase_price !== void 0 && p.purchase_price !== null && p.purchase_price !== "") {
+          out.purchase_price = money(p.purchase_price, "purchase_price", false);
+        }
+      }
+      if (p.cloud_quantity_seen !== void 0 && p.cloud_quantity_seen !== null && p.cloud_quantity_seen !== "") {
+        out.cloud_quantity_seen = wholeNumber(p.cloud_quantity_seen, "cloud_quantity_seen", 0);
+      }
+      if (typeof p.created_at === "string") out.created_at = p.created_at;
+      if (typeof p.expires_at === "string") out.expires_at = p.expires_at;
+      return out;
+    }
+    case "STOCK_OVERRIDE_REMOVE": {
+      onlyKeys(p, ["medicine_id", "batch_id", "quantity", "reason", "notes", "cloud_quantity_seen", "created_at", "expires_at"], "STOCK_OVERRIDE_REMOVE");
+      const out = {
+        medicine_id: uuid(p.medicine_id, "medicine_id"),
+        batch_id: uuid(p.batch_id, "batch_id"),
+        quantity: wholeNumber(p.quantity, "quantity", 1),
+        reason: reasonText(p.reason, true)
+      };
+      if (p.notes !== void 0) out.notes = text(p.notes, "notes", { clearable: true });
+      if (p.cloud_quantity_seen !== void 0 && p.cloud_quantity_seen !== null && p.cloud_quantity_seen !== "") {
+        out.cloud_quantity_seen = wholeNumber(p.cloud_quantity_seen, "cloud_quantity_seen", 0);
+      }
+      if (typeof p.created_at === "string") out.created_at = p.created_at;
+      if (typeof p.expires_at === "string") out.expires_at = p.expires_at;
+      return out;
+    }
+    case "STOCK_OVERRIDE_SET": {
+      onlyKeys(p, ["medicine_id", "batch_id", "batch_number", "quantity", "reason", "cloud_quantity_seen", "batch_counts", "created_at", "expires_at"], "STOCK_OVERRIDE_SET");
+      const out = {
+        medicine_id: uuid(p.medicine_id, "medicine_id"),
+        quantity: wholeNumber(p.quantity ?? 0, "quantity", 0),
+        reason: reasonText(p.reason, true)
+      };
+      if (p.batch_id) out.batch_id = uuid(p.batch_id, "batch_id");
+      else if (p.batch_number) out.batch_number = batchNumber(p.batch_number);
+      if (Array.isArray(p.batch_counts)) {
+        out.batch_counts = p.batch_counts.map((b, idx) => {
+          const item = obj(b);
+          onlyKeys(item, ["batch_id", "quantity"], `batch_counts[${idx}]`);
+          return {
+            batch_id: uuid(item.batch_id, `batch_counts[${idx}].batch_id`),
+            quantity: wholeNumber(item.quantity, `batch_counts[${idx}].quantity`, 0)
+          };
+        });
+      }
+      if (p.cloud_quantity_seen !== void 0 && p.cloud_quantity_seen !== null && p.cloud_quantity_seen !== "") {
+        out.cloud_quantity_seen = wholeNumber(p.cloud_quantity_seen, "cloud_quantity_seen", 0);
+      }
+      if (typeof p.created_at === "string") out.created_at = p.created_at;
+      if (typeof p.expires_at === "string") out.expires_at = p.expires_at;
+      return out;
+    }
+    case "STOCK_SNAPSHOT_REQUEST": {
+      onlyKeys(p, ["medicine_id", "reason"], "STOCK_SNAPSHOT_REQUEST");
+      const out = {};
+      if (p.medicine_id) out.medicine_id = uuid(p.medicine_id, "medicine_id");
+      const r = reasonText(p.reason, false);
+      if (r) out.reason = r;
       return out;
     }
     case "BATCH_EXPIRY_UPDATE": {
@@ -2593,6 +2671,10 @@ var ACTIONS = {
   "stock-add": "STOCK_ADD",
   "stock-remove": "STOCK_REMOVE",
   "stock-set": "STOCK_SET",
+  "stock-override-add": "STOCK_OVERRIDE_ADD",
+  "stock-override-remove": "STOCK_OVERRIDE_REMOVE",
+  "stock-override-set": "STOCK_OVERRIDE_SET",
+  "stock-snapshot-request": "STOCK_SNAPSHOT_REQUEST",
   "price-update": "PRICE_UPDATE",
   "medicine-update": "MEDICINE_METADATA_UPDATE",
   "batch-expiry": "BATCH_EXPIRY_UPDATE",
@@ -2833,6 +2915,19 @@ function shopSupportsMedicineDelete(rt) {
   }
   return { supported: true };
 }
+function shopSupportsStockOverride(rt, type) {
+  if (!rt) return { supported: true };
+  const capabilities = Array.isArray(rt.capabilities) ? rt.capabilities : Array.isArray(rt.status?.capabilities) ? rt.status.capabilities : null;
+  if (capabilities && !capabilities.includes(type)) {
+    const commit = (rt.git_commit || rt.status?.git_commit || "").toLowerCase().trim();
+    const shortSha = commit ? commit.slice(0, 7) : "unknown";
+    return {
+      supported: false,
+      reason: `SHOP UPDATE REQUIRED: Shop 1 is currently running commit ${shortSha}. To safely use ${type}, Shop 1 must install the current GIGA CHEMIST release.`
+    };
+  }
+  return { supported: true };
+}
 function buildRemoteAdminRouter(deps) {
   const r = express2.Router();
   const { requireAdmin: requireAdmin2, route: route2 } = deps;
@@ -2917,6 +3012,28 @@ function buildRemoteAdminRouter(deps) {
       }
       if ((payload.expected_current_stock || 0) > 0) {
         throw new HttpError(409, `Cannot delete medicine because it still has stock (${payload.expected_current_stock} units). Stock must be adjusted to 0 first through an auditable workflow.`, { code: "MEDICINE_HAS_STOCK" });
+      }
+    }
+    const OVERRIDE_COMMANDS = ["STOCK_OVERRIDE_ADD", "STOCK_OVERRIDE_REMOVE", "STOCK_OVERRIDE_SET", "STOCK_SNAPSHOT_REQUEST"];
+    if (OVERRIDE_COMMANDS.includes(type)) {
+      if (!deps.isGlobalAdmin(u)) {
+        throw new HttpError(403, "Forbidden: Global Administrator only.", { code: "GLOBAL_ADMIN_ONLY" });
+      }
+      if (isAllShopsScope(req)) {
+        throw new HttpError(409, "All Shops is a read-only view. Select one shop to change it.", { code: "ALL_SHOPS_READ_ONLY" });
+      }
+      const rt = await runtimeRow(deps, shopId);
+      const cap = shopSupportsStockOverride(rt, type);
+      if (!cap.supported) {
+        throw new HttpError(409, cap.reason || "Shop 1 must install the current GIGA CHEMIST release before Stock Override can be used.", { code: "SHOP_UPDATE_REQUIRED" });
+      }
+      if (type !== "STOCK_SNAPSHOT_REQUEST") {
+        const now = /* @__PURE__ */ new Date();
+        const expiresAt = new Date(now.getTime() + 10 * 60 * 1e3);
+        body.created_at = now.toISOString();
+        body.expires_at = expiresAt.toISOString();
+        payload.created_at = body.created_at;
+        payload.expires_at = body.expires_at;
       }
     }
     const online = await shopOnline(shopId);
@@ -3348,6 +3465,59 @@ function buildRemoteAdminRouter(deps) {
         rejected_events: events.map((x) => ({ id: Number(x.id), event_type: x.event_type, error: safeError(x.error), rejected_at: x.rejected_at, conflict: classifyConflict(x.event_type, x.error) }))
       };
     });
+  }));
+  r.get("/admin/sync/stock-conflicts", requireAdmin2, route2("GET /admin/sync/stock-conflicts", async (req) => {
+    const shopId = deps.shopId(req);
+    const rt = await runtimeRow(deps, shopId);
+    const st = rt?.status || {};
+    const mismatches = Array.isArray(st.inventory?.mismatches) ? st.inventory.mismatches : [];
+    const conflicts = await deps.withShopId(shopId, async (c) => {
+      const cloudMeds = (await c.query(`
+        SELECT id, name, current_stock, stock_version, stock_fingerprint, updated_at
+          FROM medicines
+         WHERE status <> 'archived'
+      `)).rows;
+      const cloudBatches = (await c.query(`
+        SELECT id, medicine_id, batch_number, quantity_available, stock_version, expiry_date, updated_at
+          FROM medicine_batches
+         WHERE status <> 'archived'
+      `)).rows;
+      const medMap = new Map(cloudMeds.map((m) => [m.id, m]));
+      const batchMap = /* @__PURE__ */ new Map();
+      for (const b of cloudBatches) {
+        const arr = batchMap.get(b.medicine_id) || [];
+        arr.push(b);
+        batchMap.set(b.medicine_id, arr);
+      }
+      return mismatches.map((mm) => {
+        const cloudMed = medMap.get(mm.medicine_id);
+        const batches = batchMap.get(mm.medicine_id) || [];
+        const primaryBatch = batches[0];
+        const cloudQty = cloudMed ? Number(cloudMed.current_stock) : Number(mm.cloud_stock ?? 0);
+        const shopQty = Number(mm.local_stock ?? 0);
+        return {
+          medicine_id: mm.medicine_id,
+          medicine_name: mm.name || cloudMed?.name || "Unknown",
+          batch_id: primaryBatch?.id || null,
+          batch_number: primaryBatch?.batch_number || null,
+          cloud_quantity: cloudQty,
+          shop_quantity: shopQty,
+          cloud_version: cloudMed ? Number(cloudMed.stock_version ?? 1) : Number(mm.cloud_stock_version ?? 1),
+          shop_version: Number(mm.local_stock_version ?? 1),
+          difference: shopQty - cloudQty,
+          last_local_change: mm.checked_at || null,
+          last_cloud_sync: rt?.last_sync_at || cloudMed?.updated_at || null,
+          details: mm.details || null
+        };
+      });
+    });
+    return {
+      shop_id: shopId,
+      healthy: conflicts.length === 0,
+      stock_mismatch_count: conflicts.length,
+      last_checked: st.inventory?.stock_parity_checked_at || rt?.reported_at || null,
+      conflicts
+    };
   }));
   r.get("/admin/sync/rejected-changes", requireAdmin2, route2("GET /admin/sync/rejected-changes", async (req) => {
     const global = deps.isGlobalAdmin(req.onlineUser);

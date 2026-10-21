@@ -25,6 +25,7 @@ import { canViewCostData, isCashier } from '../../services/permissions';
 import { CATALOG_REFRESHED_EVENT, isCatalogForCurrentShop } from '../../services/syncEngine';
 import { CatalogStatusBanner } from '../common/CatalogStatusBanner';
 import { DeleteMedicineModal } from '../medicines/DeleteMedicineModal';
+import { apiFetch } from '../../services/http';
 import type { Category, Medicine, PharmacySettings, User } from '../../types';
 
 interface MedicineListProps {
@@ -412,12 +413,7 @@ export const MedicineList: React.FC<MedicineListProps> = ({ currentUser, setting
                                   onClick={async () => {
                                     if (!window.confirm(`Restore archived medicine "${m.name}" to active status?`)) return;
                                     try {
-                                      const token = localStorage.getItem('token') || sessionStorage.getItem('token') || '';
-                                      const res = await fetch(`/api/medicines/${m.id}/restore`, {
-                                        method: 'POST',
-                                        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-                                      });
-                                      if (!res.ok) throw new Error('Failed to restore medicine.');
+                                      await apiFetch(`/api/medicines/${m.id}/restore`, { method: 'POST' });
                                       await db.medicines.update(m.id, { status: 'active' });
                                       await loadMedicines();
                                     } catch (err: any) {

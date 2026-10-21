@@ -1,6 +1,7 @@
-import React, { useState, useEffect } from 'react';
-import { AlertTriangle, Trash2, Archive, X, CheckCircle, ShieldAlert, Loader2 } from 'lucide-react';
+import React, { useState, useEffect, useCallback } from 'react';
+import { AlertTriangle, Trash2, Archive, X, ShieldAlert, Loader2, RotateCcw } from 'lucide-react';
 import type { Medicine } from '../../types';
+import { apiFetch } from '../../services/http';
 
 export interface DeletePreviewData {
   medicine: {
@@ -58,6 +59,26 @@ export const DeleteMedicineModal: React.FC<DeleteMedicineModalProps> = ({
   const [confirmInput, setConfirmInput] = useState('');
   const [reason, setReason] = useState('');
 
+  const fetchPreview = useCallback(async () => {
+    if (!medicine) return;
+    setLoading(true);
+    setError(null);
+
+    try {
+      const url = isRemote && shopId
+        ? `/api/admin/medicines/${medicine.id}/delete-preview?shop_id=${shopId}`
+        : `/api/medicines/${medicine.id}/delete-preview`;
+
+      const data = await apiFetch<DeletePreviewData>(url);
+      setPreview(data);
+    } catch (err: any) {
+      setPreview(null);
+      setError(err?.message || 'DELETION ELIGIBILITY COULD NOT BE DETERMINED');
+    } finally {
+      setLoading(false);
+    }
+  }, [medicine, isRemote, shopId]);
+
   useEffect(() => {
     if (!isOpen || !medicine) {
       setPreview(null);
@@ -67,44 +88,8 @@ export const DeleteMedicineModal: React.FC<DeleteMedicineModalProps> = ({
       return;
     }
 
-    let isMounted = true;
-    setLoading(true);
-    setError(null);
-
-    const fetchPreview = async () => {
-      try {
-        const token = localStorage.getItem('token') || sessionStorage.getItem('token') || '';
-        const url = isRemote && shopId
-          ? `/api/admin/medicines/${medicine.id}/delete-preview?shop_id=${shopId}`
-          : `/api/medicines/${medicine.id}/delete-preview`;
-
-        const res = await fetch(url, {
-          headers: {
-            Authorization: `Bearer ${token}`,
-            'Content-Type': 'application/json',
-            ...(isRemote && shopId ? { 'X-GIGA-SHOP-ID': shopId } : {}),
-          },
-        });
-
-        if (!res.ok) {
-          const body = await res.json().catch(() => ({}));
-          throw new Error(body.error || 'Failed to load deletion preview.');
-        }
-
-        const data: DeletePreviewData = await res.json();
-        if (isMounted) setPreview(data);
-      } catch (err: any) {
-        if (isMounted) setError(err.message || 'Error fetching preview.');
-      } finally {
-        if (isMounted) setLoading(false);
-      }
-    };
-
-    fetchPreview();
-    return () => {
-      isMounted = false;
-    };
-  }, [isOpen, medicine, isRemote, shopId]);
+    void fetchPreview();
+  }, [isOpen, medicine, fetchPreview]);
 
   if (!isOpen || !medicine) return null;
 
@@ -113,62 +98,52 @@ export const DeleteMedicineModal: React.FC<DeleteMedicineModalProps> = ({
   const isConfirmValid = isPermanent
     ? confirmInput.trim().toUpperCase() === 'DELETE' || confirmInput.trim() === medicine.name.trim()
     : true;
-  const canSubmit = preview && !hasStock && !preview.has_pending_sync && !preview.shop_update_required && isConfirmValid && !submitting;
+  const canSubmit = Boolean(
+    preview &&
+    !hasStock &&
+    !preview.has_pending_sync &&
+    !preview.shop_update_required &&
+    isConfirmValid &&
+    !submitting
+  );
 
   const handleDelete = async () => {
-    if (!canSubmit) return;
+    if (!canSubmit || !preview) return;
     setSubmitting(true);
     setError(null);
 
     try {
-      const token = localStorage.getItem('token') || sessionStorage.getItem('token') || '';
-      let res: Response;
-
+      let data: any;
       if (isRemote && shopId) {
-        res = await fetch(`/api/admin/commands/medicine-delete`, {
+        data = await apiFetch('/api/admin/commands/medicine-delete', {
           method: 'POST',
-          headers: {
-            Authorization: `Bearer ${token}`,
-            'Content-Type': 'application/json',
-            'X-GIGA-SHOP-ID': shopId,
-          },
-          body: JSON.stringify({
+          body: {
             medicine_id: medicine.id,
             expected_version: preview.medicine.version,
             expected_status: preview.medicine.status,
             expected_current_stock: preview.medicine.current_stock,
             reason: reason.trim() || undefined,
-          }),
+          },
         });
       } else {
-        res = await fetch(`/api/medicines/${medicine.id}`, {
+        data = await apiFetch(`/api/medicines/${medicine.id}`, {
           method: 'DELETE',
-          headers: {
-            Authorization: `Bearer ${token}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
+          body: {
             expected_version: preview.medicine.version,
             expected_status: preview.medicine.status,
             expected_current_stock: preview.medicine.current_stock,
             reason: reason.trim() || undefined,
-          }),
+          },
         });
       }
 
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(body.error || 'Failed to execute medicine deletion.');
-      }
-
-      const data = await res.json();
       onDeleted({
         action: data.action || (isPermanent ? 'DELETED' : 'ARCHIVED'),
         reason: data.reason || 'Completed successfully',
       });
       onClose();
     } catch (err: any) {
-      setError(err.message || 'Delete operation failed.');
+      setError(err?.message || 'Delete operation failed.');
     } finally {
       setSubmitting(false);
     }
@@ -180,8 +155,20 @@ export const DeleteMedicineModal: React.FC<DeleteMedicineModalProps> = ({
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-slate-100 bg-slate-50">
           <div className="flex items-center gap-2.5">
-            <div className={`p-2 rounded-lg ${isPermanent ? 'bg-rose-100 text-rose-700' : 'bg-amber-100 text-amber-700'}`}>
-              {isPermanent ? <Trash2 className="w-5 h-5" /> : <Archive className="w-5 h-5" />}
+            <div className={`p-2 rounded-lg ${
+              preview?.outcome === 'PERMANENT_DELETE'
+                ? 'bg-rose-100 text-rose-700'
+                : preview?.outcome === 'ARCHIVE_REQUIRED'
+                  ? 'bg-amber-100 text-amber-700'
+                  : 'bg-slate-100 text-slate-700'
+            }`}>
+              {preview?.outcome === 'PERMANENT_DELETE' ? (
+                <Trash2 className="w-5 h-5" />
+              ) : preview?.outcome === 'ARCHIVE_REQUIRED' ? (
+                <Archive className="w-5 h-5" />
+              ) : (
+                <ShieldAlert className="w-5 h-5 text-slate-500" />
+              )}
             </div>
             <div>
               <h3 className="font-bold text-slate-900 text-base">Delete Medicine</h3>
@@ -206,9 +193,24 @@ export const DeleteMedicineModal: React.FC<DeleteMedicineModalProps> = ({
           ) : (
             <>
               {error && (
-                <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl flex items-start gap-2.5 text-rose-800 text-xs">
-                  <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-rose-600" />
-                  <div>{error}</div>
+                <div className="p-4 bg-rose-50 border border-rose-300 rounded-xl space-y-2 text-rose-900 text-xs">
+                  <div className="flex items-center gap-2 font-bold uppercase tracking-wider text-[11px] text-rose-800">
+                    <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+                    DELETION ELIGIBILITY COULD NOT BE DETERMINED
+                  </div>
+                  <p className="text-xs text-rose-700">
+                    {error}
+                  </p>
+                  <div>
+                    <button
+                      type="button"
+                      onClick={() => void fetchPreview()}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-rose-700 hover:bg-rose-800 text-white font-medium text-xs transition cursor-pointer"
+                    >
+                      <RotateCcw className="w-3.5 h-3.5" />
+                      Retry Preview
+                    </button>
+                  </div>
                 </div>
               )}
 
@@ -385,13 +387,19 @@ export const DeleteMedicineModal: React.FC<DeleteMedicineModalProps> = ({
             onClick={handleDelete}
             disabled={!canSubmit}
             className={`px-4 py-2 rounded-lg text-xs font-semibold text-white transition cursor-pointer flex items-center gap-1.5 ${
-              isPermanent
-                ? 'bg-rose-600 hover:bg-rose-700 disabled:bg-rose-300'
-                : 'bg-amber-600 hover:bg-amber-700 disabled:bg-amber-300'
+              !preview
+                ? 'bg-slate-300 cursor-not-allowed disabled:opacity-50'
+                : isPermanent
+                  ? 'bg-rose-600 hover:bg-rose-700 disabled:bg-rose-300'
+                  : 'bg-amber-600 hover:bg-amber-700 disabled:bg-amber-300'
             }`}
           >
             {submitting && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
-            {isPermanent ? 'Permanently Delete' : 'Archive Medicine'}
+            {preview?.outcome === 'PERMANENT_DELETE'
+              ? 'Permanently Delete'
+              : preview?.outcome === 'ARCHIVE_REQUIRED'
+                ? 'Archive Medicine'
+                : 'Delete Medicine'}
           </button>
         </div>
       </div>

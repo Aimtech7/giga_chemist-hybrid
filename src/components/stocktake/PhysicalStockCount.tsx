@@ -19,7 +19,6 @@ import {
   FileSpreadsheet,
 } from 'lucide-react';
 import { db, getDeviceId } from '../../db/dexie';
-import { getAuthHeaders } from '../../services/auth';
 import { apiUrl } from '../../services/api';
 import { applyServerStockResult, refreshCacheAfterCommit } from '../../services/stockCache';
 import { MedicineSelector } from '../common/MedicineSelector';

@@ -29,6 +29,7 @@ import {
   History,
 } from 'lucide-react';
 import { PWAInstallButton } from '../common/PWAInstallButton';
+import { BuildIdentityAndPwaUpdate } from '../common/BuildIdentityAndPwaUpdate';
 import { ChangePasswordModal } from '../users/ChangePasswordModal';
 import { refreshNetworkStatus } from '../../services/network';
 import { refreshCloudSyncStatus } from '../../services/cloudSync';
@@ -354,6 +355,9 @@ export const AppShell: React.FC<AppShellProps> = ({
           <div className="p-2 border-t border-slate-800 text-[10px] text-slate-500 truncate font-mono">
             {device?.id ? `Terminal: ${device.id}` : 'Station 01'}
           </div>
+
+          {/* Build Identity & PWA Update */}
+          <BuildIdentityAndPwaUpdate />
         </aside>
 
         {/* Content Outlet */}

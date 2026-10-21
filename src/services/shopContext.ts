@@ -49,11 +49,50 @@ const currentUserId = () => getCachedUser()?.id || null;
 export function setOnlineAccount(account: OnlineAccount | null | undefined): void {
   write(ACCOUNT_KEY, account ? { ...account, user_id: currentUserId() } : null);
 }
+
 export function getOnlineAccount(): OnlineAccount | null {
   const a = read<OnlineAccount & { user_id: string | null }>(ACCOUNT_KEY);
-  return a && a.user_id === currentUserId() ? a : null;
+  if (a && a.user_id === currentUserId()) return a;
+
+  // Resilient fallback: Decode server JWT payload if cached storage key is missing or desynced
+  try {
+    const rawToken = localStorage.getItem('giga_chemist_auth_token');
+    if (rawToken) {
+      const parts = rawToken.split('.');
+      if (parts.length === 3) {
+        const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')));
+        if (payload?.account_type === 'GLOBAL_ADMIN' || (payload?.role === 'ADMIN' && !payload?.shop_id)) {
+          const synthesized: OnlineAccount = {
+            type: 'GLOBAL_ADMIN',
+            shop_id: null,
+            local_user_id: payload.local_user_id ?? null,
+            username: payload.username ?? null,
+          };
+          write(ACCOUNT_KEY, { ...synthesized, user_id: currentUserId() });
+          return synthesized;
+        }
+      }
+    }
+  } catch {}
+
+  const user = getCachedUser();
+  if (user && user.role === 'ADMIN' && !(user as any).shop_id) {
+    return {
+      type: 'GLOBAL_ADMIN',
+      shop_id: null,
+      local_user_id: user.id,
+      username: (user as any).username || null,
+    };
+  }
+  return null;
 }
-export const isGlobalAdminAccount = () => getOnlineAccount()?.type === 'GLOBAL_ADMIN';
+
+export const isGlobalAdminAccount = (): boolean => {
+  const acc = getOnlineAccount();
+  if (acc?.type === 'GLOBAL_ADMIN') return true;
+  const user = getCachedUser();
+  return Boolean(user && user.role === 'ADMIN' && !(user as any).shop_id);
+};
 
 // ---------------------------------------------------------------- "All Shops" (Global Admin, read-only)
 const SCOPE_KEY = 'giga_online_scope';
