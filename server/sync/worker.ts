@@ -535,6 +535,34 @@ export async function getSyncStatus() {
     `SELECT event_type, last_error, last_attempt_at FROM sync_events
       WHERE status IN ('PENDING', 'FAILED') AND last_error IS NOT NULL ORDER BY last_attempt_at DESC NULLS LAST LIMIT 1`
   );
+  const lastErrorResolved = Boolean(
+    st.last_error && st.last_contact_at && st.last_error_at &&
+    new Date(st.last_contact_at).getTime() >= new Date(st.last_error_at).getTime()
+  );
+
+  const consecutiveFailures = syncWorker.status().consecutive_failures;
+  let current_cloud_state: 'HEALTHY' | 'DEGRADED' | 'OFFLINE';
+  if (!cfg.cloudConfigured || syncWorker.cloudReachable === false || consecutiveFailures >= 3) {
+    current_cloud_state = 'OFFLINE';
+  } else if (st.last_contact_at) {
+    const contactAgeSec = (Date.now() - new Date(st.last_contact_at).getTime()) / 1000;
+    if (contactAgeSec > 180) {
+      current_cloud_state = 'OFFLINE';
+    } else if (consecutiveFailures > 0) {
+      current_cloud_state = 'DEGRADED';
+    } else if (!lastErrorResolved && st.last_error_at && (Date.now() - new Date(st.last_error_at).getTime()) / 1000 < 600) {
+      current_cloud_state = 'DEGRADED';
+    } else {
+      current_cloud_state = 'HEALTHY';
+    }
+  } else if (consecutiveFailures === 0 && syncWorker.cloudReachable === true) {
+    current_cloud_state = 'HEALTHY';
+  } else {
+    current_cloud_state = 'DEGRADED';
+  }
+
+  const lastBusinessUploadAt = c.last_synced_event_at ? new Date(c.last_synced_event_at).toISOString() : null;
+
   return {
     ...base,
     shop_id: identity.shop_id,
@@ -549,10 +577,16 @@ export async function getSyncStatus() {
       oldest_pending_at: c.oldest_pending_at ? new Date(c.oldest_pending_at).toISOString() : null,
     },
     inbound_commands: inbound.rows[0],
-    last_sync: st.last_success_at || (c.last_synced_event_at ? new Date(c.last_synced_event_at).toISOString() : null),
+    current_cloud_state,
+    consecutive_failures: consecutiveFailures,
+    last_sync: st.last_success_at || lastBusinessUploadAt,
     last_contact: st.last_contact_at || null,
+    last_contact_at: st.last_contact_at || null,
+    last_success_at: st.last_success_at || null,
+    last_business_upload_at: lastBusinessUploadAt,
     last_error: st.last_error || null,
     last_error_at: st.last_error_at || null,
+    last_error_resolved: lastErrorResolved,
     last_event_error: lastErrorRow.rows[0]
       ? { event_type: lastErrorRow.rows[0].event_type, error: lastErrorRow.rows[0].last_error, at: lastErrorRow.rows[0].last_attempt_at }
       : null,

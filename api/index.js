@@ -1157,31 +1157,29 @@ var SALE_COLUMNS = `
 async function hydrateSales(q, rows) {
   if (rows.length === 0) return [];
   const ids = rows.map((r) => r.id);
-  const [items, payments, returned] = await Promise.all([
-    q.query(
-      `SELECT si.id, si.sale_id, si.medicine_id, m.name AS medicine_name, m.generic_name,
-              si.batch_id, si.batch_number, si.expiry_date,
-              si.quantity::int AS quantity, si.unit_price::float AS unit_price, COALESCE(si.discount, 0)::float AS discount,
-              si.cost_price_snapshot::float AS cost_price_snapshot, si.total::float AS total, si.price_mode
-       FROM sale_items si LEFT JOIN medicines m ON si.medicine_id = m.id
-       WHERE si.sale_id = ANY($1::uuid[])
-       ORDER BY si.created_at, si.id`,
-      [ids]
-    ),
-    q.query(
-      `SELECT sale_id, method, amount::float AS amount, reference FROM payments
-       WHERE sale_id = ANY($1::uuid[]) ORDER BY created_at, id`,
-      [ids]
-    ),
-    q.query(
-      `SELECT sale_id, medicine_id, batch_id,
-              COALESCE(SUM(approved_quantity) FILTER (WHERE status = 'APPROVED'), 0)::int AS qty,
-              COALESCE(SUM(quantity) FILTER (WHERE status = 'PENDING'), 0)::int AS pending,
-              COALESCE(SUM(refund_amount) FILTER (WHERE status = 'APPROVED'), 0)::float AS refunded
-       FROM returns WHERE sale_id = ANY($1::uuid[]) GROUP BY sale_id, medicine_id, batch_id`,
-      [ids]
-    )
-  ]);
+  const items = await q.query(
+    `SELECT si.id, si.sale_id, si.medicine_id, m.name AS medicine_name, m.generic_name,
+            si.batch_id, si.batch_number, si.expiry_date,
+            si.quantity::int AS quantity, si.unit_price::float AS unit_price, COALESCE(si.discount, 0)::float AS discount,
+            si.cost_price_snapshot::float AS cost_price_snapshot, si.total::float AS total, si.price_mode
+     FROM sale_items si LEFT JOIN medicines m ON si.medicine_id = m.id
+     WHERE si.sale_id = ANY($1::uuid[])
+     ORDER BY si.created_at, si.id`,
+    [ids]
+  );
+  const payments = await q.query(
+    `SELECT sale_id, method, amount::float AS amount, reference FROM payments
+     WHERE sale_id = ANY($1::uuid[]) ORDER BY created_at, id`,
+    [ids]
+  );
+  const returned = await q.query(
+    `SELECT sale_id, medicine_id, batch_id,
+            COALESCE(SUM(approved_quantity) FILTER (WHERE status = 'APPROVED'), 0)::int AS qty,
+            COALESCE(SUM(quantity) FILTER (WHERE status = 'PENDING'), 0)::int AS pending,
+            COALESCE(SUM(refund_amount) FILTER (WHERE status = 'APPROVED'), 0)::float AS refunded
+     FROM returns WHERE sale_id = ANY($1::uuid[]) GROUP BY sale_id, medicine_id, batch_id`,
+    [ids]
+  );
   const itemsBySale = /* @__PURE__ */ new Map();
   for (const it of items.rows) {
     const list = itemsBySale.get(it.sale_id) || [];
@@ -1700,6 +1698,9 @@ function classifyConflict(commandType, error) {
   const e = String(error || "").toLowerCase();
   const t = String(commandType || "");
   if (!e) return "OTHER";
+  if ((t === "MEDICINE_DELETE" || t === "MEDICINE_DELETE_PREFLIGHT") && /(medicine version conflict|delete_preflight_stale|refresh and retry|expected \d+, but currently at \d+|version conflict)/.test(e)) {
+    return "DELETE_PREFLIGHT_STALE";
+  }
   if (/username/.test(e) && /(already|used|exists|duplicate)/.test(e)) return "DUPLICATE_USERNAME";
   if (/email/.test(e) && /(already|used|exists|duplicate)/.test(e)) return "DUPLICATE_EMAIL";
   if (t.startsWith("USER_") && /(changed at the shop|changed meanwhile|reload and edit)/.test(e)) return "USER_CHANGED_LOCALLY";
@@ -2419,11 +2420,17 @@ function validateCommandPayload(type, payload) {
       return { medicine_id: uuid(p.medicine_id, "medicine_id"), active: bool(p.active, "active"), reason: reasonText(p.reason, true) };
     }
     case "MEDICINE_DELETE": {
-      onlyKeys(p, ["medicine_id", "expected_version", "expected_status", "expected_current_stock", "reason"], "MEDICINE_DELETE");
+      onlyKeys(p, ["medicine_id", "preflight_id", "expected_version", "expected_status", "expected_current_stock", "reason"], "MEDICINE_DELETE");
       const out = { medicine_id: uuid(p.medicine_id, "medicine_id") };
+      if (p.preflight_id !== void 0) out.preflight_id = uuid(p.preflight_id, "preflight_id");
       if (p.expected_version !== void 0) out.expected_version = wholeNumber(p.expected_version, "expected_version", 1);
       if (p.expected_status !== void 0) out.expected_status = text(p.expected_status, "expected_status");
       if (p.expected_current_stock !== void 0) out.expected_current_stock = wholeNumber(p.expected_current_stock, "expected_current_stock", 0);
+      return withReason(out, p.reason);
+    }
+    case "MEDICINE_DELETE_PREFLIGHT": {
+      onlyKeys(p, ["medicine_id", "reason"], "MEDICINE_DELETE_PREFLIGHT");
+      const out = { medicine_id: uuid(p.medicine_id, "medicine_id") };
       return withReason(out, p.reason);
     }
     case "CATEGORY_UPSERT": {
@@ -2687,6 +2694,7 @@ var ACTIONS = {
   "medicine-create": "MEDICINE_CREATE",
   "medicine-active": "MEDICINE_SET_ACTIVE",
   "medicine-delete": "MEDICINE_DELETE",
+  "medicine-delete-preflight": "MEDICINE_DELETE_PREFLIGHT",
   "batch-create": "BATCH_CREATE",
   "batch-update": "BATCH_UPDATE",
   "batch-active": "BATCH_SET_ACTIVE",
@@ -2998,7 +3006,7 @@ function buildRemoteAdminRouter(deps) {
       display.current_commit = rt.update_state.current_commit ?? null;
       display.available_version = rt.update_state.available_version ?? null;
     }
-    if (type === "MEDICINE_DELETE") {
+    if (type === "MEDICINE_DELETE" || type === "MEDICINE_DELETE_PREFLIGHT") {
       if (!deps.isGlobalAdmin(u)) {
         throw new HttpError(403, "Forbidden: Global Administrator only.", { code: "GLOBAL_ADMIN_ONLY" });
       }
@@ -3010,7 +3018,7 @@ function buildRemoteAdminRouter(deps) {
       if (!cap.supported) {
         throw new HttpError(409, cap.reason || "Shop 1 must install the current GIGA CHEMIST release before Medicine Delete can be used.", { code: "SHOP_UPDATE_REQUIRED" });
       }
-      if ((payload.expected_current_stock || 0) > 0) {
+      if (type === "MEDICINE_DELETE" && (payload.expected_current_stock || 0) > 0) {
         throw new HttpError(409, `Cannot delete medicine because it still has stock (${payload.expected_current_stock} units). Stock must be adjusted to 0 first through an auditable workflow.`, { code: "MEDICINE_HAS_STOCK" });
       }
     }
@@ -3174,6 +3182,62 @@ function buildRemoteAdminRouter(deps) {
     res.status(202);
     return { command_type: type, fanout_group: seed, results };
   }));
+  r.post("/admin/medicines/:id/delete-preflight", requireAdmin2, commandRateLimit, route2("POST /admin/medicines/:id/delete-preflight", async (req, res) => {
+    if (!deps.isGlobalAdmin(req.onlineUser)) {
+      throw new HttpError(403, "Forbidden: Global Administrator only.", { code: "GLOBAL_ADMIN_ONLY" });
+    }
+    if (isAllShopsScope(req)) {
+      throw new HttpError(400, "Cannot request delete preflight across All Shops. Select a specific shop.", { code: "ALL_SHOPS_NOT_ALLOWED" });
+    }
+    const medId = req.params.id;
+    if (!isValidUuid(medId)) throw new HttpError(400, "Valid medicine UUID is required.");
+    const shopId = typeof req.query.shop_id === "string" && isValidUuid(req.query.shop_id) ? req.query.shop_id : typeof req.body?.shop_id === "string" && isValidUuid(req.body.shop_id) ? req.body.shop_id : deps.shopId(req);
+    if (!shopId || !isValidUuid(shopId)) throw new HttpError(400, "Valid shop_id is required.", { code: "SHOP_ID_REQUIRED" });
+    const seed = requestSeed(req.body?.request_id);
+    const queued = await queueForShop(req, shopId, "MEDICINE_DELETE_PREFLIGHT", { medicine_id: medId, reason: req.body?.reason }, seed);
+    const start = Date.now();
+    let latestStatus = queued.status;
+    let resultPayload = null;
+    let resultError = null;
+    while (Date.now() - start < 3500) {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      const row = (await deps.withCloud((c) => c.query(
+        "SELECT status, result, error FROM giga_cloud.commands WHERE command_id = $1",
+        [queued.command_id]
+      ))).rows[0];
+      if (row) {
+        latestStatus = row.status;
+        resultPayload = row.result;
+        resultError = row.error;
+        if (latestStatus === "APPLIED" || latestStatus === "REJECTED") {
+          break;
+        }
+      }
+    }
+    if (latestStatus === "APPLIED" && resultPayload) {
+      res.status(200);
+      return {
+        status: "APPLIED",
+        command_id: queued.command_id,
+        preflight: resultPayload
+      };
+    }
+    if (latestStatus === "REJECTED") {
+      res.status(409);
+      return {
+        status: "REJECTED",
+        command_id: queued.command_id,
+        error: resultError || "Shop rejected delete preflight."
+      };
+    }
+    res.status(202);
+    return {
+      status: latestStatus,
+      command_id: queued.command_id,
+      shop_online: queued.shop_online,
+      message: "Authoritative delete preflight requested from Shop 1. Polling for response."
+    };
+  }));
   r.get("/admin/medicines/:id/delete-preview", requireAdmin2, route2("GET /admin/medicines/:id/delete-preview", async (req) => {
     if (!deps.isGlobalAdmin(req.onlineUser)) {
       throw new HttpError(403, "Forbidden: Global Administrator only.", { code: "GLOBAL_ADMIN_ONLY" });
@@ -3203,13 +3267,11 @@ function buildRemoteAdminRouter(deps) {
       }
       const m = medRes.rows[0];
       const currentStock = Number(m.current_stock) || 0;
-      const [siRes, piRes, retRes, movRes, batchRes] = await Promise.all([
-        c.query(`SELECT COUNT(*)::int AS items, COUNT(DISTINCT sale_id)::int AS sales FROM sale_items WHERE medicine_id = $1`, [medId]),
-        c.query(`SELECT COUNT(*)::int AS items, COUNT(DISTINCT purchase_id)::int AS purchases FROM purchase_items WHERE medicine_id = $1`, [medId]),
-        c.query(`SELECT COUNT(*)::int AS count FROM returns WHERE medicine_id = $1`, [medId]),
-        c.query(`SELECT COUNT(*)::int AS count FROM inventory_movements WHERE medicine_id = $1`, [medId]),
-        c.query(`SELECT COUNT(*)::int AS count FROM medicine_batches WHERE medicine_id = $1 AND status <> 'exhausted' AND status <> 'archived'`, [medId])
-      ]);
+      const siRes = await c.query(`SELECT COUNT(*)::int AS items, COUNT(DISTINCT sale_id)::int AS sales FROM sale_items WHERE medicine_id = $1`, [medId]);
+      const piRes = await c.query(`SELECT COUNT(*)::int AS items, COUNT(DISTINCT purchase_id)::int AS purchases FROM purchase_items WHERE medicine_id = $1`, [medId]);
+      const retRes = await c.query(`SELECT COUNT(*)::int AS count FROM returns WHERE medicine_id = $1`, [medId]);
+      const movRes = await c.query(`SELECT COUNT(*)::int AS count FROM inventory_movements WHERE medicine_id = $1`, [medId]);
+      const batchRes = await c.query(`SELECT COUNT(*)::int AS count FROM medicine_batches WHERE medicine_id = $1 AND status <> 'exhausted' AND status <> 'archived'`, [medId]);
       return {
         m,
         currentStock,

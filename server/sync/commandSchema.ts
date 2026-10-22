@@ -65,6 +65,8 @@ export const COMMAND_TYPES = [
   'STOCK_OVERRIDE_REMOVE',
   'STOCK_OVERRIDE_SET',
   'STOCK_SNAPSHOT_REQUEST',
+  // Shop 1 Stability & Delete Authoritative Preflight (migration 015 / 027)
+  'MEDICINE_DELETE_PREFLIGHT',
 ] as const;
 export type CommandType = (typeof COMMAND_TYPES)[number];
 
@@ -552,11 +554,17 @@ export function validateCommandPayload(type: string, payload: unknown): Record<s
       return { medicine_id: uuid(p.medicine_id, 'medicine_id'), active: bool(p.active, 'active'), reason: reasonText(p.reason, true) };
     }
     case 'MEDICINE_DELETE': {
-      onlyKeys(p, ['medicine_id', 'expected_version', 'expected_status', 'expected_current_stock', 'reason'], 'MEDICINE_DELETE');
+      onlyKeys(p, ['medicine_id', 'preflight_id', 'expected_version', 'expected_status', 'expected_current_stock', 'reason'], 'MEDICINE_DELETE');
       const out: Record<string, any> = { medicine_id: uuid(p.medicine_id, 'medicine_id') };
+      if (p.preflight_id !== undefined) out.preflight_id = uuid(p.preflight_id, 'preflight_id');
       if (p.expected_version !== undefined) out.expected_version = wholeNumber(p.expected_version, 'expected_version', 1);
       if (p.expected_status !== undefined) out.expected_status = text(p.expected_status, 'expected_status');
       if (p.expected_current_stock !== undefined) out.expected_current_stock = wholeNumber(p.expected_current_stock, 'expected_current_stock', 0);
+      return withReason(out, p.reason);
+    }
+    case 'MEDICINE_DELETE_PREFLIGHT': {
+      onlyKeys(p, ['medicine_id', 'reason'], 'MEDICINE_DELETE_PREFLIGHT');
+      const out: Record<string, any> = { medicine_id: uuid(p.medicine_id, 'medicine_id') };
       return withReason(out, p.reason);
     }
     case 'CATEGORY_UPSERT': {

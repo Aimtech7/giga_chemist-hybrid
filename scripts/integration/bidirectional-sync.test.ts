@@ -183,10 +183,12 @@ async function run() {
 
   } finally {
     client.release();
+    await pool.end();
+    await (await import('../../server/db/client')).pgPool.end();
   }
 
   const code = summary();
-  process.exit(code);
+  process.exitCode = code;
 }
 
 void run();

@@ -32,7 +32,13 @@ export interface ServerSyncStatus {
   device_id?: string;
   last_error?: string | null;
   last_error_at?: string | null;
+  last_error_resolved?: boolean;
   last_contact?: string | null;
+  last_contact_at?: string | null;
+  last_success_at?: string | null;
+  last_business_upload_at?: string | null;
+  consecutive_failures?: number;
+  current_cloud_state?: 'HEALTHY' | 'DEGRADED' | 'OFFLINE';
   last_event_error?: { event_type: string; error: string; at: string } | null;
   inbound_commands?: { applied: number; rejected: number; unacknowledged: number };
   cloud?: { configured: boolean; config_error: string | null; host: string | null; key_type: string; reachable: boolean | null } | null;

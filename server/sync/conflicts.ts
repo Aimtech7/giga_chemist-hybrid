@@ -3,7 +3,7 @@
  * Pure (shared by the shop server and the online API). Unknown texts are OTHER (shown verbatim).
  */
 export const CONFLICT_REASONS = [
-  'STALE_VERSION', 'USER_CHANGED_LOCALLY', 'STOCK_CHANGED', 'RECORD_NOT_FOUND', 'DUPLICATE_USERNAME', 'DUPLICATE_EMAIL', 'INVALID_STATE', 'OTHER',
+  'DELETE_PREFLIGHT_STALE', 'RESOLVED_HISTORICAL_CONFLICT', 'STALE_VERSION', 'USER_CHANGED_LOCALLY', 'STOCK_CHANGED', 'RECORD_NOT_FOUND', 'DUPLICATE_USERNAME', 'DUPLICATE_EMAIL', 'INVALID_STATE', 'OTHER',
 ] as const;
 export type ConflictReason = (typeof CONFLICT_REASONS)[number];
 
@@ -11,6 +11,9 @@ export function classifyConflict(commandType: string | null | undefined, error: 
   const e = String(error || '').toLowerCase();
   const t = String(commandType || '');
   if (!e) return 'OTHER';
+  if ((t === 'MEDICINE_DELETE' || t === 'MEDICINE_DELETE_PREFLIGHT') && /(medicine version conflict|delete_preflight_stale|refresh and retry|expected \d+, but currently at \d+|version conflict)/.test(e)) {
+    return 'DELETE_PREFLIGHT_STALE';
+  }
   if (/username/.test(e) && /(already|used|exists|duplicate)/.test(e)) return 'DUPLICATE_USERNAME';
   if (/email/.test(e) && /(already|used|exists|duplicate)/.test(e)) return 'DUPLICATE_EMAIL';
   if (t.startsWith('USER_') && /(changed at the shop|changed meanwhile|reload and edit)/.test(e)) return 'USER_CHANGED_LOCALLY';
