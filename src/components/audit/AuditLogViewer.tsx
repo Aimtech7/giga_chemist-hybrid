@@ -1,14 +1,16 @@
 import React, { useState, useEffect } from 'react';
-import { Search, Download, Lock } from 'lucide-react';
+import { Search, Download, Lock, Layers, History } from 'lucide-react';
 import { db } from '../../db/dexie';
 import { downloadCSV } from '../../services/exportUtils';
 import type { AuditLog, User } from '../../types';
+import { StockAdjustmentRegister } from './StockAdjustmentRegister';
 
 interface AuditLogViewerProps {
   currentUser: User | null;
 }
 
 export const AuditLogViewer: React.FC<AuditLogViewerProps> = ({ currentUser }) => {
+  const [activeTab, setActiveTab] = useState<'audit' | 'stock_adjustments'>('audit');
   const [logs, setLogs] = useState<AuditLog[]>([]);
   const [search, setSearch] = useState('');
   const [actionFilter, setActionFilter] = useState('ALL');
@@ -91,28 +93,63 @@ export const AuditLogViewer: React.FC<AuditLogViewerProps> = ({ currentUser }) =
       <div className="p-4 bg-white border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shrink-0">
         <div>
           <h1 className="text-base font-bold text-slate-900 tracking-tight">
-            Audit Logs
+            Audit Center
           </h1>
           <p className="text-xs text-slate-500 mt-0.5">
-            System audit trail for price changes, inventory adjustments, and sensitive transactions.
+            System audit trail for price changes, inventory movements, and forced administrative adjustments.
           </p>
         </div>
 
+        {activeTab === 'audit' && (
+          <button
+            onClick={handleExportCSV}
+            className="px-3 py-1.5 rounded border border-slate-300 hover:bg-slate-50 text-slate-700 text-xs font-semibold transition cursor-pointer inline-flex items-center gap-1.5 self-start sm:self-auto"
+          >
+            <Download className="w-3.5 h-3.5" />
+            <span>Export CSV</span>
+          </button>
+        )}
+      </div>
+
+      {/* Tabs */}
+      <div className="flex border-b border-slate-200 bg-white px-4 text-xs font-semibold text-slate-600 gap-4 shrink-0">
         <button
-          onClick={handleExportCSV}
-          className="px-3 py-1.5 rounded border border-slate-300 hover:bg-slate-50 text-slate-700 text-xs font-semibold transition cursor-pointer inline-flex items-center gap-1.5 self-start sm:self-auto"
+          onClick={() => setActiveTab('audit')}
+          className={`py-2.5 flex items-center gap-1.5 border-b-2 cursor-pointer transition ${
+            activeTab === 'audit'
+              ? 'border-teal-700 text-teal-800'
+              : 'border-transparent text-slate-500 hover:text-slate-800'
+          }`}
         >
-          <Download className="w-3.5 h-3.5" />
-          <span>Export CSV</span>
+          <History className="w-3.5 h-3.5" />
+          <span>General Audit Trail</span>
+        </button>
+        <button
+          onClick={() => setActiveTab('stock_adjustments')}
+          className={`py-2.5 flex items-center gap-1.5 border-b-2 cursor-pointer transition ${
+            activeTab === 'stock_adjustments'
+              ? 'border-teal-700 text-teal-800'
+              : 'border-transparent text-slate-500 hover:text-slate-800'
+          }`}
+        >
+          <Layers className="w-3.5 h-3.5" />
+          <span>Stock Adjustment Register</span>
+          <span className="px-1.5 py-0.2 bg-teal-100 text-teal-800 rounded text-[10px]">Authoritative</span>
         </button>
       </div>
 
-      {/* Filter and search toolbar */}
-      <div className="p-3 bg-white border-b border-slate-200 flex flex-wrap items-center justify-between gap-2 text-xs shrink-0">
-        <div className="relative w-full max-w-sm">
-          <Search className="w-3.5 h-3.5 absolute left-3 top-2.5 text-slate-400" />
-          <input
-            type="text"
+      {activeTab === 'stock_adjustments' ? (
+        <div className="flex-1 overflow-auto p-4">
+          <StockAdjustmentRegister />
+        </div>
+      ) : (
+        <>
+          {/* Filter and search toolbar */}
+          <div className="p-3 bg-white border-b border-slate-200 flex flex-wrap items-center justify-between gap-2 text-xs shrink-0">
+            <div className="relative w-full max-w-sm">
+              <Search className="w-3.5 h-3.5 absolute left-3 top-2.5 text-slate-400" />
+              <input
+                type="text"
             placeholder="Search action, user, entity ID..."
             value={search}
             onChange={(e) => setSearch(e.target.value)}
@@ -203,6 +240,8 @@ export const AuditLogViewer: React.FC<AuditLogViewerProps> = ({ currentUser }) =
           </table>
         </div>
       </div>
+      </>
+      )}
     </div>
   );
 };

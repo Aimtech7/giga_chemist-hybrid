@@ -63,6 +63,7 @@
     "test:cloud-rpc-performance": "tsx scripts/integration/cloud-rpc-performance.test.ts",
     "test:postgres-client-concurrency": "tsx scripts/integration/postgres-client-concurrency.test.ts",
     "test:sync-health-state": "tsx scripts/integration/sync-health-state.test.ts",
+    "test:global-admin-forced-stock": "tsx scripts/integration/global-admin-forced-stock.test.ts",
     "updater:check": "node scripts/updater/updater.mjs check"
   },
   "dependencies": {

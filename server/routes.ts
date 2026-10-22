@@ -1517,6 +1517,91 @@ apiRouter.get('/audit', requireRole('ADMIN'), async (req, res) => {
   }
 });
 
+apiRouter.get('/audit/stock-adjustments', requireRole('ADMIN'), async (req, res) => {
+  try {
+    const fromFilter = typeof req.query.from === 'string' ? req.query.from : (typeof req.query.date_from === 'string' ? req.query.date_from : null);
+    const toFilter = typeof req.query.to === 'string' ? req.query.to : (typeof req.query.date_to === 'string' ? req.query.date_to : null);
+    const medicineFilter = typeof req.query.medicine === 'string' ? req.query.medicine : (typeof req.query.medicine_id === 'string' ? req.query.medicine_id : null);
+    const batchFilter = typeof req.query.batch === 'string' ? req.query.batch : (typeof req.query.batch_id === 'string' ? req.query.batch_id : null);
+    const adminFilter = typeof req.query.administrator === 'string' ? req.query.administrator : (typeof req.query.admin === 'string' ? req.query.admin : null);
+    const opFilter = typeof req.query.operation === 'string' ? req.query.operation.toUpperCase() : (typeof req.query.action === 'string' ? req.query.action.toUpperCase() : 'ALL');
+
+    const params: any[] = [];
+    let sql = `
+      SELECT id, user_id, user_name, role, action, entity, entity_id,
+             previous_value, new_value, device_id, timestamp, created_at
+      FROM audit_logs
+      WHERE action = 'GLOBAL_ADMIN_STOCK_OVERRIDE'
+    `;
+
+    if (fromFilter) {
+      params.push(new Date(fromFilter).toISOString());
+      sql += ` AND created_at >= $${params.length}`;
+    }
+    if (toFilter) {
+      params.push(new Date(toFilter).toISOString());
+      sql += ` AND created_at <= $${params.length}`;
+    }
+    sql += ` ORDER BY created_at DESC LIMIT 500`;
+
+    const result = await pgPool.query(sql, params);
+    let records = result.rows.map((r) => {
+      const v = typeof r.new_value === 'string' ? JSON.parse(r.new_value) : (r.new_value || {});
+      return {
+        id: r.id,
+        created_at: r.created_at,
+        ...v,
+      };
+    });
+
+    if (medicineFilter) {
+      const q = medicineFilter.toLowerCase();
+      records = records.filter((rec: any) =>
+        rec.medicine_id === medicineFilter || (rec.medicine_name && rec.medicine_name.toLowerCase().includes(q))
+      );
+    }
+    if (batchFilter) {
+      const q = batchFilter.toLowerCase();
+      records = records.filter((rec: any) =>
+        rec.batch_id === batchFilter || (rec.batch_number && rec.batch_number.toLowerCase().includes(q))
+      );
+    }
+    if (adminFilter) {
+      const q = adminFilter.toLowerCase();
+      records = records.filter((rec: any) =>
+        (rec.admin_name && rec.admin_name.toLowerCase().includes(q)) ||
+        (rec.admin_email && rec.admin_email.toLowerCase().includes(q))
+      );
+    }
+    if (opFilter && opFilter !== 'ALL') {
+      records = records.filter((rec: any) => rec.action === opFilter);
+    }
+
+    if (req.query.format === 'csv') {
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename="stock-adjustments-${new Date().toISOString().slice(0, 10)}.csv"`);
+      const headers = [
+        'override_id', 'command_id', 'shop_id', 'shop_name', 'medicine_id', 'medicine_name',
+        'sku', 'barcode', 'batch_id', 'batch_number', 'expiry_date',
+        'admin_name', 'admin_email', 'action', 'online_quantity_shown', 'local_quantity_before',
+        'requested_amount', 'local_quantity_after', 'difference', 'reason',
+        'date_submitted', 'date_delivered', 'date_applied', 'date_cloud_confirmed',
+        'stock_version_before', 'stock_version_after', 'result'
+      ];
+      const escape = (val: any) => `"${String(val ?? '').replace(/"/g, '""')}"`;
+      const csvLines = [
+        headers.join(','),
+        ...records.map((r: any) => headers.map((h) => escape(r[h])).join(','))
+      ];
+      return res.send(csvLines.join('\n'));
+    }
+
+    res.json({ adjustments: records });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to fetch stock adjustments.' });
+  }
+});
+
 // --- 15. SETTINGS ---
 apiRouter.get('/settings', async (req, res) => {
   try {

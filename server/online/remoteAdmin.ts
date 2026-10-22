@@ -399,6 +399,22 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
     if (!ctl.remote_writes_enabled) throw new HttpError(423, 'Remote changes are disabled (emergency switch). Re-enable them under Security.');
     const u = req.onlineUser;
     let body = bodyIn;
+
+    if (deps.isGlobalAdmin(u)) {
+      if (type === 'STOCK_ADD') {
+        type = 'STOCK_OVERRIDE_ADD';
+      } else if (type === 'STOCK_REMOVE') {
+        type = 'STOCK_OVERRIDE_REMOVE';
+      } else if (type === 'STOCK_SET') {
+        type = 'STOCK_OVERRIDE_SET';
+      }
+      if (['STOCK_OVERRIDE_ADD', 'STOCK_OVERRIDE_REMOVE', 'STOCK_OVERRIDE_SET'].includes(type)) {
+        if (body.expected_quantity !== undefined && body.cloud_quantity_seen === undefined) {
+          body.cloud_quantity_seen = body.expected_quantity;
+        }
+      }
+    }
+
     const createField = CREATE_ID_FIELD[type] ?? (type === 'PURCHASE_RECEIVE' && Array.isArray(body.items) ? 'purchase_id' : undefined);
     if (createField) {
       if (body[createField] !== undefined) throw new HttpError(400, `${createField} of a new record is assigned by the server; do not send it.`);
@@ -449,16 +465,14 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
         throw new HttpError(409, cap.reason || 'Shop 1 must install the current GIGA CHEMIST release before Stock Override can be used.', { code: 'SHOP_UPDATE_REQUIRED' });
       }
       if (type !== 'STOCK_SNAPSHOT_REQUEST') {
-        const now = new Date();
-        const expiresAt = new Date(now.getTime() + 10 * 60 * 1000);
-        body.created_at = now.toISOString();
-        body.expires_at = expiresAt.toISOString();
+        body.created_at = new Date().toISOString();
         payload.created_at = body.created_at;
-        payload.expires_at = body.expires_at;
+        // Durable forced directive: no forced 10-minute expiry
       }
     }
     const online = await shopOnline(shopId);
     const highConflict = HIGH_CONFLICT_TYPES.includes(type);
+    const isOverrideDirective = OVERRIDE_COMMANDS.includes(type);
     if (online === false) display.queued_while_shop_offline = true;
 
     // Same request (+ same shop for a fan-out) = same key = ONE command, however often it is retried.
@@ -487,9 +501,11 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
       if (orig) entity = commandEntity(orig.command_type, orig.payload);
     }
     console.log(`[Online] ${u.email} queued ${type} ${row.command_id} for shop ${target?.shop_code || shopId}${row.duplicate ? ' (replayed request)' : ''}`);
-    const offlineWarning = highConflict
-      ? 'The shop computer is OFFLINE. This stock/financial change waits as PENDING and is re-checked against the shop live data when it arrives; it may be REJECTED if anything changed meanwhile.'
-      : 'The shop computer is offline: the change waits as PENDING and is applied when the shop reconnects.';
+    const offlineWarning = isOverrideDirective
+      ? 'The shop computer is OFFLINE. This administrative stock directive will wait in queue (PENDING) and execute automatically against the shop live stock when the shop reconnects.'
+      : (highConflict
+          ? 'The shop computer is OFFLINE. This stock/financial change waits as PENDING and is re-checked against the shop live data when it arrives; it may be REJECTED if anything changed meanwhile.'
+          : 'The shop computer is offline: the change waits as PENDING and is applied when the shop reconnects.');
     return {
       command_id: row.command_id,
       command_type: type,
@@ -1029,6 +1045,141 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
       conflicts,
     };
   }));
+
+  /** Stock Adjustment Register: Full printable audit trail of all Global Admin forced stock changes */
+  const handleStockAdjustments = route('GET /admin/stock-adjustments', async (req, res) => {
+    if (!deps.isGlobalAdmin(req.onlineUser)) {
+      throw new HttpError(403, 'Forbidden: Global Administrator only.', { code: 'GLOBAL_ADMIN_ONLY' });
+    }
+    const shopFilter = typeof req.query.shop_id === 'string' && isValidUuid(req.query.shop_id)
+      ? req.query.shop_id
+      : (typeof req.query.shop === 'string' && isValidUuid(req.query.shop) ? req.query.shop : (isAllShopsScope(req) ? null : deps.shopId(req)));
+
+    const fromFilter = typeof req.query.from === 'string' ? req.query.from : (typeof req.query.date_from === 'string' ? req.query.date_from : null);
+    const toFilter = typeof req.query.to === 'string' ? req.query.to : (typeof req.query.date_to === 'string' ? req.query.date_to : null);
+    const medicineFilter = typeof req.query.medicine === 'string' ? req.query.medicine : (typeof req.query.medicine_id === 'string' ? req.query.medicine_id : null);
+    const batchFilter = typeof req.query.batch === 'string' ? req.query.batch : (typeof req.query.batch_id === 'string' ? req.query.batch_id : null);
+    const adminFilter = typeof req.query.administrator === 'string' ? req.query.administrator : (typeof req.query.admin === 'string' ? req.query.admin : null);
+    const opFilter = typeof req.query.operation === 'string' ? req.query.operation.toUpperCase() : (typeof req.query.action === 'string' ? req.query.action.toUpperCase() : 'ALL');
+
+    const params: any[] = [];
+    let sql = `
+      SELECT c.*, s.name AS shop_name, s.shop_code
+      FROM giga_cloud.commands c
+      LEFT JOIN giga_cloud.shops s ON s.shop_id = c.shop_id
+      WHERE c.command_type IN ('STOCK_OVERRIDE_ADD', 'STOCK_OVERRIDE_REMOVE', 'STOCK_OVERRIDE_SET', 'STOCK_ADD', 'STOCK_REMOVE', 'STOCK_SET')
+    `;
+
+    if (shopFilter) {
+      params.push(shopFilter);
+      sql += ` AND c.shop_id = $${params.length}`;
+    }
+    if (fromFilter) {
+      params.push(new Date(fromFilter).toISOString());
+      sql += ` AND c.created_at >= $${params.length}`;
+    }
+    if (toFilter) {
+      params.push(new Date(toFilter).toISOString());
+      sql += ` AND c.created_at <= $${params.length}`;
+    }
+    sql += ` ORDER BY c.created_at DESC LIMIT 500`;
+
+    const rows = (await deps.withCloud((c) => c.query(sql, params))).rows;
+
+    let records = rows.map((r: any) => {
+      const a = r.result?.audit;
+      if (a) return a;
+
+      const p = r.payload || {};
+      const resObj = r.result || {};
+      const d = r.display || {};
+      const action = r.command_type.includes('ADD') ? 'ADD' : r.command_type.includes('REMOVE') ? (resObj.operation || 'REMOVE') : 'SET';
+      const localBefore = resObj.local_before ?? p.local_before ?? null;
+      const localAfter = resObj.local_after ?? null;
+      const diff = (localBefore !== null && localAfter !== null) ? (localAfter - localBefore) : (action === 'ADD' ? p.quantity : action === 'REMOVE' ? -p.quantity : null);
+
+      return {
+        override_id: p.override_id || r.command_id,
+        command_id: r.command_id,
+        shop_id: r.shop_id,
+        shop_name: r.shop_name || r.shop_code || 'Shop',
+        medicine_id: p.medicine_id,
+        medicine_name: d.medicine_name || 'Medicine',
+        sku: d.sku || null,
+        barcode: d.barcode || null,
+        batch_id: p.batch_id || null,
+        batch_number: p.batch_number || d.batch_number || null,
+        expiry_date: d.expiry_before || null,
+        admin_user_id: p.created_by_user_id || null,
+        admin_name: r.created_by || 'Global Administrator',
+        admin_email: r.created_by || 'admin@gigachemist.com',
+        action,
+        online_quantity_shown: p.cloud_quantity_seen ?? p.expected_quantity ?? null,
+        actual_quantity_before: localBefore,
+        local_quantity_before: localBefore,
+        requested_amount: p.quantity ?? null,
+        actual_quantity_after: localAfter,
+        local_quantity_after: localAfter,
+        difference: diff,
+        reason: p.reason || 'Administrative stock adjustment',
+        notes: p.notes || null,
+        date_submitted: r.created_at,
+        date_delivered: r.delivered_at,
+        date_applied: r.acked_at || resObj.applied_at || null,
+        date_cloud_confirmed: r.acked_at,
+        stock_version_before: resObj.stock_version_before ?? null,
+        stock_version_after: resObj.stock_version ?? null,
+        result: r.status,
+      };
+    });
+
+    if (medicineFilter) {
+      const q = medicineFilter.toLowerCase();
+      records = records.filter((rec: any) =>
+        rec.medicine_id === medicineFilter || (rec.medicine_name && rec.medicine_name.toLowerCase().includes(q))
+      );
+    }
+    if (batchFilter) {
+      const q = batchFilter.toLowerCase();
+      records = records.filter((rec: any) =>
+        rec.batch_id === batchFilter || (rec.batch_number && rec.batch_number.toLowerCase().includes(q))
+      );
+    }
+    if (adminFilter) {
+      const q = adminFilter.toLowerCase();
+      records = records.filter((rec: any) =>
+        (rec.admin_name && rec.admin_name.toLowerCase().includes(q)) ||
+        (rec.admin_email && rec.admin_email.toLowerCase().includes(q))
+      );
+    }
+    if (opFilter && opFilter !== 'ALL') {
+      records = records.filter((rec: any) => rec.action === opFilter);
+    }
+
+    if (req.query.format === 'csv') {
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename="stock-adjustments-${new Date().toISOString().slice(0, 10)}.csv"`);
+      const headers = [
+        'override_id', 'command_id', 'shop_id', 'shop_name', 'medicine_id', 'medicine_name',
+        'sku', 'barcode', 'batch_id', 'batch_number', 'expiry_date',
+        'admin_name', 'admin_email', 'action', 'online_quantity_shown', 'local_quantity_before',
+        'requested_amount', 'local_quantity_after', 'difference', 'reason',
+        'date_submitted', 'date_delivered', 'date_applied', 'date_cloud_confirmed',
+        'stock_version_before', 'stock_version_after', 'result'
+      ];
+      const escape = (val: any) => `"${String(val ?? '').replace(/"/g, '""')}"`;
+      const csvLines = [
+        headers.join(','),
+        ...records.map((r: any) => headers.map((h) => escape(r[h])).join(','))
+      ];
+      return res.send(csvLines.join('\n'));
+    }
+
+    return { adjustments: records };
+  });
+
+  r.get('/admin/stock-adjustments', requireAdmin, handleStockAdjustments);
+  r.get('/audit/stock-adjustments', requireAdmin, handleStockAdjustments);
 
   /** Rejected Changes Center: Full list of rejected events with safe preview and clear category */
   r.get('/admin/sync/rejected-changes', requireAdmin, route('GET /admin/sync/rejected-changes', async (req) => {
