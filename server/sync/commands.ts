@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import type pg from 'pg';
 import { HttpError, isValidUuid, withTransaction } from '../db/client';
 import { recordAuditLog } from '../db/audit';
@@ -159,7 +160,105 @@ async function medicineEvent(client: pg.PoolClient, cmd: CloudCommand, type: 'ME
   });
 }
 
+async function recordGlobalAdminStockAdjustmentAudit(
+  client: pg.PoolClient,
+  opts: {
+    cmd: any;
+    identity: { shop_id: string; pharmacy_name?: string };
+    medicineId: string;
+    batchId?: string | null;
+    action: 'ADD' | 'REMOVE' | 'SET' | 'SET_TO_ZERO';
+    onlineQuantityShown: number | null;
+    localQuantityBefore: number;
+    requestedAmount: number;
+    localQuantityAfter: number;
+    reason: string;
+    stockVersionBefore: number;
+    stockVersionAfter: number;
+    notes?: string;
+  }
+) {
+  const {
+    cmd, identity, medicineId, batchId, action,
+    onlineQuantityShown, localQuantityBefore, requestedAmount, localQuantityAfter,
+    reason, stockVersionBefore, stockVersionAfter, notes,
+  } = opts;
+
+  const medRes = await client.query('SELECT name, sku, barcode FROM medicines WHERE id = $1', [medicineId]);
+  const med = medRes.rows[0] || {};
+
+  let batchInfo: { batch_number?: string | null; expiry_date?: string | null } = {};
+  if (batchId && isValidUuid(batchId)) {
+    const bRes = await client.query('SELECT batch_number, expiry_date FROM medicine_batches WHERE id = $1', [batchId]);
+    if (bRes.rows[0]) batchInfo = bRes.rows[0];
+  }
+
+  const actor = cloudActor(cmd);
+  const overrideId = (cmd.payload as any)?.override_id || (cmd as any).override_id || crypto.randomUUID();
+  const submittedAt = (cmd.payload as any)?.created_at || cmd.created_at || new Date().toISOString();
+  const deliveredAt = (cmd as any).delivered_at || new Date().toISOString();
+  const appliedAt = new Date().toISOString();
+  const cloudConfirmedAt = (cmd as any).cloud_confirmed_at || null;
+
+  const record = {
+    override_id: overrideId,
+    command_id: cmd.command_id,
+    shop_id: identity.shop_id,
+    shop_name: identity.pharmacy_name || 'Shop 1',
+    medicine_id: medicineId,
+    medicine_name: med.name || 'Unknown Medicine',
+    sku: med.sku || null,
+    barcode: med.barcode || null,
+    batch_id: batchId || null,
+    batch_number: batchInfo.batch_number || (cmd.payload as any)?.batch_number || null,
+    expiry_date: batchInfo.expiry_date ? new Date(batchInfo.expiry_date).toISOString().slice(0, 10) : null,
+    admin_user_id: (cmd as any).created_by_user_id || actor.user_id || null,
+    admin_name: actor.user_name || 'Global Administrator',
+    admin_email: cmd.created_by || actor.user_name || 'admin@gigachemist.com',
+    action,
+    online_quantity_shown: onlineQuantityShown,
+    cloud_quantity_seen: onlineQuantityShown,
+    actual_quantity_before: localQuantityBefore,
+    local_quantity_before: localQuantityBefore,
+    requested_amount: requestedAmount,
+    actual_quantity_after: localQuantityAfter,
+    local_quantity_after: localQuantityAfter,
+    difference: localQuantityAfter - localQuantityBefore,
+    reason,
+    notes: notes || null,
+    date_submitted: submittedAt,
+    date_delivered: deliveredAt,
+    date_applied: appliedAt,
+    date_cloud_confirmed: cloudConfirmedAt,
+    stock_version_before: stockVersionBefore,
+    stock_version_after: stockVersionAfter,
+    result: 'APPLIED',
+  };
+
+  await recordAuditLog({
+    action: 'GLOBAL_ADMIN_STOCK_OVERRIDE',
+    entity: 'medicine',
+    entity_id: medicineId,
+    user_id: actor.user_id || undefined,
+    user_name: actor.user_name || 'Global Administrator',
+    role: 'ADMIN',
+    new_value: record,
+  }, client);
+
+  return record;
+}
+
 type Handler = (client: pg.PoolClient, cmd: CloudCommand) => Promise<Record<string, unknown>>;
+
+function isGlobalAdminCommand(cmd: CloudCommand): boolean {
+  return Boolean(
+    (cmd as any).is_global_admin ||
+    (cmd.payload as any)?.is_global_admin ||
+    (cmd as any).role === 'GLOBAL_ADMIN' ||
+    (cmd.payload as any)?.role === 'GLOBAL_ADMIN' ||
+    (cmd.created_by && /global[-_ ]?admin/i.test(cmd.created_by))
+  );
+}
 
 const HANDLERS: Record<string, Handler> = {
   // ---------------------------------------------------------------- medicines / prices
@@ -251,7 +350,13 @@ const HANDLERS: Record<string, Handler> = {
   async STOCK_ADD(client, cmd) {
     const p = validateCommandPayload('STOCK_ADD', cmd.payload);
     const batch = p.batch_id ? await batchOfMedicine(client, p.batch_id, p.medicine_id) : null;
-    if (batch) assertExpectedQuantity(Number(batch.quantity_available), p.expected_quantity, `batch ${batch.batch_number}`);
+    const isGlobalAdmin = isGlobalAdminCommand(cmd);
+    if (batch && !isGlobalAdmin) {
+      assertExpectedQuantity(Number(batch.quantity_available), p.expected_quantity, `batch ${batch.batch_number}`);
+    }
+    const localBefore = batch ? Number(batch.quantity_available) : 0;
+    const batchVersionBefore = (batch as any)?.stock_version ?? 1;
+
     const out = await adminAddStockTx(client, {
       ...cloudActor(cmd),
       medicine_id: p.medicine_id,
@@ -260,6 +365,25 @@ const HANDLERS: Record<string, Handler> = {
       expiry_date: batch ? undefined : p.expiry_date,
       notes: remoteNote(cmd, p.reason),
     });
+
+    if (isGlobalAdmin) {
+      const identity = await getShopIdentity();
+      await recordGlobalAdminStockAdjustmentAudit(client, {
+        cmd,
+        identity,
+        medicineId: p.medicine_id,
+        batchId: out.batch.id,
+        action: 'ADD',
+        onlineQuantityShown: p.expected_quantity ?? null,
+        localQuantityBefore: localBefore,
+        requestedAmount: p.quantity,
+        localQuantityAfter: Number(out.batch.quantity_available),
+        reason: p.reason || 'Administrative stock addition',
+        stockVersionBefore: batchVersionBefore,
+        stockVersionAfter: Number(out.batch.stock_version),
+      });
+    }
+
     return {
       medicine_id: p.medicine_id, batch_id: out.batch.id, batch_number: out.batch.batch_number, quantity_added: p.quantity,
       previous_quantity: out.movement.previous_quantity, new_quantity: out.movement.new_quantity, delta: out.movement.delta,
@@ -271,7 +395,13 @@ const HANDLERS: Record<string, Handler> = {
   async STOCK_REMOVE(client, cmd) {
     const p = validateCommandPayload('STOCK_REMOVE', cmd.payload);
     const batch = await batchOfMedicine(client, p.batch_id, p.medicine_id);
-    assertExpectedQuantity(Number(batch.quantity_available), p.expected_quantity, `batch ${batch.batch_number}`);
+    const isGlobalAdmin = isGlobalAdminCommand(cmd);
+    if (!isGlobalAdmin) {
+      assertExpectedQuantity(Number(batch.quantity_available), p.expected_quantity, `batch ${batch.batch_number}`);
+    }
+    const localBefore = Number(batch.quantity_available);
+    const batchVersionBefore = (batch as any)?.stock_version ?? 1;
+
     const out = await adminRemoveStockTx(client, {
       ...cloudActor(cmd),
       medicine_id: p.medicine_id,
@@ -280,6 +410,26 @@ const HANDLERS: Record<string, Handler> = {
       reason: p.reason,
       notes: remoteNote(cmd, p.notes ? `${p.reason} - ${p.notes}` : p.reason),
     });
+
+    if (isGlobalAdmin) {
+      const identity = await getShopIdentity();
+      await recordGlobalAdminStockAdjustmentAudit(client, {
+        cmd,
+        identity,
+        medicineId: p.medicine_id,
+        batchId: p.batch_id,
+        action: 'REMOVE',
+        onlineQuantityShown: p.expected_quantity ?? null,
+        localQuantityBefore: localBefore,
+        requestedAmount: p.quantity,
+        localQuantityAfter: Number(out.batch.quantity_available),
+        reason: p.reason || 'Administrative stock reduction',
+        stockVersionBefore: batchVersionBefore,
+        stockVersionAfter: Number(out.batch.stock_version),
+        notes: p.notes,
+      });
+    }
+
     return {
       medicine_id: p.medicine_id, batch_id: p.batch_id, batch_number: out.batch.batch_number, quantity_removed: p.quantity,
       previous_quantity: out.movement.previous_quantity, new_quantity: out.movement.new_quantity, delta: out.movement.delta,
@@ -287,23 +437,29 @@ const HANDLERS: Record<string, Handler> = {
     };
   },
 
-  // Physical count of one batch. expected_quantity is MANDATORY: when the batch quantity locked now
-  // differs from what the Administrator saw (a sale happened meanwhile) the count is REJECTED, so a
-  // stale count can never erase a cashier's movement.
+  // Physical count of one batch.
   async STOCK_SET(client, cmd) {
     const p = validateCommandPayload('STOCK_SET', cmd.payload);
     let current = 0;
     let label = `batch ${p.batch_number || ''}`.trim();
+    let batchId = p.batch_id;
+    let batchVersionBefore = 1;
     if (p.batch_id) {
       const b = await batchOfMedicine(client, p.batch_id, p.medicine_id);
       current = Number(b.quantity_available);
       label = `batch ${b.batch_number}`;
+      batchVersionBefore = (b as any)?.stock_version ?? 1;
     } else {
-      const b = (await client.query('SELECT quantity_available FROM medicine_batches WHERE medicine_id = $1 AND UPPER(batch_number) = $2 FOR UPDATE',
+      const b = (await client.query('SELECT id, quantity_available, stock_version FROM medicine_batches WHERE medicine_id = $1 AND UPPER(batch_number) = $2 FOR UPDATE',
         [p.medicine_id, p.batch_number])).rows[0];
       current = b ? Number(b.quantity_available) : 0;
+      batchId = b?.id;
+      batchVersionBefore = b ? Number(b.stock_version) : 1;
     }
-    assertExpectedQuantity(current, p.expected_quantity, label);
+    const isGlobalAdmin = isGlobalAdminCommand(cmd);
+    if (!isGlobalAdmin) {
+      assertExpectedQuantity(current, p.expected_quantity, label);
+    }
     const out = await adminPhysicalStockCountTx(client, {
       ...cloudActor(cmd),
       medicine_id: p.medicine_id,
@@ -311,6 +467,25 @@ const HANDLERS: Record<string, Handler> = {
       notes: remoteNote(cmd, p.reason),
     });
     const m = out.movements[0];
+
+    if (isGlobalAdmin) {
+      const identity = await getShopIdentity();
+      await recordGlobalAdminStockAdjustmentAudit(client, {
+        cmd,
+        identity,
+        medicineId: p.medicine_id,
+        batchId: batchId || null,
+        action: 'SET',
+        onlineQuantityShown: p.expected_quantity ?? null,
+        localQuantityBefore: current,
+        requestedAmount: p.quantity,
+        localQuantityAfter: Number(m.new_quantity),
+        reason: p.reason || 'Physical count adjustment',
+        stockVersionBefore: batchVersionBefore,
+        stockVersionAfter: Number(out.medicine?.stock_version ?? batchVersionBefore + 1),
+      });
+    }
+
     return {
       medicine_id: p.medicine_id, batch_id: m.batch_id, batch_number: m.batch_number, counted_quantity: p.quantity,
       previous_quantity: m.previous_quantity, new_quantity: m.new_quantity, delta: m.delta,
@@ -341,31 +516,20 @@ const HANDLERS: Record<string, Handler> = {
     const localAfter = Number(out.batch.quantity_available);
     const batchVersionAfter = Number(out.batch.stock_version);
 
-    await recordAuditLog({
-      action: 'GLOBAL_ADMIN_STOCK_OVERRIDE',
-      entity: 'medicine',
-      entity_id: p.medicine_id,
-      user_id: actor.user_id || undefined,
-      user_name: actor.user_name || 'CLOUD',
-      role: 'ADMIN',
-      new_value: {
-        admin_user_id: (cmd as any).created_by_user_id || null,
-        admin_email: cmd.created_by || null,
-        shop_id: identity.shop_id,
-        medicine_id: p.medicine_id,
-        batch_id: batchId,
-        operation: 'ADD',
-        cloud_quantity_seen: p.cloud_quantity_seen ?? null,
-        local_quantity_before: localBefore,
-        requested_quantity: p.quantity,
-        local_quantity_after: localAfter,
-        stock_version_before: batchVersionBefore,
-        stock_version_after: batchVersionAfter,
-        reason: p.reason,
-        command_id: cmd.command_id,
-        timestamp: new Date().toISOString(),
-      },
-    }, client);
+    const auditRecord = await recordGlobalAdminStockAdjustmentAudit(client, {
+      cmd,
+      identity,
+      medicineId: p.medicine_id,
+      batchId,
+      action: 'ADD',
+      onlineQuantityShown: p.cloud_quantity_seen ?? null,
+      localQuantityBefore: localBefore,
+      requestedAmount: p.quantity,
+      localQuantityAfter: localAfter,
+      reason: p.reason,
+      stockVersionBefore: batchVersionBefore,
+      stockVersionAfter: batchVersionAfter,
+    });
 
     return {
       medicine_id: p.medicine_id,
@@ -376,6 +540,7 @@ const HANDLERS: Record<string, Handler> = {
       medicine_total_after: Number(out.medicine.current_stock),
       stock_version: Number(out.medicine.stock_version),
       applied_at: new Date().toISOString(),
+      audit: auditRecord,
     };
   },
 
@@ -387,62 +552,69 @@ const HANDLERS: Record<string, Handler> = {
     const batch = await batchOfMedicine(client, p.batch_id, p.medicine_id);
     const localBefore = Number(batch.quantity_available);
     if (localBefore < p.quantity) {
-      throw new HttpError(409, `INSUFFICIENT_LOCAL_STOCK: Cannot remove ${p.quantity} units; local shop quantity is ${localBefore}. Result cannot be negative.`, {
-        code: 'INSUFFICIENT_LOCAL_STOCK',
-        local_quantity: localBefore,
-        requested: p.quantity,
-      });
+      if (!p.set_zero_if_insufficient) {
+        throw new HttpError(409, `INSUFFICIENT_LOCAL_STOCK: Current Shop stock is ${localBefore}. Removing ${p.quantity} would produce negative stock.`, {
+          code: 'INSUFFICIENT_LOCAL_STOCK',
+          local_quantity: localBefore,
+          requested: p.quantity,
+        });
+      }
     }
 
     const batchVersionBefore = (batch as any).stock_version ?? 1;
+    const isSetZero = Boolean(p.set_zero_if_insufficient && localBefore < p.quantity);
+    const removeQty = isSetZero ? localBefore : p.quantity;
+    const actionType: 'REMOVE' | 'SET_TO_ZERO' = isSetZero ? 'SET_TO_ZERO' : 'REMOVE';
 
-    const out = await adminRemoveStockTx(client, {
-      ...actor,
-      medicine_id: p.medicine_id,
-      batch_id: p.batch_id,
-      quantity: p.quantity,
-      reason: 'Physical stock correction',
-      notes: remoteNote(cmd, `OVERRIDE REMOVE: ${p.reason}${p.notes ? ` - ${p.notes}` : ''}`),
-    });
+    let localAfter = localBefore;
+    let batchVersionAfter = batchVersionBefore;
+    let medicineTotalAfter = 0;
 
-    const localAfter = Number(out.batch.quantity_available);
-    const batchVersionAfter = Number(out.batch.stock_version);
-
-    await recordAuditLog({
-      action: 'GLOBAL_ADMIN_STOCK_OVERRIDE',
-      entity: 'medicine',
-      entity_id: p.medicine_id,
-      user_id: actor.user_id || undefined,
-      user_name: actor.user_name || 'CLOUD',
-      role: 'ADMIN',
-      new_value: {
-        admin_user_id: (cmd as any).created_by_user_id || null,
-        admin_email: cmd.created_by || null,
-        shop_id: identity.shop_id,
+    if (removeQty > 0) {
+      const out = await adminRemoveStockTx(client, {
+        ...actor,
         medicine_id: p.medicine_id,
         batch_id: p.batch_id,
-        operation: 'REMOVE',
-        cloud_quantity_seen: p.cloud_quantity_seen ?? null,
-        local_quantity_before: localBefore,
-        requested_quantity: p.quantity,
-        local_quantity_after: localAfter,
-        stock_version_before: batchVersionBefore,
-        stock_version_after: batchVersionAfter,
-        reason: p.reason,
-        command_id: cmd.command_id,
-        timestamp: new Date().toISOString(),
-      },
-    }, client);
+        quantity: removeQty,
+        reason: 'Physical stock correction',
+        notes: remoteNote(cmd, `OVERRIDE ${actionType}: ${p.reason}${p.notes ? ` - ${p.notes}` : ''}${isSetZero ? ` (originally requested removal of ${p.quantity} reduced to ${removeQty} to avoid negative stock)` : ''}`),
+      });
+
+      localAfter = Number(out.batch.quantity_available);
+      batchVersionAfter = Number(out.batch.stock_version);
+      medicineTotalAfter = Number(out.medicine.current_stock);
+    } else {
+      localAfter = 0;
+      const med = (await client.query('SELECT current_stock FROM medicines WHERE id = $1', [p.medicine_id])).rows[0];
+      medicineTotalAfter = med ? Number(med.current_stock) : 0;
+    }
+
+    const auditRecord = await recordGlobalAdminStockAdjustmentAudit(client, {
+      cmd,
+      identity,
+      medicineId: p.medicine_id,
+      batchId: p.batch_id,
+      action: actionType,
+      onlineQuantityShown: p.cloud_quantity_seen ?? null,
+      localQuantityBefore: localBefore,
+      requestedAmount: p.quantity,
+      localQuantityAfter: localAfter,
+      reason: p.reason,
+      stockVersionBefore: batchVersionBefore,
+      stockVersionAfter: batchVersionAfter,
+      notes: isSetZero ? `Requested ${p.quantity}, set stock to zero from ${localBefore}` : (p.notes || undefined),
+    });
 
     return {
       medicine_id: p.medicine_id,
       batch_id: p.batch_id,
-      operation: 'REMOVE',
+      operation: actionType,
       local_before: localBefore,
       local_after: localAfter,
-      medicine_total_after: Number(out.medicine.current_stock),
-      stock_version: Number(out.medicine.stock_version),
+      medicine_total_after: medicineTotalAfter,
+      stock_version: batchVersionAfter,
       applied_at: new Date().toISOString(),
+      audit: auditRecord,
     };
   },
 
@@ -492,32 +664,22 @@ const HANDLERS: Record<string, Handler> = {
 
     const m = out.movements[0] || { new_quantity: p.quantity, previous_quantity: localBefore };
     const localAfter = Number(m.new_quantity);
+    const stockVersionAfter = Number(out.medicine?.stock_version ?? batchVersionBefore + 1);
 
-    await recordAuditLog({
-      action: 'GLOBAL_ADMIN_STOCK_OVERRIDE',
-      entity: 'medicine',
-      entity_id: p.medicine_id,
-      user_id: actor.user_id || undefined,
-      user_name: actor.user_name || 'CLOUD',
-      role: 'ADMIN',
-      new_value: {
-        admin_user_id: (cmd as any).created_by_user_id || null,
-        admin_email: cmd.created_by || null,
-        shop_id: identity.shop_id,
-        medicine_id: p.medicine_id,
-        batch_id: primaryBatchId || null,
-        operation: 'SET',
-        cloud_quantity_seen: p.cloud_quantity_seen ?? null,
-        local_quantity_before: localBefore,
-        requested_quantity: p.quantity,
-        local_quantity_after: localAfter,
-        stock_version_before: batchVersionBefore,
-        stock_version_after: Number(out.medicine?.stock_version ?? batchVersionBefore + 1),
-        reason: p.reason,
-        command_id: cmd.command_id,
-        timestamp: new Date().toISOString(),
-      },
-    }, client);
+    const auditRecord = await recordGlobalAdminStockAdjustmentAudit(client, {
+      cmd,
+      identity,
+      medicineId: p.medicine_id,
+      batchId: primaryBatchId || null,
+      action: 'SET',
+      onlineQuantityShown: p.cloud_quantity_seen ?? null,
+      localQuantityBefore: localBefore,
+      requestedAmount: p.quantity,
+      localQuantityAfter: localAfter,
+      reason: p.reason,
+      stockVersionBefore: batchVersionBefore,
+      stockVersionAfter,
+    });
 
     return {
       medicine_id: p.medicine_id,
@@ -528,6 +690,7 @@ const HANDLERS: Record<string, Handler> = {
       medicine_total_after: Number(out.total_stock),
       stock_version: Number(out.medicine?.stock_version ?? 1),
       applied_at: new Date().toISOString(),
+      audit: auditRecord,
     };
   },
 
@@ -999,17 +1162,12 @@ export async function applyCloudCommand(cmd: CloudCommand): Promise<CommandOutco
         const now = Date.now();
         let expired = false;
         const expiresAt = cmd.payload?.expires_at || cmd.expires_at;
-        const createdAt = cmd.payload?.created_at || cmd.created_at;
         if (expiresAt) {
           const exp = new Date(expiresAt).getTime();
           if (!Number.isNaN(exp) && now > exp) expired = true;
         }
-        if (!expired && createdAt) {
-          const created = new Date(createdAt).getTime();
-          if (!Number.isNaN(created) && now - created > 10 * 60 * 1000) expired = true;
-        }
         if (expired) {
-          throw new HttpError(409, 'STOCK_OVERRIDE_EXPIRED: The stock override command has expired (>10 minutes). Refresh stock from shop and try again.', {
+          throw new HttpError(409, 'STOCK_OVERRIDE_EXPIRED: The stock override command has expired. Refresh stock from shop and try again.', {
             code: 'STOCK_OVERRIDE_EXPIRED',
           });
         }

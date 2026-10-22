@@ -509,7 +509,28 @@ export async function getSyncStatus() {
     device_id: cfg.deviceId,
   };
   if (!cfg.outboxEnabled) {
-    return { ...base, shop_id: null, branch_id: null, shop_code: null, counts: null, cloud: null, worker: null, last_sync: null, last_error: null };
+    return {
+      ...base,
+      shop_id: null,
+      branch_id: null,
+      shop_code: null,
+      counts: null,
+      cloud: null,
+      worker: null,
+      last_sync: null,
+      last_error: null,
+      last_error_at: null,
+      last_error_resolved: false,
+      last_contact: null,
+      last_contact_at: null,
+      last_success_at: null,
+      last_business_upload_at: null,
+      consecutive_failures: 0,
+      current_cloud_state: 'OFFLINE' as 'HEALTHY' | 'DEGRADED' | 'OFFLINE',
+      inbound_commands: null,
+      last_event_error: null,
+      cloud_reachable: null,
+    };
   }
   const [identity, counts, state, inbound] = await Promise.all([
     getShopIdentity(),

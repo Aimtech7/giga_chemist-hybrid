@@ -14,10 +14,12 @@ import {
   Receipt,
   ArrowDownRight,
   TrendingDown,
+  Layers,
 } from 'lucide-react';
 import { apiFetch } from '../../services/http';
 import { downloadCSV } from '../../services/exportUtils';
 import type { Sale, PharmacySettings, User } from '../../types';
+import { StockAdjustmentRegister } from '../audit/StockAdjustmentRegister';
 
 interface ServerReport {
   range: string;
@@ -56,7 +58,7 @@ interface ReportsDashboardProps {
   settings: PharmacySettings;
 }
 
-type ReportTab = 'summary' | 'sales' | 'returns' | 'expenses' | 'medicines' | 'cashiers' | 'tenders';
+type ReportTab = 'summary' | 'sales' | 'returns' | 'expenses' | 'medicines' | 'cashiers' | 'tenders' | 'global-admin-stock';
 
 export const ReportsDashboard: React.FC<ReportsDashboardProps> = ({ currentUser, settings }) => {
   // All totals come from PostgreSQL (GET /api/reports/summary) over the FULL history, on
@@ -334,6 +336,7 @@ export const ReportsDashboard: React.FC<ReportsDashboardProps> = ({ currentUser,
           { id: 'medicines' as ReportTab, label: 'Medicine Velocity', icon: Pill },
           { id: 'cashiers' as ReportTab, label: 'Cashier Accountability', icon: Users },
           { id: 'tenders' as ReportTab, label: 'Payment Tenders', icon: CreditCard },
+          { id: 'global-admin-stock' as ReportTab, label: 'Global Admin Stock Changes', icon: Layers },
         ].map((t) => {
           const Icon = t.icon;
           const active = activeTab === t.id;
@@ -683,6 +686,11 @@ export const ReportsDashboard: React.FC<ReportsDashboardProps> = ({ currentUser,
               </tbody>
             </table>
           </div>
+        )}
+
+        {/* TAB 7: GLOBAL ADMIN STOCK CHANGES */}
+        {activeTab === 'global-admin-stock' && (
+          <StockAdjustmentRegister />
         )}
       </div>
     </div>

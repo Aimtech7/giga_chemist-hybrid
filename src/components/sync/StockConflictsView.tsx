@@ -50,7 +50,8 @@ export const StockConflictsView: React.FC<StockConflictsViewProps> = ({ online }
 
   // Form state
   const [overrideQty, setOverrideQty] = useState('');
-  const [overrideReason, setOverrideReason] = useState('');
+  const [selectedPreset, setSelectedPreset] = useState<string>('Physical count correction');
+  const [otherReason, setOtherReason] = useState('');
   const [confirmed, setConfirmed] = useState(false);
   const [confirmText, setConfirmText] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -119,7 +120,8 @@ export const StockConflictsView: React.FC<StockConflictsViewProps> = ({ online }
     setSelectedConflict(item);
     setOverrideKind(kind);
     setOverrideQty('');
-    setOverrideReason('');
+    setSelectedPreset('Physical count correction');
+    setOtherReason('');
     setConfirmed(false);
     setConfirmText('');
   };
@@ -128,28 +130,26 @@ export const StockConflictsView: React.FC<StockConflictsViewProps> = ({ online }
     setSelectedConflict(null);
     setOverrideKind(null);
     setOverrideQty('');
-    setOverrideReason('');
+    setSelectedPreset('Physical count correction');
+    setOtherReason('');
     setConfirmed(false);
     setConfirmText('');
   };
 
-  const submitOverride = async () => {
+  const submitOverride = async (setZeroIfInsufficient = false) => {
     if (!selectedConflict || !overrideKind) return;
     const qty = Number(overrideQty);
     if (!Number.isFinite(qty) || qty < 0 || (overrideKind !== 'set' && qty === 0)) {
       setMsg({ ok: false, text: 'Please enter a valid quantity.' });
       return;
     }
-    if (overrideReason.trim().length < 3) {
-      setMsg({ ok: false, text: 'Please provide a meaningful reason (at least 3 characters).' });
+    const finalReason = selectedPreset === 'Other' ? otherReason.trim() : selectedPreset;
+    if (finalReason.length < 3) {
+      setMsg({ ok: false, text: 'Please provide an explanation for the reason.' });
       return;
     }
     if (!confirmed) {
-      setMsg({ ok: false, text: 'Please acknowledge the override confirmation checkbox.' });
-      return;
-    }
-    if ((overrideKind === 'remove' || (overrideKind === 'set' && qty < selectedConflict.shop_quantity)) && confirmText.trim().toUpperCase() !== 'OVERRIDE') {
-      setMsg({ ok: false, text: 'Please type "OVERRIDE" to confirm this stock reduction.' });
+      setMsg({ ok: false, text: 'Please acknowledge the confirmation checkbox.' });
       return;
     }
 
@@ -166,8 +166,9 @@ export const StockConflictsView: React.FC<StockConflictsViewProps> = ({ online }
       const payload: Record<string, any> = {
         medicine_id: selectedConflict.medicine_id,
         quantity: qty,
-        reason: overrideReason.trim(),
+        reason: finalReason,
         cloud_quantity_seen: selectedConflict.cloud_quantity,
+        set_zero_if_insufficient: setZeroIfInsufficient,
       };
       if (selectedConflict.batch_id) {
         payload.batch_id = selectedConflict.batch_id;
@@ -179,12 +180,19 @@ export const StockConflictsView: React.FC<StockConflictsViewProps> = ({ online }
       await queueRemoteCommand(action, payload);
       setMsg({
         ok: true,
-        text: `Stock override command (${overrideKind.toUpperCase()}) queued for "${selectedConflict.medicine_name}". Shop will execute against live stock.`,
+        text: `Authoritative stock directive (${overrideKind.toUpperCase()}) queued for "${selectedConflict.medicine_name}". Shop will execute against live stock.`,
       });
       closeOverride();
       setTimeout(loadConflicts, 2500);
     } catch (err: any) {
-      setMsg({ ok: false, text: err?.message || 'Failed to submit stock override.' });
+      if (err?.details?.code === 'INSUFFICIENT_LOCAL_STOCK' || err?.code === 'INSUFFICIENT_LOCAL_STOCK') {
+        setMsg({
+          ok: false,
+          text: `Current Shop stock is ${err.details?.local_quantity ?? selectedConflict.shop_quantity}. Removing ${qty} would produce negative stock.`,
+        });
+      } else {
+        setMsg({ ok: false, text: err?.message || 'Failed to submit stock directive.' });
+      }
     } finally {
       setSubmitting(false);
     }
@@ -317,19 +325,19 @@ export const StockConflictsView: React.FC<StockConflictsViewProps> = ({ online }
                           onClick={() => openOverride(item, 'add')}
                           className="px-2 py-1 rounded bg-blue-50 border border-blue-200 text-blue-800 text-[11px] font-semibold hover:bg-blue-100"
                         >
-                          + Override
+                          Add Stock
                         </button>
                         <button
                           onClick={() => openOverride(item, 'remove')}
                           className="px-2 py-1 rounded bg-amber-50 border border-amber-200 text-amber-800 text-[11px] font-semibold hover:bg-amber-100"
                         >
-                          - Override
+                          Remove Stock
                         </button>
                         <button
                           onClick={() => openOverride(item, 'set')}
                           className="px-2 py-1 rounded bg-purple-50 border border-purple-200 text-purple-800 text-[11px] font-semibold hover:bg-purple-100"
                         >
-                          Set Count
+                          Set Physical Count
                         </button>
                       </>
                     )}
@@ -355,27 +363,43 @@ export const StockConflictsView: React.FC<StockConflictsViewProps> = ({ online }
       {/* Stock Override Modal */}
       {selectedConflict && overrideKind && (
         <div className="fixed inset-0 bg-black/40 backdrop-blur-xs flex items-center justify-center p-4 z-50">
-          <div className="bg-white rounded-2xl max-w-md w-full shadow-xl border border-slate-200 overflow-hidden">
+          <div className="bg-white rounded-2xl max-w-lg w-full shadow-xl border border-slate-200 overflow-hidden">
             <div className="px-4 py-3 bg-slate-900 text-white flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <ShieldAlert className="w-4 h-4 text-amber-400" />
                 <span className="text-sm font-bold">
-                  OVERRIDE STOCK — {overrideKind === 'add' ? 'ADD' : overrideKind === 'remove' ? 'REMOVE' : 'SET PHYSICAL COUNT'}
+                  {overrideKind === 'add' ? 'Add Stock' : overrideKind === 'remove' ? 'Remove Stock' : 'Set Physical Count'}
+                </span>
+                <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-400 text-slate-900">
+                  GLOBAL ADMIN — AUTHORITATIVE CHANGE
                 </span>
               </div>
               <button onClick={closeOverride} className="text-slate-400 hover:text-white"><X className="w-4 h-4" /></button>
             </div>
 
             <div className="p-4 space-y-3 text-xs">
-              <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg space-y-1">
-                <div className="font-bold text-amber-900 text-sm">{selectedConflict.medicine_name}</div>
-                <div className="flex justify-between text-amber-800">
-                  <span>Cloud seen quantity:</span>
-                  <span className="font-bold font-mono">{selectedConflict.cloud_quantity}</span>
+              <p className="text-[11px] text-slate-600 font-medium">
+                This instruction will be applied to the Shop's actual stock even if the stock has changed since this page was loaded.
+              </p>
+
+              {/* Informational Comparison Box */}
+              <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg space-y-1.5">
+                <div className="font-bold text-slate-900 text-sm">{selectedConflict.medicine_name}</div>
+                <div className="grid grid-cols-2 gap-2 text-slate-700 pt-1">
+                  <div>
+                    <span className="text-slate-400 block text-[10px] uppercase font-semibold">Online Last Showed</span>
+                    <span className="font-bold font-mono text-slate-800">{selectedConflict.cloud_quantity}</span>
+                  </div>
+                  <div>
+                    <span className="text-slate-400 block text-[10px] uppercase font-semibold">Shop Last Reported</span>
+                    <span className="font-bold font-mono text-slate-900">{selectedConflict.shop_quantity}</span>
+                  </div>
                 </div>
-                <div className="flex justify-between text-amber-800">
-                  <span>Authoritative Shop quantity:</span>
-                  <span className="font-bold font-mono">{selectedConflict.shop_quantity}</span>
+                <div className="pt-1.5 border-t border-slate-200 text-teal-800 text-[11px]">
+                  <strong>Instruction:</strong> {overrideKind.toUpperCase()} {overrideQty || 0}
+                  <div className="text-[10px] text-slate-500 mt-0.5">
+                    Important: The Shop will apply this instruction to whatever quantity is actually present when this command is executed.
+                  </div>
                 </div>
               </div>
 
@@ -393,16 +417,64 @@ export const StockConflictsView: React.FC<StockConflictsViewProps> = ({ online }
                 />
               </div>
 
+              {/* Mandatory Reason with Presets */}
               <div>
                 <label className="block font-semibold text-slate-700 mb-1">Reason (required):</label>
-                <input
-                  type="text"
-                  value={overrideReason}
-                  onChange={(e) => setOverrideReason(e.target.value)}
-                  placeholder="e.g. Physical count verified by administrator"
+                <select
+                  value={selectedPreset}
+                  onChange={(e) => setSelectedPreset(e.target.value)}
                   className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs focus:ring-1 focus:ring-teal-600 focus:outline-none"
-                />
+                >
+                  <option value="Physical count correction">Physical count correction</option>
+                  <option value="Stock entry correction">Stock entry correction</option>
+                  <option value="Unrecorded delivery">Unrecorded delivery</option>
+                  <option value="Damaged stock">Damaged stock</option>
+                  <option value="Expired stock">Expired stock</option>
+                  <option value="Migration correction">Migration correction</option>
+                  <option value="Opening balance correction">Opening balance correction</option>
+                  <option value="Other">Other</option>
+                </select>
+
+                {selectedPreset === 'Other' && (
+                  <input
+                    type="text"
+                    value={otherReason}
+                    onChange={(e) => setOtherReason(e.target.value)}
+                    placeholder="Please specify explanation (required)..."
+                    className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs mt-1.5 focus:ring-1 focus:ring-teal-600 focus:outline-none"
+                  />
+                )}
               </div>
+
+              {/* Negative Stock Warning and Option */}
+              {overrideKind === 'remove' && Number(overrideQty) > selectedConflict.shop_quantity && (
+                <div className="p-3 bg-rose-50 border-2 border-rose-300 rounded-lg space-y-2">
+                  <div className="font-bold text-rose-900 text-xs flex items-center gap-1.5">
+                    <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+                    <span>Insufficient Shop Stock For Removal</span>
+                  </div>
+                  <p className="text-xs text-rose-800">
+                    Current Shop stock is <strong className="font-mono">{selectedConflict.shop_quantity}</strong>. Removing <strong className="font-mono">{overrideQty}</strong> would produce negative stock.
+                  </p>
+                  <div className="pt-1 flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => void submitOverride(true)}
+                      disabled={submitting}
+                      className="px-3 py-1.5 rounded bg-rose-700 text-white text-xs font-bold hover:bg-rose-800 disabled:opacity-50"
+                    >
+                      SET STOCK TO ZERO
+                    </button>
+                    <button
+                      type="button"
+                      onClick={closeOverride}
+                      className="px-3 py-1.5 rounded border border-rose-300 bg-white text-rose-800 text-xs font-semibold hover:bg-rose-50"
+                    >
+                      CANCEL
+                    </button>
+                  </div>
+                </div>
+              )}
 
               <div className="pt-2 border-t border-slate-100 space-y-2">
                 <label className="flex items-start gap-2 cursor-pointer text-slate-700">
@@ -413,23 +485,9 @@ export const StockConflictsView: React.FC<StockConflictsViewProps> = ({ online }
                     className="mt-0.5 rounded text-teal-600 focus:ring-teal-500"
                   />
                   <span className="text-[11px] leading-snug">
-                    I understand this will change the Shop's authoritative stock via a local PostgreSQL transaction and generate an auditable movement.
+                    I understand this will change the Shop's actual stock via an authoritative PostgreSQL transaction and generate an immutable audit record.
                   </span>
                 </label>
-
-                {(overrideKind === 'remove' || (overrideKind === 'set' && Number(overrideQty) < selectedConflict.shop_quantity)) && (
-                  <div className="p-2.5 bg-rose-50 border border-rose-200 rounded-lg space-y-1">
-                    <div className="font-bold text-rose-900 text-[11px]">Destructive Stock Reduction Confirmation:</div>
-                    <p className="text-[10px] text-rose-700">Type OVERRIDE below to confirm reducing stock at the shop.</p>
-                    <input
-                      type="text"
-                      placeholder="Type OVERRIDE"
-                      value={confirmText}
-                      onChange={(e) => setConfirmText(e.target.value)}
-                      className="w-full px-2.5 py-1.5 border border-rose-300 rounded text-xs font-mono uppercase focus:ring-1 focus:ring-rose-600 focus:outline-none"
-                    />
-                  </div>
-                )}
               </div>
             </div>
 
@@ -442,12 +500,12 @@ export const StockConflictsView: React.FC<StockConflictsViewProps> = ({ online }
                 Cancel
               </button>
               <button
-                onClick={submitOverride}
-                disabled={submitting || !confirmed}
+                onClick={() => void submitOverride(false)}
+                disabled={submitting || !confirmed || (overrideKind === 'remove' && Number(overrideQty) > selectedConflict.shop_quantity)}
                 className="px-3 py-1.5 rounded-lg bg-teal-800 text-white text-xs font-semibold hover:bg-teal-900 disabled:opacity-50 flex items-center gap-1.5"
               >
                 {submitting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Wrench className="w-3.5 h-3.5" />}
-                <span>Execute Override Command</span>
+                <span>Execute Authoritative Command</span>
               </button>
             </div>
           </div>

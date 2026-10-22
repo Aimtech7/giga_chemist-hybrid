@@ -413,7 +413,7 @@ export function validateCommandPayload(type: string, payload: unknown): Record<s
       return out;
     }
     case 'STOCK_OVERRIDE_ADD': {
-      onlyKeys(p, ['medicine_id', 'batch_id', 'batch_number', 'expiry_date', 'purchase_price', 'quantity', 'reason', 'cloud_quantity_seen', 'created_at', 'expires_at'], 'STOCK_OVERRIDE_ADD');
+      onlyKeys(p, ['medicine_id', 'batch_id', 'batch_number', 'expiry_date', 'purchase_price', 'quantity', 'reason', 'cloud_quantity_seen', 'expected_quantity', 'created_at', 'expires_at'], 'STOCK_OVERRIDE_ADD');
       const out: Record<string, any> = {
         medicine_id: uuid(p.medicine_id, 'medicine_id'),
         quantity: wholeNumber(p.quantity, 'quantity', 1),
@@ -429,15 +429,18 @@ export function validateCommandPayload(type: string, payload: unknown): Record<s
           out.purchase_price = money(p.purchase_price, 'purchase_price', false);
         }
       }
-      if (p.cloud_quantity_seen !== undefined && p.cloud_quantity_seen !== null && p.cloud_quantity_seen !== '') {
-        out.cloud_quantity_seen = wholeNumber(p.cloud_quantity_seen, 'cloud_quantity_seen', 0);
+      const seen = p.cloud_quantity_seen !== undefined && p.cloud_quantity_seen !== null && p.cloud_quantity_seen !== ''
+        ? p.cloud_quantity_seen
+        : p.expected_quantity;
+      if (seen !== undefined && seen !== null && seen !== '') {
+        out.cloud_quantity_seen = wholeNumber(seen, 'cloud_quantity_seen', 0);
       }
       if (typeof p.created_at === 'string') out.created_at = p.created_at;
       if (typeof p.expires_at === 'string') out.expires_at = p.expires_at;
       return out;
     }
     case 'STOCK_OVERRIDE_REMOVE': {
-      onlyKeys(p, ['medicine_id', 'batch_id', 'quantity', 'reason', 'notes', 'cloud_quantity_seen', 'created_at', 'expires_at'], 'STOCK_OVERRIDE_REMOVE');
+      onlyKeys(p, ['medicine_id', 'batch_id', 'quantity', 'reason', 'notes', 'cloud_quantity_seen', 'expected_quantity', 'set_zero_if_insufficient', 'created_at', 'expires_at'], 'STOCK_OVERRIDE_REMOVE');
       const out: Record<string, any> = {
         medicine_id: uuid(p.medicine_id, 'medicine_id'),
         batch_id: uuid(p.batch_id, 'batch_id'),
@@ -445,15 +448,19 @@ export function validateCommandPayload(type: string, payload: unknown): Record<s
         reason: reasonText(p.reason, true),
       };
       if (p.notes !== undefined) out.notes = text(p.notes, 'notes', { clearable: true });
-      if (p.cloud_quantity_seen !== undefined && p.cloud_quantity_seen !== null && p.cloud_quantity_seen !== '') {
-        out.cloud_quantity_seen = wholeNumber(p.cloud_quantity_seen, 'cloud_quantity_seen', 0);
+      const seen = p.cloud_quantity_seen !== undefined && p.cloud_quantity_seen !== null && p.cloud_quantity_seen !== ''
+        ? p.cloud_quantity_seen
+        : p.expected_quantity;
+      if (seen !== undefined && seen !== null && seen !== '') {
+        out.cloud_quantity_seen = wholeNumber(seen, 'cloud_quantity_seen', 0);
       }
+      if (p.set_zero_if_insufficient !== undefined) out.set_zero_if_insufficient = Boolean(p.set_zero_if_insufficient);
       if (typeof p.created_at === 'string') out.created_at = p.created_at;
       if (typeof p.expires_at === 'string') out.expires_at = p.expires_at;
       return out;
     }
     case 'STOCK_OVERRIDE_SET': {
-      onlyKeys(p, ['medicine_id', 'batch_id', 'batch_number', 'quantity', 'reason', 'cloud_quantity_seen', 'batch_counts', 'created_at', 'expires_at'], 'STOCK_OVERRIDE_SET');
+      onlyKeys(p, ['medicine_id', 'batch_id', 'batch_number', 'quantity', 'reason', 'cloud_quantity_seen', 'expected_quantity', 'batch_counts', 'created_at', 'expires_at'], 'STOCK_OVERRIDE_SET');
       const out: Record<string, any> = {
         medicine_id: uuid(p.medicine_id, 'medicine_id'),
         quantity: wholeNumber(p.quantity ?? 0, 'quantity', 0),
@@ -471,8 +478,11 @@ export function validateCommandPayload(type: string, payload: unknown): Record<s
           };
         });
       }
-      if (p.cloud_quantity_seen !== undefined && p.cloud_quantity_seen !== null && p.cloud_quantity_seen !== '') {
-        out.cloud_quantity_seen = wholeNumber(p.cloud_quantity_seen, 'cloud_quantity_seen', 0);
+      const seen = p.cloud_quantity_seen !== undefined && p.cloud_quantity_seen !== null && p.cloud_quantity_seen !== ''
+        ? p.cloud_quantity_seen
+        : p.expected_quantity;
+      if (seen !== undefined && seen !== null && seen !== '') {
+        out.cloud_quantity_seen = wholeNumber(seen, 'cloud_quantity_seen', 0);
       }
       if (typeof p.created_at === 'string') out.created_at = p.created_at;
       if (typeof p.expires_at === 'string') out.expires_at = p.expires_at;

@@ -115,6 +115,7 @@ async function run() {
     console.log('--- ALL CLOUD RPC PERFORMANCE TESTS PASSED ---');
   } finally {
     // Clean up test shop
+    await cloudClient.query('DELETE FROM giga_cloud.shop_runtime_status WHERE shop_id = $1', [testShopId]).catch(() => {});
     await cloudClient.query('DELETE FROM giga_cloud.shops WHERE shop_id = $1', [testShopId]).catch(() => {});
     await cloudClient.end();
   }

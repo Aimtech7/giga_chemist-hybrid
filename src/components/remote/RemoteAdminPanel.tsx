@@ -21,6 +21,8 @@ import {
   X,
   XCircle,
   Trash2,
+  ShieldAlert,
+  AlertTriangle,
 } from 'lucide-react';
 import { apiFetch, ApiError } from '../../services/http';
 import {
@@ -513,9 +515,22 @@ export const RemoteAdminPanel: React.FC<Props> = ({ currentUser, settings, initi
               <div className="font-bold text-amber-900">{status?.shop_name || status?.shop_code || 'Unknown shop'}{status?.shop_code ? ` (${status.shop_code})` : ''}</div>
             </div>
           )}
+          {isGlobalAdminAccount() && ['stock-add', 'stock-remove', 'stock-set', 'stock-override-add', 'stock-override-remove', 'stock-override-set'].includes(draft.action) && (
+            <div className="mb-2 rounded-lg border border-teal-300 bg-teal-50 px-3 py-2 text-xs">
+              <div className="flex items-center gap-1.5 font-bold text-teal-900">
+                <ShieldAlert className="w-3.5 h-3.5 text-teal-700" />
+                <span>GLOBAL ADMIN — AUTHORITATIVE CHANGE</span>
+              </div>
+              <p className="text-[11px] text-teal-800 mt-1">
+                This instruction will be applied to the Shop's actual stock even if the stock has changed since this page was loaded.
+              </p>
+            </div>
+          )}
           {!draft.allShops && status && !status.shop_in_contact && ['stock-add', 'stock-remove', 'stock-set', 'batch-create', 'purchase-receive', 'return-approve', 'sale-void'].includes(draft.action) && (
-            <div className="mb-2 rounded-lg border-2 border-rose-500 bg-rose-50 px-3 py-2 text-[12px] text-rose-900 font-semibold">
-              The shop computer is OFFLINE. This stock change will wait and be checked against the shop's live figures when it arrives; if anything changed meanwhile it is REJECTED, never forced.
+            <div className="mb-2 rounded-lg border-2 border-amber-500 bg-amber-50 px-3 py-2 text-[12px] text-amber-900 font-semibold">
+              {isGlobalAdminAccount()
+                ? 'The shop computer is OFFLINE. This administrative directive will wait in queue (PENDING) and execute automatically against the shop live stock when the shop reconnects.'
+                : 'The shop computer is OFFLINE. This stock change will wait and be checked against the shop\'s live figures when it arrives; if anything changed meanwhile it is REJECTED, never forced.'}
             </div>
           )}
           <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 space-y-1.5 text-sm">

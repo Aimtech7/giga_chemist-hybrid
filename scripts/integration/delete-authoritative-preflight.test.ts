@@ -35,7 +35,7 @@ async function run() {
       sku: `SKU-PF-${uid}`,
       barcode: `BAR-PF-${uid}`,
       selling_price: 100,
-      cost_price: 60,
+      purchase_price: 60,
       current_stock: 0,
     }, adminActor);
 
@@ -149,7 +149,7 @@ async function run() {
       sku: `SKU-HIST-${histUid}`,
       barcode: `BAR-HIST-${histUid}`,
       selling_price: 200,
-      cost_price: 120,
+      purchase_price: 120,
       current_stock: 0,
     }, adminActor);
 
@@ -212,7 +212,7 @@ async function run() {
       sku: `SKU-STK-${stockUid}`,
       barcode: `BAR-STK-${stockUid}`,
       selling_price: 50,
-      cost_price: 30,
+      purchase_price: 30,
     }, adminActor);
     await client.query('UPDATE medicines SET current_stock = 15 WHERE id = $1', [stockMedId]);
   });
