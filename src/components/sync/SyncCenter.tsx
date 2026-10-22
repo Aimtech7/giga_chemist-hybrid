@@ -601,7 +601,16 @@ export const SyncCenter: React.FC<{ online: boolean }> = ({ online }) => {
                   <div key={String(k)} className="bg-white border border-slate-200 rounded-lg p-2 shadow-xs"><div className="text-[10px] uppercase text-slate-500 font-semibold">{k}</div><div className="text-sm font-bold">{String(v)}</div></div>
                 ))}
               </div>
-              <div className="text-[11px] text-slate-500">Last successful sync {when(data.status?.last_sync)}{data.status?.last_error ? ` · last error: ${data.status.last_error}` : ''}</div>
+              <div className="text-[11px] text-slate-500 space-y-0.5">
+                <div>
+                  Cloud contact: <span className="font-semibold text-slate-700">{when(data.status?.last_contact_at || data.status?.last_contact)}</span> · Last business upload: <span className="font-semibold text-slate-700">{when(data.status?.last_business_upload_at || data.status?.last_sync)}</span> · Pending uploads: <span className="font-semibold text-slate-700">{data.status?.counts?.pending ?? 0}</span>
+                </div>
+                {data.status?.last_error && (
+                  <div className="text-slate-600">
+                    Last error: <span className="text-slate-800">{data.status.last_error}</span> · Occurred: <span>{when(data.status.last_error_at)}</span> · Resolved: <span className={data.status.last_error_resolved ? 'text-emerald-700 font-bold' : 'text-rose-700 font-bold'}>{data.status.last_error_resolved ? 'YES' : 'NO'}</span>
+                  </div>
+                )}
+              </div>
               <div className="flex items-center justify-between">
                 <div className="text-sm font-bold text-slate-800">Failed / retrying events</div>
                 <button className={btn} disabled={busy || !data.failed_events.some((e: any) => e.status === 'FAILED')} onClick={() => void run(() => apiFetch('/api/sync/retry-failed', { body: {} }), 'Failed events re-queued')}><RotateCcw className="w-3.5 h-3.5" /> Retry all failed</button>

@@ -61,31 +61,29 @@ const SALE_COLUMNS = `
 async function hydrateSales(q: Queryable, rows: any[]): Promise<Sale[]> {
   if (rows.length === 0) return [];
   const ids = rows.map((r) => r.id);
-  const [items, payments, returned] = await Promise.all([
-    q.query(
-      `SELECT si.id, si.sale_id, si.medicine_id, m.name AS medicine_name, m.generic_name,
-              si.batch_id, si.batch_number, si.expiry_date,
-              si.quantity::int AS quantity, si.unit_price::float AS unit_price, COALESCE(si.discount, 0)::float AS discount,
-              si.cost_price_snapshot::float AS cost_price_snapshot, si.total::float AS total, si.price_mode
-       FROM sale_items si LEFT JOIN medicines m ON si.medicine_id = m.id
-       WHERE si.sale_id = ANY($1::uuid[])
-       ORDER BY si.created_at, si.id`,
-      [ids]
-    ),
-    q.query(
-      `SELECT sale_id, method, amount::float AS amount, reference FROM payments
-       WHERE sale_id = ANY($1::uuid[]) ORDER BY created_at, id`,
-      [ids]
-    ),
-    q.query(
-      `SELECT sale_id, medicine_id, batch_id,
-              COALESCE(SUM(approved_quantity) FILTER (WHERE status = 'APPROVED'), 0)::int AS qty,
-              COALESCE(SUM(quantity) FILTER (WHERE status = 'PENDING'), 0)::int AS pending,
-              COALESCE(SUM(refund_amount) FILTER (WHERE status = 'APPROVED'), 0)::float AS refunded
-       FROM returns WHERE sale_id = ANY($1::uuid[]) GROUP BY sale_id, medicine_id, batch_id`,
-      [ids]
-    ),
-  ]);
+  const items = await q.query(
+    `SELECT si.id, si.sale_id, si.medicine_id, m.name AS medicine_name, m.generic_name,
+            si.batch_id, si.batch_number, si.expiry_date,
+            si.quantity::int AS quantity, si.unit_price::float AS unit_price, COALESCE(si.discount, 0)::float AS discount,
+            si.cost_price_snapshot::float AS cost_price_snapshot, si.total::float AS total, si.price_mode
+     FROM sale_items si LEFT JOIN medicines m ON si.medicine_id = m.id
+     WHERE si.sale_id = ANY($1::uuid[])
+     ORDER BY si.created_at, si.id`,
+    [ids]
+  );
+  const payments = await q.query(
+    `SELECT sale_id, method, amount::float AS amount, reference FROM payments
+     WHERE sale_id = ANY($1::uuid[]) ORDER BY created_at, id`,
+    [ids]
+  );
+  const returned = await q.query(
+    `SELECT sale_id, medicine_id, batch_id,
+            COALESCE(SUM(approved_quantity) FILTER (WHERE status = 'APPROVED'), 0)::int AS qty,
+            COALESCE(SUM(quantity) FILTER (WHERE status = 'PENDING'), 0)::int AS pending,
+            COALESCE(SUM(refund_amount) FILTER (WHERE status = 'APPROVED'), 0)::float AS refunded
+     FROM returns WHERE sale_id = ANY($1::uuid[]) GROUP BY sale_id, medicine_id, batch_id`,
+    [ids]
+  );
 
   const itemsBySale = new Map<string, any[]>();
   for (const it of items.rows) {

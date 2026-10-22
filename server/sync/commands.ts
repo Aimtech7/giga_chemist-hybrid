@@ -2,7 +2,7 @@ import type pg from 'pg';
 import { HttpError, isValidUuid, withTransaction } from '../db/client';
 import { recordAuditLog } from '../db/audit';
 import { assertExpected, assertExpectedQuantity } from '../db/concurrency';
-import { applyPricingUpdate, createMedicineTx, deleteOrArchiveMedicineTx, getMedicineById, updateMedicineDetailsTx, type MedicineActor } from '../db/medicines';
+import { applyPricingUpdate, createMedicineTx, deleteOrArchiveMedicineTx, generateAuthoritativeDeletePreflight, getMedicineById, updateMedicineDetailsTx, type MedicineActor } from '../db/medicines';
 import { updatePharmacySettingsTx } from '../db/settings';
 import {
   adminAddStockTx, adminCreateBatchTx, adminEditBatchExpiryTx, adminPhysicalStockCountTx, adminRemoveStockTx,
@@ -206,10 +206,17 @@ const HANDLERS: Record<string, Handler> = {
     return { medicine_id: p.medicine_id, name: saved.name, previous_status: before.status, status: saved.status };
   },
 
+  async MEDICINE_DELETE_PREFLIGHT(client, cmd) {
+    const p = validateCommandPayload('MEDICINE_DELETE_PREFLIGHT', cmd.payload);
+    const preflight = await generateAuthoritativeDeletePreflight(client, p.medicine_id, p.reason);
+    return preflight as unknown as Record<string, unknown>;
+  },
+
   async MEDICINE_DELETE(client, cmd) {
     const p = validateCommandPayload('MEDICINE_DELETE', cmd.payload);
     const actor = cloudActor(cmd);
     const res = await deleteOrArchiveMedicineTx(client, p.medicine_id, actor, {
+      preflight_id: p.preflight_id as string | undefined,
       expected_version: p.expected_version as number | undefined,
       expected_status: p.expected_status as string | undefined,
       expected_current_stock: p.expected_current_stock as number | undefined,

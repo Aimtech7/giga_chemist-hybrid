@@ -78,6 +78,7 @@ export const ACTIONS: Record<string, CommandType> = {
   'medicine-create': 'MEDICINE_CREATE',
   'medicine-active': 'MEDICINE_SET_ACTIVE',
   'medicine-delete': 'MEDICINE_DELETE',
+  'medicine-delete-preflight': 'MEDICINE_DELETE_PREFLIGHT',
   'batch-create': 'BATCH_CREATE',
   'batch-update': 'BATCH_UPDATE',
   'batch-active': 'BATCH_SET_ACTIVE',
@@ -418,7 +419,7 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
       display.current_commit = rt.update_state.current_commit ?? null;
       display.available_version = rt.update_state.available_version ?? null;
     }
-    if (type === 'MEDICINE_DELETE') {
+    if (type === 'MEDICINE_DELETE' || type === 'MEDICINE_DELETE_PREFLIGHT') {
       if (!deps.isGlobalAdmin(u)) {
         throw new HttpError(403, 'Forbidden: Global Administrator only.', { code: 'GLOBAL_ADMIN_ONLY' });
       }
@@ -430,7 +431,7 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
       if (!cap.supported) {
         throw new HttpError(409, cap.reason || 'Shop 1 must install the current GIGA CHEMIST release before Medicine Delete can be used.', { code: 'SHOP_UPDATE_REQUIRED' });
       }
-      if ((payload.expected_current_stock || 0) > 0) {
+      if (type === 'MEDICINE_DELETE' && (payload.expected_current_stock || 0) > 0) {
         throw new HttpError(409, `Cannot delete medicine because it still has stock (${payload.expected_current_stock} units). Stock must be adjusted to 0 first through an auditable workflow.`, { code: 'MEDICINE_HAS_STOCK' });
       }
     }
@@ -613,6 +614,78 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
   }));
 
   /**
+   * Request authoritative medicine delete preflight directly from the target shop's PostgreSQL.
+   * Dispatches MEDICINE_DELETE_PREFLIGHT command and returns the authoritative state.
+   */
+  r.post('/admin/medicines/:id/delete-preflight', requireAdmin, commandRateLimit, route('POST /admin/medicines/:id/delete-preflight', async (req, res) => {
+    if (!deps.isGlobalAdmin(req.onlineUser)) {
+      throw new HttpError(403, 'Forbidden: Global Administrator only.', { code: 'GLOBAL_ADMIN_ONLY' });
+    }
+    if (isAllShopsScope(req)) {
+      throw new HttpError(400, 'Cannot request delete preflight across All Shops. Select a specific shop.', { code: 'ALL_SHOPS_NOT_ALLOWED' });
+    }
+    const medId = req.params.id;
+    if (!isValidUuid(medId)) throw new HttpError(400, 'Valid medicine UUID is required.');
+
+    const shopId = (typeof req.query.shop_id === 'string' && isValidUuid(req.query.shop_id))
+      ? req.query.shop_id
+      : (typeof req.body?.shop_id === 'string' && isValidUuid(req.body.shop_id))
+        ? req.body.shop_id
+        : deps.shopId(req);
+    if (!shopId || !isValidUuid(shopId)) throw new HttpError(400, 'Valid shop_id is required.', { code: 'SHOP_ID_REQUIRED' });
+
+    const seed = requestSeed(req.body?.request_id);
+    const queued = await queueForShop(req, shopId, 'MEDICINE_DELETE_PREFLIGHT', { medicine_id: medId, reason: req.body?.reason }, seed);
+
+    const start = Date.now();
+    let latestStatus = queued.status;
+    let resultPayload: any = null;
+    let resultError: any = null;
+
+    while (Date.now() - start < 3500) {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      const row = (await deps.withCloud((c) => c.query(
+        'SELECT status, result, error FROM giga_cloud.commands WHERE command_id = $1',
+        [queued.command_id]
+      ))).rows[0];
+      if (row) {
+        latestStatus = row.status;
+        resultPayload = row.result;
+        resultError = row.error;
+        if (latestStatus === 'APPLIED' || latestStatus === 'REJECTED') {
+          break;
+        }
+      }
+    }
+
+    if (latestStatus === 'APPLIED' && resultPayload) {
+      res.status(200);
+      return {
+        status: 'APPLIED',
+        command_id: queued.command_id,
+        preflight: resultPayload,
+      };
+    }
+
+    if (latestStatus === 'REJECTED') {
+      res.status(409);
+      return {
+        status: 'REJECTED',
+        command_id: queued.command_id,
+        error: resultError || 'Shop rejected delete preflight.',
+      };
+    }
+
+    res.status(202);
+    return {
+      status: latestStatus,
+      command_id: queued.command_id,
+      shop_online: queued.shop_online,
+      message: 'Authoritative delete preflight requested from Shop 1. Polling for response.',
+    };
+  }));
+
+  /**
    * Preview deletion of a medicine from the selected shop's cloud reporting copy.
    * Strictly for Global / Universal Administrator only.
    * "All Shops" scope is prohibited.
@@ -652,13 +725,11 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
       const m = medRes.rows[0];
       const currentStock = Number(m.current_stock) || 0;
 
-      const [siRes, piRes, retRes, movRes, batchRes] = await Promise.all([
-        c.query(`SELECT COUNT(*)::int AS items, COUNT(DISTINCT sale_id)::int AS sales FROM sale_items WHERE medicine_id = $1`, [medId]),
-        c.query(`SELECT COUNT(*)::int AS items, COUNT(DISTINCT purchase_id)::int AS purchases FROM purchase_items WHERE medicine_id = $1`, [medId]),
-        c.query(`SELECT COUNT(*)::int AS count FROM returns WHERE medicine_id = $1`, [medId]),
-        c.query(`SELECT COUNT(*)::int AS count FROM inventory_movements WHERE medicine_id = $1`, [medId]),
-        c.query(`SELECT COUNT(*)::int AS count FROM medicine_batches WHERE medicine_id = $1 AND status <> 'exhausted' AND status <> 'archived'`, [medId]),
-      ]);
+      const siRes = await c.query(`SELECT COUNT(*)::int AS items, COUNT(DISTINCT sale_id)::int AS sales FROM sale_items WHERE medicine_id = $1`, [medId]);
+      const piRes = await c.query(`SELECT COUNT(*)::int AS items, COUNT(DISTINCT purchase_id)::int AS purchases FROM purchase_items WHERE medicine_id = $1`, [medId]);
+      const retRes = await c.query(`SELECT COUNT(*)::int AS count FROM returns WHERE medicine_id = $1`, [medId]);
+      const movRes = await c.query(`SELECT COUNT(*)::int AS count FROM inventory_movements WHERE medicine_id = $1`, [medId]);
+      const batchRes = await c.query(`SELECT COUNT(*)::int AS count FROM medicine_batches WHERE medicine_id = $1 AND status <> 'exhausted' AND status <> 'archived'`, [medId]);
 
       return {
         m,

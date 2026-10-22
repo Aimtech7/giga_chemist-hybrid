@@ -203,10 +203,24 @@ export const SyncIndicator: React.FC<SyncIndicatorProps> = ({ currentUser, onRef
             <dd>{s?.counts?.synced ?? '—'}</dd>
             <dt className="text-slate-500">Oldest pending</dt>
             <dd>{fmt(s?.counts?.oldest_pending_at)}</dd>
-            <dt className="text-slate-500">Last successful sync</dt>
-            <dd>{fmt(s?.last_sync)}</dd>
-            <dt className="text-slate-500">Last error</dt>
-            <dd className="break-words">{s?.last_error ? `${s.last_error} (${fmt(s.last_error_at)})` : '—'}</dd>
+            <dt className="text-slate-500">Cloud state</dt>
+            <dd className={s?.current_cloud_state === 'OFFLINE' ? 'text-rose-700 font-bold' : s?.current_cloud_state === 'DEGRADED' ? 'text-amber-700 font-semibold' : 'text-emerald-700 font-semibold'}>{s?.current_cloud_state || (s?.cloud_reachable === false ? 'OFFLINE' : 'HEALTHY')}</dd>
+            <dt className="text-slate-500">Cloud contact</dt>
+            <dd>{fmt(s?.last_contact_at || s?.last_contact)}</dd>
+            <dt className="text-slate-500">Last business upload</dt>
+            <dd>{fmt(s?.last_business_upload_at || s?.last_sync)}</dd>
+            {s?.last_error && (
+              <>
+                <dt className="text-slate-500">Last error</dt>
+                <dd className="break-words">{s.last_error}</dd>
+                <dt className="text-slate-500">Occurred</dt>
+                <dd>{fmt(s.last_error_at)}</dd>
+                <dt className="text-slate-500">Resolved</dt>
+                <dd className={s.last_error_resolved ? 'text-emerald-700 font-bold' : 'text-rose-700 font-bold'}>
+                  {s.last_error_resolved ? 'YES' : 'NO'}
+                </dd>
+              </>
+            )}
             {s?.worker?.halted_reason && (
               <>
                 <dt className="text-slate-500">Halted</dt>

@@ -58,6 +58,11 @@
     "test:online-admin-parity": "tsx scripts/integration/online-admin-parity.test.ts",
     "test:pwa-update": "tsx scripts/integration/pwa-update.test.ts",
     "test:auth-client-consistency": "tsx scripts/integration/auth-client-consistency.test.ts",
+    "test:auth-consistency": "tsx scripts/integration/auth-client-consistency.test.ts",
+    "test:delete-authoritative-preflight": "tsx scripts/integration/delete-authoritative-preflight.test.ts",
+    "test:cloud-rpc-performance": "tsx scripts/integration/cloud-rpc-performance.test.ts",
+    "test:postgres-client-concurrency": "tsx scripts/integration/postgres-client-concurrency.test.ts",
+    "test:sync-health-state": "tsx scripts/integration/sync-health-state.test.ts",
     "updater:check": "node scripts/updater/updater.mjs check"
   },
   "dependencies": {
@@ -93,7 +98,7 @@
     "pngjs": "^7.0.0"
   },
   "sync_protocol_version": 2,
-  "required_cloud_schema_version": 14,
+  "required_cloud_schema_version": 15,
   "engines": {
     "node": ">=20.0.0"
   }

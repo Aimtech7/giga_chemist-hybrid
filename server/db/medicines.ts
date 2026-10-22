@@ -437,15 +437,13 @@ export async function previewMedicineDeletion(
   if (medRes.rows.length === 0) throw new HttpError(404, `Medicine ${id} not found.`);
   const m = medRes.rows[0];
 
-  const [saleItems, purchaseItems, returns, movements, stocktakes, batches, pendingSync] = await Promise.all([
-    q.query('SELECT count(*)::int AS c FROM sale_items WHERE medicine_id = $1', [id]),
-    q.query('SELECT count(*)::int AS c FROM purchase_items WHERE medicine_id = $1', [id]),
-    q.query('SELECT count(*)::int AS c FROM returns WHERE medicine_id = $1', [id]),
-    q.query('SELECT count(*)::int AS c FROM inventory_movements WHERE medicine_id = $1', [id]),
-    q.query('SELECT count(*)::int AS c FROM stocktake_lines WHERE medicine_id = $1', [id]),
-    q.query('SELECT count(*)::int AS c FROM medicine_batches WHERE medicine_id = $1', [id]),
-    q.query("SELECT count(*)::int AS c FROM sync_events WHERE entity_type = 'medicine' AND entity_id = $1 AND status <> 'SYNCED'", [id]),
-  ]);
+  const saleItems = await q.query('SELECT count(*)::int AS c FROM sale_items WHERE medicine_id = $1', [id]);
+  const purchaseItems = await q.query('SELECT count(*)::int AS c FROM purchase_items WHERE medicine_id = $1', [id]);
+  const returns = await q.query('SELECT count(*)::int AS c FROM returns WHERE medicine_id = $1', [id]);
+  const movements = await q.query('SELECT count(*)::int AS c FROM inventory_movements WHERE medicine_id = $1', [id]);
+  const stocktakes = await q.query('SELECT count(*)::int AS c FROM stocktake_lines WHERE medicine_id = $1', [id]);
+  const batches = await q.query('SELECT count(*)::int AS c FROM medicine_batches WHERE medicine_id = $1', [id]);
+  const pendingSync = await q.query("SELECT count(*)::int AS c FROM sync_events WHERE entity_type = 'medicine' AND entity_id = $1 AND status <> 'SYNCED'", [id]);
 
   const siCount = saleItems.rows[0]?.c || 0;
   const piCount = purchaseItems.rows[0]?.c || 0;
@@ -487,6 +485,134 @@ export async function previewMedicineDeletion(
   };
 }
 
+export interface AuthoritativeDeletePreflight {
+  [key: string]: unknown;
+  preflight_id: string;
+  medicine_id: string;
+  name: string;
+  current_version: number;
+  current_status: string;
+  current_stock: number;
+  active_batches: number;
+  references: {
+    sales: number;
+    sale_items: number;
+    purchases: number;
+    purchase_items: number;
+    returns: number;
+    inventory_movements: number;
+    stocktake_lines: number;
+    active_batches: number;
+    pending_sync_events: number;
+  };
+  total_historical_references: number;
+  pending_local_sync: number;
+  outcome: 'PERMANENT_DELETE' | 'ARCHIVE_REQUIRED' | 'BLOCKED';
+  block_reason: string | null;
+  generated_at: string;
+  expires_at: string;
+}
+
+export async function generateAuthoritativeDeletePreflight(
+  client: pg.PoolClient | pg.Client | pg.Pool,
+  medicineId: string,
+  _reason?: string
+): Promise<AuthoritativeDeletePreflight> {
+  const id = requireUuid(medicineId, 'medicine_id');
+  const medRes = await client.query(
+    'SELECT id, name, sku, barcode, current_stock, status, version FROM medicines WHERE id = $1',
+    [id]
+  );
+  if (medRes.rows.length === 0) throw new HttpError(404, `Medicine ${id} not found.`);
+  const m = medRes.rows[0];
+
+  const salesCountRes = await client.query('SELECT count(DISTINCT sale_id)::int AS c FROM sale_items WHERE medicine_id = $1', [id]);
+  const saleItems = await client.query('SELECT count(*)::int AS c FROM sale_items WHERE medicine_id = $1', [id]);
+  const purchasesCountRes = await client.query('SELECT count(DISTINCT purchase_id)::int AS c FROM purchase_items WHERE medicine_id = $1', [id]);
+  const purchaseItems = await client.query('SELECT count(*)::int AS c FROM purchase_items WHERE medicine_id = $1', [id]);
+  const returns = await client.query('SELECT count(*)::int AS c FROM returns WHERE medicine_id = $1', [id]);
+  const movements = await client.query('SELECT count(*)::int AS c FROM inventory_movements WHERE medicine_id = $1', [id]);
+  const stocktakes = await client.query('SELECT count(*)::int AS c FROM stocktake_lines WHERE medicine_id = $1', [id]);
+  const batches = await client.query("SELECT count(*)::int AS c FROM medicine_batches WHERE medicine_id = $1 AND status <> 'exhausted' AND status <> 'archived'", [id]);
+  const pendingSync = await client.query("SELECT count(*)::int AS c FROM sync_events WHERE entity_type = 'medicine' AND entity_id = $1 AND status <> 'SYNCED'", [id]);
+
+  const salesCount = salesCountRes.rows[0]?.c || 0;
+  const siCount = saleItems.rows[0]?.c || 0;
+  const purchasesCount = purchasesCountRes.rows[0]?.c || 0;
+  const piCount = purchaseItems.rows[0]?.c || 0;
+  const retCount = returns.rows[0]?.c || 0;
+  const movCount = movements.rows[0]?.c || 0;
+  const stCount = stocktakes.rows[0]?.c || 0;
+  const batchCount = batches.rows[0]?.c || 0;
+  const pendingCount = pendingSync.rows[0]?.c || 0;
+
+  const totalHistory = siCount + piCount + retCount + movCount + stCount;
+  const currentStock = Number(m.current_stock) || 0;
+  const stockBlocks = currentStock > 0;
+  const pendingBlocks = pendingCount > 0;
+
+  let outcome: 'PERMANENT_DELETE' | 'ARCHIVE_REQUIRED' | 'BLOCKED';
+  let blockReason: string | null = null;
+
+  if (stockBlocks) {
+    outcome = 'BLOCKED';
+    blockReason = `Cannot delete medicine "${m.name}" because it still has sellable stock (${currentStock} units). Stock must be adjusted to 0 first through an auditable workflow.`;
+  } else if (pendingBlocks) {
+    outcome = 'BLOCKED';
+    blockReason = `Cannot delete medicine while ${pendingCount} unsynced events are pending in the local outbox. Wait for sync to complete.`;
+  } else if (totalHistory > 0) {
+    outcome = 'ARCHIVE_REQUIRED';
+  } else {
+    outcome = 'PERMANENT_DELETE';
+  }
+
+  const preflight_id = crypto.randomUUID();
+  const generated_at = new Date().toISOString();
+  const expires_at = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+
+  await client.query(
+    `INSERT INTO medicine_delete_preflights (
+      preflight_id, medicine_id, current_version, current_status, current_stock,
+      active_batches, sales_references, sale_item_references, purchase_references,
+      purchase_item_references, returns_references, movement_references,
+      stocktake_references, pending_local_sync, outcome, block_reason, generated_at, expires_at
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+    ON CONFLICT (preflight_id) DO NOTHING`,
+    [
+      preflight_id, id, Number(m.version) || 1, m.status || 'active', currentStock,
+      batchCount, salesCount, siCount, purchasesCount, piCount, retCount, movCount,
+      stCount, pendingCount, outcome, blockReason, generated_at, expires_at
+    ]
+  ).catch(() => {});
+
+  return {
+    preflight_id,
+    medicine_id: m.id,
+    name: m.name,
+    current_version: Number(m.version) || 1,
+    current_status: m.status || 'active',
+    current_stock: currentStock,
+    active_batches: batchCount,
+    references: {
+      sales: salesCount,
+      sale_items: siCount,
+      purchases: purchasesCount,
+      purchase_items: piCount,
+      returns: retCount,
+      inventory_movements: movCount,
+      stocktake_lines: stCount,
+      active_batches: batchCount,
+      pending_sync_events: pendingCount,
+    },
+    total_historical_references: totalHistory,
+    pending_local_sync: pendingCount,
+    outcome,
+    block_reason: blockReason,
+    generated_at,
+    expires_at,
+  };
+}
+
 /**
  * Atomically deletes or archives a medicine according to historical references and stock rules.
  */
@@ -495,6 +621,7 @@ export async function deleteOrArchiveMedicineTx(
   medicineId: string,
   actor: MedicineActor,
   options?: {
+    preflight_id?: string;
     expected_version?: number;
     expected_status?: string;
     expected_current_stock?: number;
@@ -506,6 +633,21 @@ export async function deleteOrArchiveMedicineTx(
   // Enforce ADMIN role requirement server-side
   if (actor.role !== 'ADMIN') {
     throw new HttpError(403, 'Permission denied: only an Administrator may delete or archive medicines.');
+  }
+
+  // Preflight validation if preflight_id provided
+  if (options?.preflight_id) {
+    const pfRes = await client.query(
+      'SELECT preflight_id, expires_at FROM medicine_delete_preflights WHERE preflight_id = $1',
+      [options.preflight_id]
+    ).catch(() => ({ rows: [] }));
+    if (pfRes.rows.length > 0 && new Date(pfRes.rows[0].expires_at).getTime() < Date.now()) {
+      throw new HttpError(
+        409,
+        'DELETE_PREFLIGHT_STALE: Delete preflight has expired. Refresh preview before trying again.',
+        { code: 'DELETE_PREFLIGHT_STALE' }
+      );
+    }
   }
 
   // Lock medicine row
@@ -523,15 +665,27 @@ export async function deleteOrArchiveMedicineTx(
   }
   const m = lockedRes.rows[0];
 
-  // Optimistic concurrency validation
+  // Optimistic concurrency validation (DELETE_PREFLIGHT_STALE if conflict)
   if (options?.expected_version !== undefined && Number(m.version) !== options.expected_version) {
-    throw new HttpError(409, `Medicine version conflict: expected ${options.expected_version}, but currently at ${m.version}. Refresh and retry.`);
+    throw new HttpError(
+      409,
+      `DELETE_PREFLIGHT_STALE: Medicine version conflict: expected ${options.expected_version}, but currently at ${m.version}. Refresh and retry.`,
+      { code: 'DELETE_PREFLIGHT_STALE', expected_version: options.expected_version, current_version: Number(m.version), current_state: { version: Number(m.version), status: m.status, current_stock: Number(m.current_stock) } }
+    );
   }
   if (options?.expected_status !== undefined && m.status !== options.expected_status) {
-    throw new HttpError(409, `Medicine status conflict: expected ${options.expected_status}, but currently "${m.status}".`);
+    throw new HttpError(
+      409,
+      `DELETE_PREFLIGHT_STALE: Medicine status conflict: expected ${options.expected_status}, but currently "${m.status}". Refresh and retry.`,
+      { code: 'DELETE_PREFLIGHT_STALE', expected_status: options.expected_status, current_status: m.status, current_state: { version: Number(m.version), status: m.status, current_stock: Number(m.current_stock) } }
+    );
   }
   if (options?.expected_current_stock !== undefined && Number(m.current_stock) !== options.expected_current_stock) {
-    throw new HttpError(409, `Medicine stock conflict: expected ${options.expected_current_stock}, but currently ${m.current_stock}.`);
+    throw new HttpError(
+      409,
+      `DELETE_PREFLIGHT_STALE: Medicine stock conflict: expected ${options.expected_current_stock}, but currently ${m.current_stock}. Refresh and retry.`,
+      { code: 'DELETE_PREFLIGHT_STALE', expected_current_stock: options.expected_current_stock, current_stock: Number(m.current_stock), current_state: { version: Number(m.version), status: m.status, current_stock: Number(m.current_stock) } }
+    );
   }
 
   const currentStock = Number(m.current_stock) || 0;
@@ -551,14 +705,12 @@ export async function deleteOrArchiveMedicineTx(
     throw new HttpError(409, 'Cannot delete medicine while unsynced events are pending in the outbox. Wait for sync to complete.');
   }
 
-  // Check all historical business references
-  const [si, pi, ret, mov, st] = await Promise.all([
-    client.query('SELECT count(*)::int AS c FROM sale_items WHERE medicine_id = $1', [id]),
-    client.query('SELECT count(*)::int AS c FROM purchase_items WHERE medicine_id = $1', [id]),
-    client.query('SELECT count(*)::int AS c FROM returns WHERE medicine_id = $1', [id]),
-    client.query('SELECT count(*)::int AS c FROM inventory_movements WHERE medicine_id = $1', [id]),
-    client.query('SELECT count(*)::int AS c FROM stocktake_lines WHERE medicine_id = $1', [id]),
-  ]);
+  // Check all historical business references (sequentially to avoid concurrent client.query)
+  const si = await client.query('SELECT count(*)::int AS c FROM sale_items WHERE medicine_id = $1', [id]);
+  const pi = await client.query('SELECT count(*)::int AS c FROM purchase_items WHERE medicine_id = $1', [id]);
+  const ret = await client.query('SELECT count(*)::int AS c FROM returns WHERE medicine_id = $1', [id]);
+  const mov = await client.query('SELECT count(*)::int AS c FROM inventory_movements WHERE medicine_id = $1', [id]);
+  const st = await client.query('SELECT count(*)::int AS c FROM stocktake_lines WHERE medicine_id = $1', [id]);
 
   const totalHistory =
     (si.rows[0]?.c || 0) +

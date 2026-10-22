@@ -372,8 +372,11 @@ async function run() {
   check(true, 'OFFLINE_SALE_RECOVERY = PASS');
   check(true, 'POWER_LOSS_RECOVERY = PASS');
 
+  await pool.end();
+  await (await import('../../server/db/client')).pgPool.end();
+
   const code = summary();
-  process.exit(code);
+  process.exitCode = code;
 }
 
 run().catch((err) => {

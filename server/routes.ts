@@ -56,6 +56,7 @@ import {
   isSupabaseConfigured,
   requireUuid,
   previewMedicineDeletion,
+  generateAuthoritativeDeletePreflight,
   deleteOrArchiveMedicineTx,
   restoreMedicineTx,
 } from './db/index';
@@ -598,6 +599,15 @@ apiRouter.get('/medicines/:id/delete-preview', requireRole('ADMIN'), async (req:
     res.json(preview);
   } catch (err: any) {
     sendError(res, err, 'Failed to preview medicine deletion.', 'GET /medicines/:id/delete-preview');
+  }
+});
+
+apiRouter.post('/medicines/:id/delete-preflight', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const preflight = await generateAuthoritativeDeletePreflight(pgPool, req.params.id, req.body?.reason);
+    res.json(preflight);
+  } catch (err: any) {
+    sendError(res, err, 'Failed to generate authoritative delete preflight.', 'POST /medicines/:id/delete-preflight');
   }
 });
 
