@@ -9,6 +9,7 @@ import { collectRuntimeStatus } from './heartbeat';
 import { recordAuditLog } from '../db/audit';
 import { registerSyncWakeHandler } from './wake';
 import { runStockParityAudit } from './stockParity';
+import { checkInventoryParity } from './inventorySnapshot';
 
 /**
  * Background sync worker on the LOCAL server.
@@ -51,6 +52,8 @@ class SyncWorker {
   private loggedCommandErrors = new Set<string>();
   private lastHeartbeatAt = 0;
   private lastParityAuditAt = 0;
+  private lastMirrorReconciliationAt = 0;
+  private lastParityResult: any = null;
   private heartbeatNotice = false;
   readonly workerId = `server-${process.pid}`;
 
@@ -177,6 +180,33 @@ class SyncWorker {
       );
       if (res.rowCount) console.log(`[Sync] Cloud reachable again; retrying ${res.rowCount} backed-off event(s) now.`);
       await this.pushDueEvents();
+      // Part 23: Reconnect reconciliation
+      await this.maybeReconcileAuthoritativeMirror(true);
+    }
+
+    // 6. Authoritative mirror reconciliation (every 2 mins with fast fingerprint check): Part 5, 6, 7
+    await this.maybeReconcileAuthoritativeMirror();
+  }
+
+  getParityStatus() {
+    return this.lastParityResult;
+  }
+
+  // -------------------------------------------------------------------------- authoritative mirror reconciliation
+  async maybeReconcileAuthoritativeMirror(force = false): Promise<any> {
+    const every = Math.max(30, Number(process.env.AUTHORITATIVE_SYNC_INTERVAL_SECONDS) || 120) * 1000;
+    if (!force && Date.now() - this.lastMirrorReconciliationAt < every) return this.lastParityResult;
+    this.lastMirrorReconciliationAt = Date.now();
+    try {
+      const res = await checkInventoryParity({ autoReconcile: true });
+      this.lastParityResult = res;
+      if (res.reconciled) {
+        console.log(`[Sync] Authoritative mirror auto-reconciled: parity was ${res.parity}, local fingerprint ${res.local_fingerprint.slice(0, 10)} published.`);
+      }
+      return res;
+    } catch (err: any) {
+      console.warn('[Sync] Authoritative mirror reconciliation warning:', err?.message || err);
+      return null;
     }
   }
 
@@ -409,6 +439,10 @@ class SyncWorker {
     // so a command reported APPLIED in the cloud is already reflected in the cloud copy.
     if (outcomes.some((o) => o.result.status === 'APPLIED' && !o.result.duplicate)) {
       if ((await this.pushDueEvents()) === 'unreachable') return 'unreachable';
+      // Part 5.4: Authoritative reconciliation after every stock-changing Global Admin command
+      if (outcomes.some((o) => ['STOCK_ADD', 'STOCK_REMOVE', 'STOCK_SET', 'STOCK_OVERRIDE_ADD', 'STOCK_OVERRIDE_REMOVE', 'STOCK_OVERRIDE_SET', 'BATCH_UPDATE'].includes(o.cmd.command_type))) {
+        await this.maybeReconcileAuthoritativeMirror(true);
+      }
     }
     for (const { cmd, result } of outcomes) await this.ack(cmd.command_id, result.status, result.result, result.error);
     return outcome;
@@ -620,5 +654,6 @@ export async function getSyncStatus() {
     },
     cloud_reachable: cfg.workerEnabled ? syncWorker.cloudReachable : null,
     worker: syncWorker.status(),
+    authoritative_sync: syncWorker.getParityStatus(),
   };
 }

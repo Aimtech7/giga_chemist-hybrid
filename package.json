@@ -64,6 +64,11 @@
     "test:postgres-client-concurrency": "tsx scripts/integration/postgres-client-concurrency.test.ts",
     "test:sync-health-state": "tsx scripts/integration/sync-health-state.test.ts",
     "test:global-admin-forced-stock": "tsx scripts/integration/global-admin-forced-stock.test.ts",
+    "test:authoritative-shop-mirror": "tsx scripts/integration/authoritative-shop-mirror.test.ts",
+    "test:snapshot-high-water": "tsx scripts/integration/snapshot-high-water.test.ts",
+    "test:global-admin-force-stock": "tsx scripts/integration/global-admin-force-stock.test.ts",
+    "test:cloud-parity-self-heal": "tsx scripts/integration/cloud-parity-self-heal.test.ts",
+    "test:stock-adjustment-register": "tsx scripts/integration/stock-adjustment-register.test.ts",
     "updater:check": "node scripts/updater/updater.mjs check"
   },
   "dependencies": {
@@ -99,7 +104,7 @@
     "pngjs": "^7.0.0"
   },
   "sync_protocol_version": 2,
-  "required_cloud_schema_version": 15,
+  "required_cloud_schema_version": 16,
   "engines": {
     "node": ">=20.0.0"
   }

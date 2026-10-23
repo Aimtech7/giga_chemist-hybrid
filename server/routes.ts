@@ -69,6 +69,7 @@ import {
 } from './auth';
 import { getSyncStatus, syncWorker } from './sync/worker';
 import { runStockParityAudit, reconcileSelectedStockParity } from './sync/stockParity';
+import { checkInventoryParity, publishAuthoritativeInventorySnapshot } from './sync/inventorySnapshot';
 import {
   runShopConsistencyCheck,
   reconcileMedicineBaseline,
@@ -962,6 +963,29 @@ apiRouter.post('/sync/now', requireRole('ADMIN'), async (req: AuthenticatedReque
     return res.status(409).json({ error: 'Cloud sync is not enabled on this server (APP_MODE=hybrid and SYNC_ENABLED=true are required).' });
   }
   res.json({ success: true, result });
+});
+
+// ADMIN: Authoritative inventory parity status and deterministic fingerprints
+apiRouter.get('/sync/authoritative-status', requireRole('ADMIN'), async (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    const result = await checkInventoryParity({ autoReconcile: false });
+    res.json(result);
+  } catch (err: any) {
+    sendError(res, err, 'Failed to fetch authoritative sync status.', 'GET /sync/authoritative-status');
+  }
+});
+
+// ADMIN: SYNC FROM SHOP NOW — Publishes local point-in-time PostgreSQL snapshot to cloud mirror
+apiRouter.post('/sync/sync-from-shop-now', requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const result = await publishAuthoritativeInventorySnapshot({
+      actor: actorAudit(req),
+      reason: 'Shop Admin: SYNC FROM SHOP NOW',
+    });
+    res.json({ success: true, ...result });
+  } catch (err: any) {
+    sendError(res, err, 'Failed to execute authoritative sync from shop.', 'POST /sync/sync-from-shop-now');
+  }
 });
 
 // ADMIN: re-queue events the cloud rejected (after the cause was fixed). Idempotency keys are kept.
