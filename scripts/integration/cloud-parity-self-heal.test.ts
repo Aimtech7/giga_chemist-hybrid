@@ -1,9 +1,5 @@
 process.env.APP_MODE = 'hybrid';
-import crypto from 'crypto';
 import { check, section, summary, pool, assertDevDatabase } from './harness';
-import { withTransaction } from '../../server/db/client';
-import { createMedicineTx, getMedicineById } from '../../server/db/medicines';
-import { adminAddStockTx } from '../../server/db/inventory';
 import { getShopIdentity } from '../../server/sync/identity';
 import {
   generateAuthoritativeInventorySnapshot,
