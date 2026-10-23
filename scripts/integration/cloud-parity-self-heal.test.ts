@@ -11,19 +11,73 @@ import {
   computeInventoryFingerprint,
   checkInventoryParity,
 } from '../../server/sync/inventorySnapshot';
-import { callCloud } from '../../server/sync/cloudClient';
-import { getSyncConfig } from '../../server/sync/config';
 
 async function run() {
   await assertDevDatabase();
 
   const identity = await getShopIdentity();
   const shopId = identity.shop_id;
-  const cfg = getSyncConfig();
 
   const adminRow = (await pool.query("SELECT id, name FROM users WHERE role = 'ADMIN' LIMIT 1")).rows[0];
   if (!adminRow) throw new Error('No admin user found in database for testing.');
   const adminActor = { user_id: adminRow.id, user_name: adminRow.name || 'Admin', role: 'ADMIN' as const, device_id: 'TEST-DEV' };
+
+  // Isolated in-memory cloud mirror. This suite must NEVER write the development clone into
+  // Shop 1's live Supabase mirror; live RPC compatibility is covered by separate integration suites.
+  let cloudState: {
+    snapshotSeq: number;
+    fingerprint: string | null;
+    medicines: any[];
+    stockLevels: any[];
+    batches: any[];
+  } = { snapshotSeq: 0, fingerprint: null, medicines: [], stockLevels: [], batches: [] };
+
+  const fakeCloud = async <T = any>(fn: any, args: Record<string, any>): Promise<T> => {
+    if (fn === 'gc_get_inventory_fingerprint') {
+      return {
+        ok: true,
+        fingerprint: cloudState.fingerprint,
+        snapshot_seq: cloudState.snapshotSeq,
+        medicines_count: cloudState.medicines.length,
+        batches_count: cloudState.stockLevels.length,
+      } as T;
+    }
+    if (fn === 'gc_inspect_shop_data') {
+      return {
+        medicines: cloudState.medicines,
+        stock_levels: cloudState.stockLevels,
+        batches: cloudState.batches,
+      } as T;
+    }
+    if (fn === 'gc_apply_inventory_snapshot') {
+      const s = args.p_snapshot || {};
+      const seq = Number(s.snapshot_seq || 0);
+      if (seq < cloudState.snapshotSeq) {
+        return {
+          ok: false,
+          ignored: true,
+          reason: 'OLDER_SNAPSHOT_SUPERSEDED',
+          current_snapshot_seq: cloudState.snapshotSeq,
+          attempted_seq: seq,
+        } as T;
+      }
+      cloudState = {
+        snapshotSeq: seq,
+        fingerprint: s.fingerprint || null,
+        medicines: (s.medicines || []).map((m: any) => ({ ...m, id: m.medicine_id })),
+        stockLevels: (s.batches || []).map((b: any) => ({
+          medicine_id: b.medicine_id,
+          batch_id: b.batch_id,
+          quantity: b.quantity_available,
+          quantity_available: b.quantity_available,
+          stock_version: b.stock_version,
+        })),
+        batches: (s.batches || []).map((b: any) => ({ ...b })),
+      };
+      return { ok: true, ignored: false, snapshot_seq: seq, fingerprint: cloudState.fingerprint } as T;
+    }
+    throw new Error(`Unexpected fake cloud RPC: ${String(fn)}`);
+  };
 
   try {
     // =========================================================================
@@ -99,21 +153,18 @@ async function run() {
     section('3. Automatic Self-Heal (Shop -> Cloud Mirror Repair)');
 
     // Check parity before self-heal
-    const parityPre = await checkInventoryParity({ autoReconcile: false });
+    const parityPre = await checkInventoryParity({ autoReconcile: false, cloudCall: fakeCloud as any });
     check(typeof parityPre.parity === 'string', '3.1 Parity state evaluated');
 
     // Trigger self-heal via checkInventoryParity({ autoReconcile: true })
-    const parityPost = await checkInventoryParity({ autoReconcile: true });
+    const parityPost = await checkInventoryParity({ autoReconcile: true, cloudCall: fakeCloud as any });
     check(parityPost.in_sync === true, '3.2 Post-reconciliation parity is MATCH');
     check(parityPost.parity === 'MATCH', '3.3 Parity status reports MATCH');
     check(parityPost.medicine_mismatches === 0, '3.4 0 medicine mismatches');
     check(parityPost.batch_mismatches === 0, '3.5 0 batch mismatches');
 
-    // Verify Cloud has updated fingerprint
-    const cloudFpData = await callCloud<any>('gc_get_inventory_fingerprint', {
-      p_shop_id: shopId,
-      p_token: cfg.shopToken,
-    });
+    // Verify isolated Cloud has updated fingerprint
+    const cloudFpData = await fakeCloud<any>('gc_get_inventory_fingerprint', { p_shop_id: shopId });
     check(cloudFpData.fingerprint === parityPost.local_fingerprint, '3.6 Cloud inventory fingerprint matches local Shop fingerprint exactly');
 
     // =========================================================================
@@ -124,14 +175,29 @@ async function run() {
     const manualSyncRes = await publishAuthoritativeInventorySnapshot({
       actor: adminActor,
       reason: 'Global Admin: SYNC FROM SHOP NOW manual action',
+      cloudCall: fakeCloud as any,
     });
 
     check(manualSyncRes.ok === true, '4.1 SYNC FROM SHOP NOW executes successfully');
     check(manualSyncRes.medicines_count > 0, '4.2 All medicines mirrored to cloud');
     check(manualSyncRes.batches_count > 0, '4.3 All batches mirrored to cloud');
 
-    const parityAfterManual = await checkInventoryParity({ autoReconcile: false });
+    const parityAfterManual = await checkInventoryParity({ autoReconcile: false, cloudCall: fakeCloud as any });
     check(parityAfterManual.in_sync === true, '4.4 Immediate parity check reports MATCH');
+
+    // =========================================================================
+    // SECTION 5: SUPERSEDED SNAPSHOT MUST NEVER FALSE-GREEN
+    // =========================================================================
+    section('5. High-water supersession safety');
+
+    const localNow = await generateAuthoritativeInventorySnapshot();
+    cloudState.snapshotSeq = localNow.snapshot_seq + 100;
+    cloudState.fingerprint = 'cloud-newer-fingerprint';
+
+    const superseded = await checkInventoryParity({ autoReconcile: true, cloudCall: fakeCloud as any });
+    check(superseded.in_sync === false, '5.1 Superseded local snapshot is NOT reported in sync');
+    check(superseded.parity === 'CLOUD_AHEAD_INVALID', '5.2 Superseded snapshot reports CLOUD_AHEAD_INVALID');
+    check(superseded.details?.reconciliation_result?.ignored === true, '5.3 High-water rejection is preserved in diagnostics');
   } finally {
     await pool.end();
   }
