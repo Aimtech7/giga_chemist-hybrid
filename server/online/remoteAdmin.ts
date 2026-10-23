@@ -987,6 +987,64 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
     });
   }));
 
+  /** Authoritative Shop Sync Status: inspects local & cloud fingerprints, parity and snapshot high-water mark */
+  r.get('/admin/sync/authoritative-status', requireAdmin, route('GET /admin/sync/authoritative-status', async (req) => {
+    const shopId = deps.shopId(req);
+    const rt = await runtimeRow(deps, shopId);
+    const st = rt?.status || {};
+    return deps.withCloud(async (c) => {
+      const shopRow = (await c.query(
+        `SELECT shop_id, shop_code, name, inventory_fingerprint, shop_snapshot_seq, shop_snapshot_at, shop_snapshot_id
+           FROM giga_cloud.shops WHERE shop_id = $1`,
+        [shopId]
+      )).rows[0];
+
+      const localFp = st.authoritative_sync?.local_fingerprint || st.inventory?.fingerprint || null;
+      const cloudFp = shopRow?.inventory_fingerprint || null;
+      const inSync = Boolean(localFp && cloudFp && localFp === cloudFp);
+
+      const contactAgeSec = rt?.age_seconds ?? null;
+      const lastSyncAt = rt?.last_sync_at ?? null;
+
+      return {
+        shop_id: shopId,
+        shop_code: shopRow?.shop_code || 'SHOP1',
+        shop_name: shopRow?.name || 'Shop 1',
+        cloud_contact_age_seconds: contactAgeSec,
+        last_contact_at: rt?.reported_at || null,
+        last_business_event_at: lastSyncAt,
+        local_inventory_fingerprint: localFp,
+        cloud_inventory_fingerprint: cloudFp,
+        parity: inSync ? 'MATCH' : (st.authoritative_sync?.parity || 'AUTHORITATIVE_RECONCILIATION_REQUIRED'),
+        medicines_checked: st.authoritative_sync?.medicines_checked ?? st.inventory?.medicine_count ?? 0,
+        batch_mismatches: st.authoritative_sync?.batch_mismatches ?? 0,
+        medicine_mismatches: st.authoritative_sync?.medicine_mismatches ?? 0,
+        missing_cloud: st.authoritative_sync?.missing_cloud ?? 0,
+        extra_cloud: st.authoritative_sync?.extra_cloud ?? 0,
+        version_mismatches: st.authoritative_sync?.version_mismatches ?? 0,
+        snapshot_seq: shopRow?.shop_snapshot_seq ? Number(shopRow.shop_snapshot_seq) : (st.authoritative_sync?.snapshot_seq ?? 0),
+        snapshot_at: shopRow?.shop_snapshot_at || st.authoritative_sync?.timestamp || null,
+      };
+    });
+  }));
+
+  /** SYNC FROM SHOP NOW: Queues authoritative point-in-time PostgreSQL snapshot from shop to cloud */
+  r.post('/admin/sync/authoritative-sync-now', requireAdmin, route('POST /admin/sync/authoritative-sync-now', async (req) => {
+    const shopId = deps.shopId(req);
+    const key = `sync-snapshot:${shopId}:${Date.now()}`;
+    const queued = await queueForShop(req, shopId, 'STOCK_SNAPSHOT_REQUEST', {
+      reason: 'Manual Authoritative Sync initiated from Global Admin Sync Center',
+      source: 'ONLINE_GLOBAL_ADMIN',
+      is_global_admin: true,
+    }, key);
+    return {
+      success: true,
+      command_id: queued.command_id,
+      status: 'QUEUED',
+      note: 'Authoritative snapshot request queued. The shop will mirror PostgreSQL state to Cloud with zero drift.',
+    };
+  }));
+
   /** Stock Conflicts Center: mismatch inspectability and Global Admin override actions */
   r.get('/admin/sync/stock-conflicts', requireAdmin, route('GET /admin/sync/stock-conflicts', async (req) => {
     const shopId = deps.shopId(req);

@@ -23,6 +23,7 @@ import { revokeUserSessionsTx, updateUserTx, unusablePinHash } from '../db/users
 import type { FetchedCredential } from './credentials';
 import { readUpdateState } from '../ops/runtime';
 import { safeRetryFailedEvents } from './retry';
+import { publishAuthoritativeInventorySnapshot } from './inventorySnapshot';
 
 /**
  * Inbound cloud -> shop commands: the ONE write path of remote (online) administration.
@@ -204,6 +205,7 @@ async function recordGlobalAdminStockAdjustmentAudit(
     override_id: overrideId,
     command_id: cmd.command_id,
     shop_id: identity.shop_id,
+    shop_code: (identity as any).shop_code || 'SHOP1',
     shop_name: identity.pharmacy_name || 'Shop 1',
     medicine_id: medicineId,
     medicine_name: med.name || 'Unknown Medicine',
@@ -216,20 +218,34 @@ async function recordGlobalAdminStockAdjustmentAudit(
     admin_name: actor.user_name || 'Global Administrator',
     admin_email: cmd.created_by || actor.user_name || 'admin@gigachemist.com',
     action,
+    operation: action,
+    source: 'ONLINE_GLOBAL_ADMIN',
     online_quantity_shown: onlineQuantityShown,
     cloud_quantity_seen: onlineQuantityShown,
+    ONLINE_QUANTITY_SEEN: onlineQuantityShown,
     actual_quantity_before: localQuantityBefore,
     local_quantity_before: localQuantityBefore,
+    LOCAL_QUANTITY_AT_EXECUTION: localQuantityBefore,
     requested_amount: requestedAmount,
+    REQUESTED_DELTA: action === 'ADD' ? requestedAmount : action === 'REMOVE' ? -requestedAmount : null,
+    REQUESTED_ABSOLUTE_QUANTITY: action === 'SET' ? requestedAmount : null,
     actual_quantity_after: localQuantityAfter,
     local_quantity_after: localQuantityAfter,
+    FINAL_LOCAL_QUANTITY: localQuantityAfter,
     difference: localQuantityAfter - localQuantityBefore,
+    medicine_version_before: Number((med as any).version || 1),
+    medicine_version_after: Number((med as any).version || 1),
     reason,
     notes: notes || null,
+    forced_floor_to_zero: Boolean(notes && notes.toLowerCase().includes('zero')),
     date_submitted: submittedAt,
+    queued_at: submittedAt,
     date_delivered: deliveredAt,
+    delivered_at: deliveredAt,
     date_applied: appliedAt,
+    applied_at: appliedAt,
     date_cloud_confirmed: cloudConfirmedAt,
+    cloud_confirmed_at: cloudConfirmedAt,
     stock_version_before: stockVersionBefore,
     stock_version_after: stockVersionAfter,
     result: 'APPLIED',
@@ -256,6 +272,9 @@ function isGlobalAdminCommand(cmd: CloudCommand): boolean {
     (cmd.payload as any)?.is_global_admin ||
     (cmd as any).role === 'GLOBAL_ADMIN' ||
     (cmd.payload as any)?.role === 'GLOBAL_ADMIN' ||
+    (cmd as any).source === 'ONLINE_GLOBAL_ADMIN' ||
+    (cmd.payload as any)?.source === 'ONLINE_GLOBAL_ADMIN' ||
+    ['STOCK_OVERRIDE_ADD', 'STOCK_OVERRIDE_REMOVE', 'STOCK_OVERRIDE_SET'].includes(cmd.command_type) ||
     (cmd.created_by && /global[-_ ]?admin/i.test(cmd.created_by))
   );
 }
@@ -742,28 +761,19 @@ const HANDLERS: Record<string, Handler> = {
         batches_count: batches.length,
       };
     } else {
-      const meds = (await client.query('SELECT id FROM medicines WHERE status <> \'archived\'')).rows;
-      for (const m of meds) {
-        const batches = (await client.query(
-          `SELECT id, medicine_id, batch_number, quantity_available, expiry_date, expiry_status, status, supplier_id,
-                  purchase_price, selling_price_override, received_date, manufacturing_date, purchase_invoice, notes, created_by, stock_version
-             FROM medicine_batches WHERE medicine_id = $1 ORDER BY id`,
-          [m.id]
-        )).rows;
-        await enqueueSyncEvent(client, {
-          event_type: 'MEDICINE_BASELINE',
-          entity_type: 'medicine',
-          entity_id: m.id,
-          operation: 'RECONCILIATION',
-          data: async () => ({
-            medicine: await medicineJson(client, m.id),
-            batches,
-          }),
-          actor,
-          business_ref: 'STOCK_SNAPSHOT_PUBLISHED',
-        });
-      }
-      baselineResult = { published_medicines: meds.length };
+      const snapRes = await publishAuthoritativeInventorySnapshot({
+        actor,
+        reason: p.reason || 'Global Admin: SYNC FROM SHOP NOW',
+        client,
+      });
+      baselineResult = {
+        snapshot_published: true,
+        snapshot_id: snapRes.snapshot_id,
+        snapshot_seq: snapRes.snapshot_seq,
+        fingerprint: snapRes.fingerprint,
+        medicines_count: snapRes.medicines_count,
+        batches_count: snapRes.batches_count,
+      };
     }
 
     await recordAuditLog({

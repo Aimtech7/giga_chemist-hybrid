@@ -2240,7 +2240,7 @@ function validateCommandPayload(type, payload) {
   switch (type) {
     // ------------------------------------------------------------------ stock (movements / counts)
     case "STOCK_ADD": {
-      onlyKeys(p, ["medicine_id", "batch_id", "batch_number", "expiry_date", "quantity", "reason", "expected_quantity"], "STOCK_ADD");
+      onlyKeys(p, ["medicine_id", "batch_id", "batch_number", "expiry_date", "quantity", "reason", "expected_quantity", "source", "admin_email", "admin_user_id", "role", "is_global_admin"], "STOCK_ADD");
       const out = { medicine_id: uuid(p.medicine_id, "medicine_id"), quantity: wholeNumber(p.quantity, "quantity", 1), reason: reasonText(p.reason, true) };
       if (p.batch_id !== void 0 && p.batch_id !== null && p.batch_id !== "") {
         if (p.batch_number || p.expiry_date) throw new HttpError(400, "Give either batch_id (existing batch) or batch_number + expiry_date (new batch), not both.");
@@ -2252,19 +2252,25 @@ function validateCommandPayload(type, payload) {
         out.batch_number = batchNumber(p.batch_number);
         out.expiry_date = date(p.expiry_date);
       }
+      if (p.source !== void 0) out.source = String(p.source);
+      if (p.admin_email !== void 0) out.admin_email = String(p.admin_email);
+      if (p.admin_user_id !== void 0) out.admin_user_id = String(p.admin_user_id);
       return out;
     }
     case "STOCK_REMOVE": {
-      onlyKeys(p, ["medicine_id", "batch_id", "quantity", "reason", "notes", "expected_quantity"], "STOCK_REMOVE");
+      onlyKeys(p, ["medicine_id", "batch_id", "quantity", "reason", "notes", "expected_quantity", "source", "admin_email", "admin_user_id", "role", "is_global_admin"], "STOCK_REMOVE");
       if (!STOCK_REMOVE_REASONS.includes(p.reason)) throw new HttpError(400, `reason must be one of: ${STOCK_REMOVE_REASONS.join(", ")}.`);
       const notes = reasonText(p.notes, p.reason === "Other", "notes");
       const out = { medicine_id: uuid(p.medicine_id, "medicine_id"), batch_id: uuid(p.batch_id, "batch_id"), quantity: wholeNumber(p.quantity, "quantity", 1), reason: p.reason, notes };
       const eq = expectedQuantity(p.expected_quantity, false);
       if (eq !== void 0) out.expected_quantity = eq;
+      if (p.source !== void 0) out.source = String(p.source);
+      if (p.admin_email !== void 0) out.admin_email = String(p.admin_email);
+      if (p.admin_user_id !== void 0) out.admin_user_id = String(p.admin_user_id);
       return out;
     }
     case "STOCK_SET": {
-      onlyKeys(p, ["medicine_id", "batch_id", "batch_number", "quantity", "reason", "expected_quantity"], "STOCK_SET");
+      onlyKeys(p, ["medicine_id", "batch_id", "batch_number", "quantity", "reason", "expected_quantity", "source", "admin_email", "admin_user_id", "role", "is_global_admin"], "STOCK_SET");
       const out = {
         medicine_id: uuid(p.medicine_id, "medicine_id"),
         quantity: wholeNumber(p.quantity, "quantity", 0),
@@ -2273,10 +2279,13 @@ function validateCommandPayload(type, payload) {
       };
       if (p.batch_id) out.batch_id = uuid(p.batch_id, "batch_id");
       else out.batch_number = batchNumber(p.batch_number);
+      if (p.source !== void 0) out.source = String(p.source);
+      if (p.admin_email !== void 0) out.admin_email = String(p.admin_email);
+      if (p.admin_user_id !== void 0) out.admin_user_id = String(p.admin_user_id);
       return out;
     }
     case "STOCK_OVERRIDE_ADD": {
-      onlyKeys(p, ["medicine_id", "batch_id", "batch_number", "expiry_date", "purchase_price", "quantity", "reason", "cloud_quantity_seen", "expected_quantity", "created_at", "expires_at"], "STOCK_OVERRIDE_ADD");
+      onlyKeys(p, ["medicine_id", "batch_id", "batch_number", "expiry_date", "purchase_price", "quantity", "reason", "cloud_quantity_seen", "expected_quantity", "created_at", "expires_at", "source", "admin_email", "admin_user_id", "role", "is_global_admin"], "STOCK_OVERRIDE_ADD");
       const out = {
         medicine_id: uuid(p.medicine_id, "medicine_id"),
         quantity: wholeNumber(p.quantity, "quantity", 1),
@@ -2298,10 +2307,13 @@ function validateCommandPayload(type, payload) {
       }
       if (typeof p.created_at === "string") out.created_at = p.created_at;
       if (typeof p.expires_at === "string") out.expires_at = p.expires_at;
+      if (p.source !== void 0) out.source = String(p.source);
+      if (p.admin_email !== void 0) out.admin_email = String(p.admin_email);
+      if (p.admin_user_id !== void 0) out.admin_user_id = String(p.admin_user_id);
       return out;
     }
     case "STOCK_OVERRIDE_REMOVE": {
-      onlyKeys(p, ["medicine_id", "batch_id", "quantity", "reason", "notes", "cloud_quantity_seen", "expected_quantity", "set_zero_if_insufficient", "created_at", "expires_at"], "STOCK_OVERRIDE_REMOVE");
+      onlyKeys(p, ["medicine_id", "batch_id", "quantity", "reason", "notes", "cloud_quantity_seen", "expected_quantity", "set_zero_if_insufficient", "created_at", "expires_at", "source", "admin_email", "admin_user_id", "role", "is_global_admin"], "STOCK_OVERRIDE_REMOVE");
       const out = {
         medicine_id: uuid(p.medicine_id, "medicine_id"),
         batch_id: uuid(p.batch_id, "batch_id"),
@@ -2316,10 +2328,13 @@ function validateCommandPayload(type, payload) {
       if (p.set_zero_if_insufficient !== void 0) out.set_zero_if_insufficient = Boolean(p.set_zero_if_insufficient);
       if (typeof p.created_at === "string") out.created_at = p.created_at;
       if (typeof p.expires_at === "string") out.expires_at = p.expires_at;
+      if (p.source !== void 0) out.source = String(p.source);
+      if (p.admin_email !== void 0) out.admin_email = String(p.admin_email);
+      if (p.admin_user_id !== void 0) out.admin_user_id = String(p.admin_user_id);
       return out;
     }
     case "STOCK_OVERRIDE_SET": {
-      onlyKeys(p, ["medicine_id", "batch_id", "batch_number", "quantity", "reason", "cloud_quantity_seen", "expected_quantity", "batch_counts", "created_at", "expires_at"], "STOCK_OVERRIDE_SET");
+      onlyKeys(p, ["medicine_id", "batch_id", "batch_number", "quantity", "reason", "cloud_quantity_seen", "expected_quantity", "batch_counts", "created_at", "expires_at", "source", "admin_email", "admin_user_id", "role", "is_global_admin"], "STOCK_OVERRIDE_SET");
       const out = {
         medicine_id: uuid(p.medicine_id, "medicine_id"),
         quantity: wholeNumber(p.quantity ?? 0, "quantity", 0),
@@ -3542,6 +3557,57 @@ function buildRemoteAdminRouter(deps) {
         rejected_events: events.map((x) => ({ id: Number(x.id), event_type: x.event_type, error: safeError(x.error), rejected_at: x.rejected_at, conflict: classifyConflict(x.event_type, x.error) }))
       };
     });
+  }));
+  r.get("/admin/sync/authoritative-status", requireAdmin2, route2("GET /admin/sync/authoritative-status", async (req) => {
+    const shopId = deps.shopId(req);
+    const rt = await runtimeRow(deps, shopId);
+    const st = rt?.status || {};
+    return deps.withCloud(async (c) => {
+      const shopRow = (await c.query(
+        `SELECT shop_id, shop_code, name, inventory_fingerprint, shop_snapshot_seq, shop_snapshot_at, shop_snapshot_id
+           FROM giga_cloud.shops WHERE shop_id = $1`,
+        [shopId]
+      )).rows[0];
+      const localFp = st.authoritative_sync?.local_fingerprint || st.inventory?.fingerprint || null;
+      const cloudFp = shopRow?.inventory_fingerprint || null;
+      const inSync = Boolean(localFp && cloudFp && localFp === cloudFp);
+      const contactAgeSec = rt?.age_seconds ?? null;
+      const lastSyncAt = rt?.last_sync_at ?? null;
+      return {
+        shop_id: shopId,
+        shop_code: shopRow?.shop_code || "SHOP1",
+        shop_name: shopRow?.name || "Shop 1",
+        cloud_contact_age_seconds: contactAgeSec,
+        last_contact_at: rt?.reported_at || null,
+        last_business_event_at: lastSyncAt,
+        local_inventory_fingerprint: localFp,
+        cloud_inventory_fingerprint: cloudFp,
+        parity: inSync ? "MATCH" : st.authoritative_sync?.parity || "AUTHORITATIVE_RECONCILIATION_REQUIRED",
+        medicines_checked: st.authoritative_sync?.medicines_checked ?? st.inventory?.medicine_count ?? 0,
+        batch_mismatches: st.authoritative_sync?.batch_mismatches ?? 0,
+        medicine_mismatches: st.authoritative_sync?.medicine_mismatches ?? 0,
+        missing_cloud: st.authoritative_sync?.missing_cloud ?? 0,
+        extra_cloud: st.authoritative_sync?.extra_cloud ?? 0,
+        version_mismatches: st.authoritative_sync?.version_mismatches ?? 0,
+        snapshot_seq: shopRow?.shop_snapshot_seq ? Number(shopRow.shop_snapshot_seq) : st.authoritative_sync?.snapshot_seq ?? 0,
+        snapshot_at: shopRow?.shop_snapshot_at || st.authoritative_sync?.timestamp || null
+      };
+    });
+  }));
+  r.post("/admin/sync/authoritative-sync-now", requireAdmin2, route2("POST /admin/sync/authoritative-sync-now", async (req) => {
+    const shopId = deps.shopId(req);
+    const key = `sync-snapshot:${shopId}:${Date.now()}`;
+    const queued = await queueForShop(req, shopId, "STOCK_SNAPSHOT_REQUEST", {
+      reason: "Manual Authoritative Sync initiated from Global Admin Sync Center",
+      source: "ONLINE_GLOBAL_ADMIN",
+      is_global_admin: true
+    }, key);
+    return {
+      success: true,
+      command_id: queued.command_id,
+      status: "QUEUED",
+      note: "Authoritative snapshot request queued. The shop will mirror PostgreSQL state to Cloud with zero drift."
+    };
   }));
   r.get("/admin/sync/stock-conflicts", requireAdmin2, route2("GET /admin/sync/stock-conflicts", async (req) => {
     const shopId = deps.shopId(req);

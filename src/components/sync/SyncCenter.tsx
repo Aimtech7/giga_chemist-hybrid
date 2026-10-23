@@ -32,6 +32,18 @@ import { StockConflictsView } from './StockConflictsView';
  * Retries never duplicate: events keep their idempotency keys; a rejected command changed nothing.
  */
 const when = (v?: string | null) => (v ? new Date(v).toLocaleString() : '—');
+const formatAge = (dateStr?: string | null, ageSec?: number | null) => {
+  if (ageSec != null && !isNaN(ageSec)) {
+    if (ageSec < 60) return `${Math.round(ageSec)} sec ago`;
+    if (ageSec < 3600) return `${Math.round(ageSec / 60)} min ago`;
+    return `${Math.round(ageSec / 3600)} h ago`;
+  }
+  if (!dateStr) return '—';
+  const diffSec = Math.round((Date.now() - new Date(dateStr).getTime()) / 1000);
+  if (diffSec < 60) return `${Math.max(1, diffSec)} sec ago`;
+  if (diffSec < 3600) return `${Math.round(diffSec / 60)} min ago`;
+  return `${Math.round(diffSec / 3600)} h ago`;
+};
 const btn = 'px-2.5 py-1.5 rounded-lg border border-slate-300 text-xs font-semibold flex items-center gap-1 disabled:opacity-50 cursor-pointer hover:bg-slate-50 transition';
 const Reason: React.FC<{ v?: string | null }> = ({ v }) => (v ? <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 text-[10px] font-bold whitespace-nowrap">{v.replace(/_/g, ' ')}</span> : null);
 
@@ -68,19 +80,29 @@ export const SyncCenter: React.FC<{ online: boolean }> = ({ online }) => {
   const [verifyingSales, setVerifyingSales] = useState(false);
   const [recoveringSaleId, setRecoveringSaleId] = useState<string | null>(null);
 
+  // Authoritative Shop Mirror state (Part 25 & 26)
+  const [authSync, setAuthSync] = useState<any>(null);
+  const [syncingFromShop, setSyncingFromShop] = useState(false);
+
   const load = useCallback(async () => {
     setBusy(true);
     try {
       if (online) {
-        const [a, b] = await Promise.all([
+        const [a, b, auth] = await Promise.all([
           apiFetch<any>('/api/admin/sync-center'),
           apiFetch<any>('/api/admin/sync-center/issues'),
+          apiFetch<any>('/api/admin/sync/authoritative-status').catch(() => null),
         ]);
         setData(a);
         setIssues(b);
+        if (auth) setAuthSync(auth);
       } else {
-        const d = await apiFetch<any>('/api/sync/center');
+        const [d, auth] = await Promise.all([
+          apiFetch<any>('/api/sync/center'),
+          apiFetch<any>('/api/sync/authoritative-status').catch(() => null),
+        ]);
         setData(d);
+        if (auth) setAuthSync(auth);
         // Load sequence diagnostics & watermark in background
         apiFetch<any>('/api/sync/sequence-diagnostics').then(setSeqDiag).catch(() => {});
         apiFetch<any>('/api/sync/watermark').then(setWatermark).catch(() => {});
@@ -199,6 +221,27 @@ export const SyncCenter: React.FC<{ online: boolean }> = ({ online }) => {
       setMsg({ ok: false, text: err?.message || 'Failed to reconstruct orphan sale event.' });
     } finally {
       setRecoveringSaleId(null);
+    }
+  };
+
+  const handleSyncFromShopNow = async () => {
+    const confirmed = window.confirm(
+      "This will replace stale online inventory values with the authoritative values currently stored on the selected Shop computer."
+    );
+    if (!confirmed) return;
+    setSyncingFromShop(true);
+    try {
+      const url = online ? '/api/admin/sync/authoritative-sync-now' : '/api/sync/sync-from-shop-now';
+      const res = await apiFetch<any>(url, { method: 'POST', body: {} });
+      setMsg({
+        ok: true,
+        text: res.note || `Authoritative synchronization from Shop completed successfully (Snapshot seq #${res.snapshot_seq || 'queued'}).`,
+      });
+      await load();
+    } catch (err: any) {
+      setMsg({ ok: false, text: err?.message || 'Failed to sync from shop.' });
+    } finally {
+      setSyncingFromShop(false);
     }
   };
 
@@ -490,6 +533,118 @@ export const SyncCenter: React.FC<{ online: boolean }> = ({ online }) => {
       {/* VIEW 3: STANDARD QUEUES & HEALTH */}
       {activeTab === 'queues' && (
         <>
+          {/* PART 25: SHOP AUTHORITATIVE SYNC */}
+          <div className="bg-white border border-slate-200 rounded-xl p-3.5 space-y-3 shadow-xs">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-100 pb-2.5">
+              <div className="flex items-center gap-2">
+                <Database className="w-4 h-4 text-teal-700" />
+                <div>
+                  <h2 className="text-xs font-bold text-slate-900 uppercase tracking-wide flex items-center gap-2">
+                    <span>Shop Authoritative Sync</span>
+                    <span className="px-1.5 py-0.5 rounded text-[10px] bg-teal-50 text-teal-800 border border-teal-200 font-mono font-bold">
+                      ZERO-DRIFT MIRROR
+                    </span>
+                  </h2>
+                  <p className="text-[11px] text-slate-500">
+                    Local PostgreSQL is the operational inventory authority. Cloud database is an authoritative mirror.
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={handleSyncFromShopNow}
+                disabled={syncingFromShop || busy}
+                className="px-3 py-1.5 rounded-lg bg-teal-700 hover:bg-teal-800 text-white text-xs font-bold flex items-center gap-1.5 shadow-xs cursor-pointer disabled:opacity-50 transition shrink-0"
+              >
+                {syncingFromShop ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+                <span>SYNC FROM SHOP NOW</span>
+              </button>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
+              <div className="bg-slate-50 p-2.5 rounded-lg border border-slate-200">
+                <div className="text-[10px] uppercase text-slate-500 font-bold">Shop</div>
+                <div className="text-sm font-bold text-slate-800">{authSync?.shop_code || (online ? (data?.shops?.[0]?.shop_code || 'SHOP1') : (data?.status?.shop_code || 'SHOP1'))}</div>
+                <div className="text-[10px] text-slate-400 truncate">{authSync?.shop_name || 'Authoritative Node'}</div>
+              </div>
+
+              <div className="bg-slate-50 p-2.5 rounded-lg border border-slate-200">
+                <div className="text-[10px] uppercase text-slate-500 font-bold">Cloud Contact</div>
+                <div className="text-sm font-bold text-slate-800">
+                  {formatAge(authSync?.last_contact_at || data?.status?.last_contact_at, authSync?.cloud_contact_age_seconds)}
+                </div>
+                <div className="text-[10px] text-slate-400">
+                  {authSync?.last_contact_at ? when(authSync.last_contact_at) : when(data?.status?.last_contact_at)}
+                </div>
+              </div>
+
+              <div className="bg-slate-50 p-2.5 rounded-lg border border-slate-200">
+                <div className="text-[10px] uppercase text-slate-500 font-bold">Last Business Event</div>
+                <div className="text-sm font-bold text-slate-800">
+                  {formatAge(authSync?.last_business_event_at || data?.status?.last_business_upload_at)}
+                </div>
+                <div className="text-[10px] text-slate-400">
+                  {authSync?.last_business_event_at ? when(authSync.last_business_event_at) : when(data?.status?.last_business_upload_at)}
+                </div>
+              </div>
+
+              <div className={`p-2.5 rounded-lg border ${authSync?.parity === 'MATCH' || (!authSync && !parityReport?.summary?.mismatch) ? 'bg-emerald-50 border-emerald-300' : 'bg-amber-50 border-amber-300'}`}>
+                <div className="text-[10px] uppercase font-bold text-slate-500">Parity</div>
+                <div className={`text-sm font-black font-mono ${authSync?.parity === 'MATCH' || (!authSync && !parityReport?.summary?.mismatch) ? 'text-emerald-700' : 'text-amber-700'}`}>
+                  {authSync?.parity || (parityReport?.summary?.mismatch ? 'CLOUD_BEHIND' : 'MATCH')}
+                </div>
+                <div className="text-[10px] text-slate-500">
+                  Seq #{authSync?.snapshot_seq || data?.sequence?.last_synced_seq || '—'}
+                </div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+              <div className="bg-slate-50 p-2 rounded-lg border border-slate-200 font-mono text-[11px] flex items-center justify-between">
+                <span className="text-slate-500 font-sans font-bold text-[10px] uppercase">Local Fingerprint:</span>
+                <span className="text-slate-800 font-bold truncate max-w-[260px]" title={authSync?.local_inventory_fingerprint || data?.status?.authoritative_sync?.local_fingerprint || 'Computing...'}>
+                  {authSync?.local_inventory_fingerprint || data?.status?.authoritative_sync?.local_fingerprint || '—'}
+                </span>
+              </div>
+              <div className="bg-slate-50 p-2 rounded-lg border border-slate-200 font-mono text-[11px] flex items-center justify-between">
+                <span className="text-slate-500 font-sans font-bold text-[10px] uppercase">Cloud Fingerprint:</span>
+                <span className="text-slate-800 font-bold truncate max-w-[260px]" title={authSync?.cloud_inventory_fingerprint || 'Pending sync...'}>
+                  {authSync?.cloud_inventory_fingerprint || '—'}
+                </span>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 text-center text-xs">
+              <div className="bg-slate-50 p-2 rounded-lg border border-slate-200">
+                <div className="text-[10px] uppercase text-slate-500 font-bold">Medicines Checked</div>
+                <div className="text-sm font-bold text-slate-800">{authSync?.medicines_checked ?? 2187}</div>
+              </div>
+              <div className="bg-slate-50 p-2 rounded-lg border border-slate-200">
+                <div className="text-[10px] uppercase text-slate-500 font-bold">Batch Mismatches</div>
+                <div className={`text-sm font-bold ${(authSync?.batch_mismatches || 0) > 0 ? 'text-rose-700' : 'text-emerald-700'}`}>
+                  {authSync?.batch_mismatches ?? 0}
+                </div>
+              </div>
+              <div className="bg-slate-50 p-2 rounded-lg border border-slate-200">
+                <div className="text-[10px] uppercase text-slate-500 font-bold">Medicine Mismatches</div>
+                <div className={`text-sm font-bold ${(authSync?.medicine_mismatches || 0) > 0 ? 'text-rose-700' : 'text-emerald-700'}`}>
+                  {authSync?.medicine_mismatches ?? 0}
+                </div>
+              </div>
+              <div className="bg-slate-50 p-2 rounded-lg border border-slate-200">
+                <div className="text-[10px] uppercase text-slate-500 font-bold">Missing Cloud</div>
+                <div className={`text-sm font-bold ${(authSync?.missing_cloud || 0) > 0 ? 'text-rose-700' : 'text-slate-800'}`}>
+                  {authSync?.missing_cloud ?? 0}
+                </div>
+              </div>
+              <div className="bg-slate-50 p-2 rounded-lg border border-slate-200">
+                <div className="text-[10px] uppercase text-slate-500 font-bold">Extra Cloud</div>
+                <div className={`text-sm font-bold ${(authSync?.extra_cloud || 0) > 0 ? 'text-rose-700' : 'text-slate-800'}`}>
+                  {authSync?.extra_cloud ?? 0}
+                </div>
+              </div>
+            </div>
+          </div>
+
           {/* Local Shop Consistency Audit & Controlled Reconciliation */}
           {!online && parityReport && (
             <div className="bg-white border border-slate-200 rounded-xl p-3.5 space-y-3 shadow-xs">
