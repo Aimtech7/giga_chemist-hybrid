@@ -64,7 +64,10 @@ export function localDateStr(d: Date = new Date()): string {
  * trg_update_medicine_stock trigger: expiry_date > CURRENT_DATE is sellable).
  */
 export function deriveBatchStatus(quantity: number, expiryDate: string | null | undefined, currentStatus?: string): string {
-  if (quantity <= 0) return 'exhausted';
+  // A zero-quantity batch is operationally deleted: archive it so it disappears from POS,
+  // inventory and normal batch lists, while the row remains available to immutable sales,
+  // purchase and movement history. Adding stock to the same batch later reactivates it.
+  if (quantity <= 0) return 'archived';
   if (expiryDate && expiryDate <= localDateStr()) return 'quarantined';
   if (currentStatus === 'recalled') return 'recalled';
   return 'active';
