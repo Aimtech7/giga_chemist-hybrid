@@ -45,6 +45,7 @@ export const StockConflictsView: React.FC<StockConflictsViewProps> = ({ online }
   const [conflicts, setConflicts] = useState<StockConflictItem[]>([]);
   const [search, setSearch] = useState('');
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [selectedConflict, setSelectedConflict] = useState<StockConflictItem | null>(null);
   const [overrideKind, setOverrideKind] = useState<'add' | 'remove' | 'set' | null>(null);
 
@@ -60,6 +61,7 @@ export const StockConflictsView: React.FC<StockConflictsViewProps> = ({ online }
   const loadConflicts = useCallback(async () => {
     setLoading(true);
     setMsg(null);
+    setLoadError(null);
     try {
       if (online) {
         const res = await apiFetch<any>('/api/admin/sync/stock-conflicts');
@@ -82,7 +84,9 @@ export const StockConflictsView: React.FC<StockConflictsViewProps> = ({ online }
         })));
       }
     } catch (err: any) {
-      setMsg({ ok: false, text: err?.message || 'Failed to load stock conflicts.' });
+      const message = err?.message || 'Failed to load stock conflicts.';
+      setLoadError(message);
+      setMsg({ ok: false, text: message });
     } finally {
       setLoading(false);
     }
@@ -235,7 +239,7 @@ export const StockConflictsView: React.FC<StockConflictsViewProps> = ({ online }
           <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
             <div className="text-[11px] font-semibold text-slate-500 uppercase">Total Mismatches</div>
             <div className={`text-xl font-bold mt-0.5 ${conflicts.length > 0 ? 'text-amber-700' : 'text-slate-800'}`}>
-              {conflicts.length}
+              {loadError ? '—' : conflicts.length}
             </div>
           </div>
           <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-lg">
@@ -348,11 +352,19 @@ export const StockConflictsView: React.FC<StockConflictsViewProps> = ({ online }
             {filtered.length === 0 && (
               <tr>
                 <td colSpan={8} className="px-4 py-8 text-center text-slate-500">
-                  <div className="flex flex-col items-center gap-1.5">
-                    <CheckCircle2 className="w-6 h-6 text-emerald-600" />
-                    <span className="font-semibold text-slate-700">All stock in perfect parity</span>
-                    <span className="text-[11px] text-slate-400">Authoritative shop stock and cloud reporting copy are synchronized.</span>
-                  </div>
+                  {loadError ? (
+                    <div className="flex flex-col items-center gap-1.5">
+                      <AlertTriangle className="w-6 h-6 text-rose-600" />
+                      <span className="font-semibold text-rose-800">Parity status unavailable</span>
+                      <span className="text-[11px] text-rose-600">The cloud conflict check failed. Refresh after the database/API error is resolved.</span>
+                    </div>
+                  ) : (
+                    <div className="flex flex-col items-center gap-1.5">
+                      <CheckCircle2 className="w-6 h-6 text-emerald-600" />
+                      <span className="font-semibold text-slate-700">All stock in perfect parity</span>
+                      <span className="text-[11px] text-slate-400">Authoritative shop stock and cloud reporting copy are synchronized.</span>
+                    </div>
+                  )}
                 </td>
               </tr>
             )}
