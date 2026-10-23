@@ -1,0 +1,42 @@
+﻿<#
+.SYNOPSIS
+    Shop 2 Cloud Activation Script (TEMPLATE)
+.DESCRIPTION
+    Activates hybrid cloud synchronization on the physical Shop 2 computer
+    AFTER local offline operation has been validated.
+    DO NOT RUN DURING LOCAL DEVELOPMENT.
+#>
+
+param(
+    [Parameter(Mandatory=$false)]
+    [switch]$DryRun
+)
+
+Write-Host "=============================================================" -ForegroundColor Cyan
+Write-Host "  GIGA CHEMIST — SHOP 2 CLOUD ACTIVATION" -ForegroundColor Cyan
+Write-Host "============================================================="
+
+$Shop1Id = "c2a176c8-a50f-456f-a370-225c11d2e32f"
+
+# 1. Guard check
+if ($env:SHOP_ID -eq $Shop1Id) {
+    Write-Error "FATAL: Shop 1 ID detected in Shop 2 environment! Aborting activation."
+    exit 1
+}
+
+Write-Host "Phase 1: Local database verification..."
+# Verify local database health before cloud contact
+
+Write-Host "Phase 2: Verifying unique Shop 2 identity on Supabase..."
+# Verify SHOP_ID and SYNC_SHOP_TOKEN
+
+Write-Host "Phase 3: Schema and protocol compatibility check..."
+# Run gc_check_compatibility
+
+Write-Host "Phase 4: Setting APP_MODE=hybrid and starting sync worker..."
+# Enable sync worker
+
+Write-Host "Phase 5: Publishing authoritative Shop 2 snapshot to mirror..."
+# Upload snapshot
+
+Write-Host "ACTIVATION COMPLETE." -ForegroundColor Green

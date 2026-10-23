@@ -40,3 +40,4 @@ pos.zip
 Thumbs.db
 .vscode/
 .idea/
+!.env.shop2.example
