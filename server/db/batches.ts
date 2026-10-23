@@ -43,8 +43,17 @@ function toBatch(r: any): MedicineBatch {
   } as MedicineBatch;
 }
 
+/**
+ * Operational batch list. Batches belonging to archived medicines (and batches explicitly archived)
+ * are hidden from live inventory screens, while their rows remain intact for historical records.
+ */
 export async function getAllBatches(q: Queryable = pgPool): Promise<MedicineBatch[]> {
-  const res = await q.query(`${BATCH_SELECT} ORDER BY b.expiry_date ASC NULLS LAST, b.created_at ASC`);
+  const res = await q.query(
+    `${BATCH_SELECT}
+     WHERE COALESCE(b.status, 'active') <> 'archived'
+       AND COALESCE(m.status, 'active') <> 'archived'
+     ORDER BY b.expiry_date ASC NULLS LAST, b.created_at ASC`
+  );
   return res.rows.map(toBatch);
 }
 
