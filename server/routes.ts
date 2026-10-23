@@ -982,6 +982,14 @@ apiRouter.post('/sync/sync-from-shop-now', requireRole('ADMIN'), async (req: Aut
       actor: actorAudit(req),
       reason: 'Shop Admin: SYNC FROM SHOP NOW',
     });
+    if (!result.ok) {
+      return res.status(409).json({
+        success: false,
+        error: 'CLOUD_AHEAD_INVALID',
+        message: 'Cloud has a newer authoritative snapshot high-water mark. This local snapshot was not applied.',
+        ...result,
+      });
+    }
     res.json({ success: true, ...result });
   } catch (err: any) {
     sendError(res, err, 'Failed to execute authoritative sync from shop.', 'POST /sync/sync-from-shop-now');
