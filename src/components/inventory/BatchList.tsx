@@ -75,6 +75,9 @@ export const BatchList: React.FC<BatchListProps> = ({ currentUser, settings }) =
   };
 
   const filtered = batches.filter((b) => {
+    // Archived batches are historical records only and never return to operational batch lists,
+    // even if an older IndexedDB cache still contains the row.
+    if (b.status === 'archived') return false;
     if (statusFilter !== 'all' && b.status !== statusFilter) return false;
     if (!search.trim()) return true;
     const q = search.toLowerCase();
