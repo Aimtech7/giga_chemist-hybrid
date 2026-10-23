@@ -58,8 +58,15 @@ export function toMedicine(r: any): Medicine {
   } as Medicine;
 }
 
+/**
+ * Operational medicine catalogue. Archived medicines are deliberately excluded so an archive acts
+ * like a deletion everywhere the live catalogue is used, while the retained row remains available
+ * to historical sales/purchases/audit joins and direct-by-id history lookups.
+ */
 export async function getAllMedicines(q: Pick<pg.PoolClient, 'query'> = pgPool): Promise<Medicine[]> {
-  const res = await q.query(`${MEDICINE_SELECT} ORDER BY m.name ASC`);
+  const res = await q.query(
+    `${MEDICINE_SELECT} WHERE COALESCE(m.status, 'active') <> 'archived' ORDER BY m.name ASC`
+  );
   return res.rows.map(toMedicine);
 }
 
