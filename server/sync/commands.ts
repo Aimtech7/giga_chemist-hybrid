@@ -766,6 +766,17 @@ const HANDLERS: Record<string, Handler> = {
         reason: p.reason || 'Global Admin: SYNC FROM SHOP NOW',
         client,
       });
+      if (!snapRes.ok) {
+        throw new HttpError(
+          409,
+          'CLOUD_AHEAD_INVALID: Cloud has a newer authoritative snapshot high-water mark; this Shop snapshot was not applied.',
+          {
+            code: 'CLOUD_AHEAD_INVALID',
+            attempted_snapshot_seq: snapRes.snapshot_seq,
+            cloud_snapshot_seq: snapRes.current_snapshot_seq ?? null,
+          }
+        );
+      }
       baselineResult = {
         snapshot_published: true,
         snapshot_id: snapRes.snapshot_id,
