@@ -245,7 +245,7 @@ export async function publishAuthoritativeInventorySnapshot(options?: {
   const cfg = getSyncConfig();
   const identity = await getShopIdentity();
 
-  if (!cfg.cloudConfigured || !cfg.shopToken) {
+  if (!options?.cloudCall && (!cfg.cloudConfigured || !cfg.shopToken)) {
     throw new Error('Cloud is not configured; cannot publish authoritative inventory snapshot.');
   }
 
@@ -256,7 +256,7 @@ export async function publishAuthoritativeInventorySnapshot(options?: {
   const cloudCall = options?.cloudCall || callCloud;
   const res = await cloudCall<any>('gc_apply_inventory_snapshot', {
     p_shop_id: identity.shop_id,
-    p_token: cfg.shopToken,
+    p_token: cfg.shopToken || 'INJECTED_TEST_CLOUD',
     p_snapshot: {
       snapshot_id: snapshot.snapshot_id,
       snapshot_seq: snapshot.snapshot_seq,
@@ -301,7 +301,7 @@ export async function publishAuthoritativeInventorySnapshot(options?: {
        total_stock, status, cloud_confirmed_at, details
      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP, $9::jsonb)
      ON CONFLICT (snapshot_id) DO UPDATE SET
-       cloud_confirmed_at = CURRENT_TIMESTAMP, status = 'CONFIRMED'`,
+       cloud_confirmed_at = CURRENT_TIMESTAMP, status = EXCLUDED.status, details = EXCLUDED.details`,
     [
       snapshot.snapshot_id,
       snapshot.snapshot_seq,
@@ -347,7 +347,7 @@ export async function checkInventoryParity(options?: {
   let localFp = localSnapshot.fingerprint;
   const cloudCall = options?.cloudCall || callCloud;
 
-  if (!cfg.cloudConfigured || !cfg.shopToken) {
+  if (!options?.cloudCall && (!cfg.cloudConfigured || !cfg.shopToken)) {
     return {
       shop_id: identity.shop_id,
       shop_code: identity.shop_code || 'SHOP1',
@@ -373,13 +373,14 @@ export async function checkInventoryParity(options?: {
   try {
     cloudFpData = await cloudCall<any>('gc_get_inventory_fingerprint', {
       p_shop_id: identity.shop_id,
-      p_token: cfg.shopToken,
+      p_token: cfg.shopToken || 'INJECTED_TEST_CLOUD',
     });
   } catch (err: any) {
     console.warn('[InventorySnapshot] Cloud fingerprint fetch failed:', err?.message || err);
   }
 
   let cloudFp = cloudFpData?.fingerprint || null;
+  let cloudSnapshotSeq = Number(cloudFpData?.snapshot_seq || 0);
 
   // 3. Fast Fingerprint Check
   if (cloudFp && localFp === cloudFp) {
@@ -407,7 +408,7 @@ export async function checkInventoryParity(options?: {
   try {
     inspectRes = await cloudCall<any>('gc_inspect_shop_data', {
       p_shop_id: identity.shop_id,
-      p_token: cfg.shopToken,
+      p_token: cfg.shopToken || 'INJECTED_TEST_CLOUD',
     });
   } catch (err: any) {
     console.warn('[InventorySnapshot] gc_inspect_shop_data failed:', err?.message || err);
@@ -457,14 +458,20 @@ export async function checkInventoryParity(options?: {
   }
 
   let parity: ParityCheckResult['parity'] = 'MATCH';
-  if (missingCloud > 0) parity = 'MISSING_CLOUD_ROW';
+  // A cloud high-water mark greater than the local outbox sequence indicates a stale/restored clone
+  // or otherwise invalid authority ordering. Never auto-overwrite this state.
+  if (cloudFp && localFp !== cloudFp && cloudSnapshotSeq > localSnapshot.snapshot_seq) parity = 'CLOUD_AHEAD_INVALID';
+  else if (missingCloud > 0) parity = 'MISSING_CLOUD_ROW';
   else if (extraCloud > 0) parity = 'EXTRA_CLOUD_ROW';
   else if (versionMismatches > 0) parity = 'VERSION_MISMATCH';
   else if (medicineMismatches > 0 || batchMismatches > 0) parity = 'CLOUD_BEHIND';
+  // Fingerprint covers status, stock_version and expiry metadata beyond the quantity checks above.
+  // If hashes differ, parity is not MATCH even when the reduced row comparison happened to match.
+  else if (cloudFp !== localFp) parity = 'CLOUD_BEHIND';
 
   let reconciled = false;
   let reconciliationResult: any = null;
-  if (options?.autoReconcile || options?.reason) {
+  if ((options?.autoReconcile || options?.reason) && parity !== 'CLOUD_AHEAD_INVALID') {
     try {
       console.log(`[InventorySnapshot] Auto-reconciling drift (${parity}, ${medicineMismatches} med mismatch, ${batchMismatches} batch mismatch)...`);
       reconciliationResult = await publishAuthoritativeInventorySnapshot({
@@ -479,12 +486,13 @@ export async function checkInventoryParity(options?: {
         generateAuthoritativeInventorySnapshot(),
         cloudCall<any>('gc_get_inventory_fingerprint', {
           p_shop_id: identity.shop_id,
-          p_token: cfg.shopToken,
+          p_token: cfg.shopToken || 'INJECTED_TEST_CLOUD',
         }),
       ]);
       localSnapshot = freshLocal;
       localFp = freshLocal.fingerprint;
       cloudFp = verifiedCloud?.fingerprint || null;
+      cloudSnapshotSeq = Number(verifiedCloud?.snapshot_seq || reconciliationResult?.current_snapshot_seq || 0);
 
       if (cloudFp && cloudFp === localFp) {
         reconciled = true;
@@ -527,6 +535,7 @@ export async function checkInventoryParity(options?: {
     details: {
       integrity_errors: localSnapshot.integrity_errors,
       reconciliation_result: reconciliationResult,
+      cloud_snapshot_seq: cloudSnapshotSeq,
     },
   };
 }
