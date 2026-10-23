@@ -31,6 +31,7 @@ async function run() {
     stockLevels: any[];
     batches: any[];
   } = { snapshotSeq: 0, fingerprint: null, medicines: [], stockLevels: [], batches: [] };
+  let snapshotApplyCalls = 0;
 
   const fakeCloud = async <T = any>(fn: any, args: Record<string, any>): Promise<T> => {
     if (fn === 'gc_get_inventory_fingerprint') {
@@ -50,6 +51,7 @@ async function run() {
       } as T;
     }
     if (fn === 'gc_apply_inventory_snapshot') {
+      snapshotApplyCalls++;
       const s = args.p_snapshot || {};
       const seq = Number(s.snapshot_seq || 0);
       if (seq < cloudState.snapshotSeq) {
@@ -193,11 +195,13 @@ async function run() {
     const localNow = await generateAuthoritativeInventorySnapshot();
     cloudState.snapshotSeq = localNow.snapshot_seq + 100;
     cloudState.fingerprint = 'cloud-newer-fingerprint';
+    const applyCallsBeforeCloudAheadCheck = snapshotApplyCalls;
 
     const superseded = await checkInventoryParity({ autoReconcile: true, cloudCall: fakeCloud as any });
-    check(superseded.in_sync === false, '5.1 Superseded local snapshot is NOT reported in sync');
-    check(superseded.parity === 'CLOUD_AHEAD_INVALID', '5.2 Superseded snapshot reports CLOUD_AHEAD_INVALID');
-    check(superseded.details?.reconciliation_result?.ignored === true, '5.3 High-water rejection is preserved in diagnostics');
+    check(superseded.in_sync === false, '5.1 Cloud-ahead state is NOT reported in sync');
+    check(superseded.parity === 'CLOUD_AHEAD_INVALID', '5.2 Higher cloud high-water reports CLOUD_AHEAD_INVALID');
+    check(snapshotApplyCalls === applyCallsBeforeCloudAheadCheck, '5.3 Cloud-ahead state does not attempt an older snapshot overwrite');
+    check(Number(superseded.details?.cloud_snapshot_seq) > superseded.snapshot_seq, '5.4 Diagnostics preserve the higher cloud snapshot sequence');
   } finally {
     await pool.end();
   }
