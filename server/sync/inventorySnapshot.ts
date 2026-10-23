@@ -1,9 +1,9 @@
 import crypto from 'crypto';
 import pg from 'pg';
-import { pgPool, withTransaction, isValidUuid } from '../db/client';
+import { pgPool } from '../db/client';
 import { getShopIdentity } from './identity';
 import { getSyncConfig } from './config';
-import { callCloud, CloudError } from './cloudClient';
+import { callCloud } from './cloudClient';
 import { recordAuditLog } from '../db/audit';
 import type { SyncActor } from './outbox';
 
@@ -299,9 +299,15 @@ export async function publishAuthoritativeInventorySnapshot(options?: {
     `INSERT INTO shop_inventory_snapshots (
        snapshot_id, snapshot_seq, generated_at, fingerprint, medicines_count, batches_count,
        total_stock, status, cloud_confirmed_at, details
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP, $9::jsonb)
+     ) VALUES (
+       $1, $2, $3, $4, $5, $6, $7, $8,
+       CASE WHEN $8 = 'CONFIRMED' THEN CURRENT_TIMESTAMP ELSE NULL END,
+       $9::jsonb
+     )
      ON CONFLICT (snapshot_id) DO UPDATE SET
-       cloud_confirmed_at = CURRENT_TIMESTAMP, status = EXCLUDED.status, details = EXCLUDED.details`,
+       cloud_confirmed_at = EXCLUDED.cloud_confirmed_at,
+       status = EXCLUDED.status,
+       details = EXCLUDED.details`,
     [
       snapshot.snapshot_id,
       snapshot.snapshot_seq,
