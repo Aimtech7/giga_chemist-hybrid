@@ -230,13 +230,17 @@ export async function publishAuthoritativeInventorySnapshot(options?: {
   actor?: SyncActor;
   reason?: string;
   client?: pg.PoolClient;
+  /** Test seam: production callers omit this and use the real Supabase RPC client. */
+  cloudCall?: typeof callCloud;
 }): Promise<{
   ok: boolean;
+  ignored: boolean;
   snapshot_id: string;
   snapshot_seq: number;
   fingerprint: string;
   medicines_count: number;
   batches_count: number;
+  current_snapshot_seq?: number;
 }> {
   const cfg = getSyncConfig();
   const identity = await getShopIdentity();
@@ -249,7 +253,8 @@ export async function publishAuthoritativeInventorySnapshot(options?: {
   const snapshot = await generateAuthoritativeInventorySnapshot(options?.client);
 
   // 2. Dispatch to Supabase Cloud RPC
-  const res = await callCloud<any>('gc_apply_inventory_snapshot', {
+  const cloudCall = options?.cloudCall || callCloud;
+  const res = await cloudCall<any>('gc_apply_inventory_snapshot', {
     p_shop_id: identity.shop_id,
     p_token: cfg.shopToken,
     p_snapshot: {
@@ -266,9 +271,11 @@ export async function publishAuthoritativeInventorySnapshot(options?: {
     throw new Error(`Cloud snapshot application failed: ${JSON.stringify(res)}`);
   }
 
-  // 3. Record local audit record
+  const ignored = Boolean(res?.ignored);
+
+  // 3. Record local audit record. A superseded snapshot is NOT a reconciliation success.
   await recordAuditLog({
-    action: 'CLOUD_MIRROR_RECONCILED',
+    action: ignored ? 'CLOUD_MIRROR_RECONCILIATION_SUPERSEDED' : 'CLOUD_MIRROR_RECONCILED',
     entity: 'shop',
     entity_id: identity.shop_id,
     user_id: options?.actor?.user_id || undefined,
@@ -281,6 +288,7 @@ export async function publishAuthoritativeInventorySnapshot(options?: {
       medicines_count: snapshot.medicines.length,
       batches_count: snapshot.batches.length,
       reason: options?.reason || 'Authoritative Shop Mirror Reconciliation',
+      ignored,
       cloud_response: res,
     },
   }, options?.client);
@@ -302,18 +310,20 @@ export async function publishAuthoritativeInventorySnapshot(options?: {
       snapshot.medicines.length,
       snapshot.batches.length,
       snapshot.medicines.reduce((sum, m) => sum + m.current_stock, 0),
-      res?.ignored ? 'SUPERSEDED' : 'CONFIRMED',
+      ignored ? 'SUPERSEDED' : 'CONFIRMED',
       JSON.stringify({ cloud_response: res }),
     ]
   );
 
   return {
-    ok: true,
+    ok: Boolean(res?.ok) && !ignored,
+    ignored,
     snapshot_id: snapshot.snapshot_id,
     snapshot_seq: snapshot.snapshot_seq,
     fingerprint: snapshot.fingerprint,
     medicines_count: snapshot.medicines.length,
     batches_count: snapshot.batches.length,
+    current_snapshot_seq: res?.current_snapshot_seq != null ? Number(res.current_snapshot_seq) : undefined,
   };
 }
 
@@ -325,14 +335,17 @@ export async function checkInventoryParity(options?: {
   autoReconcile?: boolean;
   actor?: SyncActor;
   reason?: string;
+  /** Test seam: production callers omit this and use the real Supabase RPC client. */
+  cloudCall?: typeof callCloud;
 }): Promise<ParityCheckResult> {
   const cfg = getSyncConfig();
   const identity = await getShopIdentity();
   const now = new Date().toISOString();
 
   // 1. Generate local snapshot & fingerprint
-  const localSnapshot = await generateAuthoritativeInventorySnapshot();
-  const localFp = localSnapshot.fingerprint;
+  let localSnapshot = await generateAuthoritativeInventorySnapshot();
+  let localFp = localSnapshot.fingerprint;
+  const cloudCall = options?.cloudCall || callCloud;
 
   if (!cfg.cloudConfigured || !cfg.shopToken) {
     return {
@@ -358,7 +371,7 @@ export async function checkInventoryParity(options?: {
   // 2. Fetch cloud fingerprint
   let cloudFpData: any = null;
   try {
-    cloudFpData = await callCloud<any>('gc_get_inventory_fingerprint', {
+    cloudFpData = await cloudCall<any>('gc_get_inventory_fingerprint', {
       p_shop_id: identity.shop_id,
       p_token: cfg.shopToken,
     });
@@ -392,7 +405,7 @@ export async function checkInventoryParity(options?: {
   // 4. Exhaustive parity inspection via gc_inspect_shop_data
   let inspectRes: any = null;
   try {
-    inspectRes = await callCloud<any>('gc_inspect_shop_data', {
+    inspectRes = await cloudCall<any>('gc_inspect_shop_data', {
       p_shop_id: identity.shop_id,
       p_token: cfg.shopToken,
     });
@@ -450,21 +463,46 @@ export async function checkInventoryParity(options?: {
   else if (medicineMismatches > 0 || batchMismatches > 0) parity = 'CLOUD_BEHIND';
 
   let reconciled = false;
+  let reconciliationResult: any = null;
   if (options?.autoReconcile || options?.reason) {
     try {
       console.log(`[InventorySnapshot] Auto-reconciling drift (${parity}, ${medicineMismatches} med mismatch, ${batchMismatches} batch mismatch)...`);
-      await publishAuthoritativeInventorySnapshot({
+      reconciliationResult = await publishAuthoritativeInventorySnapshot({
         actor: options?.actor,
         reason: options?.reason || `Self-heal from parity state: ${parity}`,
+        cloudCall,
       });
-      reconciled = true;
-      parity = 'MATCH';
-      medicineMismatches = 0;
-      batchMismatches = 0;
-      missingCloud = 0;
-      extraCloud = 0;
-      versionMismatches = 0;
-      cloudFp = localFp;
+
+      // Never declare MATCH merely because the RPC returned. A high-water rejection (ignored/superseded)
+      // means Cloud intentionally kept a newer snapshot. Re-read both sides and prove equality.
+      const [freshLocal, verifiedCloud] = await Promise.all([
+        generateAuthoritativeInventorySnapshot(),
+        cloudCall<any>('gc_get_inventory_fingerprint', {
+          p_shop_id: identity.shop_id,
+          p_token: cfg.shopToken,
+        }),
+      ]);
+      localSnapshot = freshLocal;
+      localFp = freshLocal.fingerprint;
+      cloudFp = verifiedCloud?.fingerprint || null;
+
+      if (cloudFp && cloudFp === localFp) {
+        reconciled = true;
+        parity = 'MATCH';
+        medicineMismatches = 0;
+        batchMismatches = 0;
+        missingCloud = 0;
+        extraCloud = 0;
+        versionMismatches = 0;
+      } else if (reconciliationResult?.ignored) {
+        // Cloud has a higher snapshot high-water mark than this local database. This is expected for
+        // a stale clone and must never be presented as successful parity.
+        reconciled = false;
+        parity = 'CLOUD_AHEAD_INVALID';
+      } else {
+        reconciled = false;
+        parity = 'CLOUD_BEHIND';
+      }
     } catch (recErr: any) {
       console.error('[InventorySnapshot] Auto-reconciliation error:', recErr?.message || recErr);
     }
@@ -488,6 +526,7 @@ export async function checkInventoryParity(options?: {
     reconciled,
     details: {
       integrity_errors: localSnapshot.integrity_errors,
+      reconciliation_result: reconciliationResult,
     },
   };
 }
