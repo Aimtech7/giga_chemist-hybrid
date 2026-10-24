@@ -19,6 +19,7 @@ coverage/
 .vite/
 
 # Runtime data, logs, backups
+scratch/
 data/
 logs/
 backups/
@@ -32,6 +33,8 @@ deployment/xampp/backups/*
 
 # Large legacy dumps & archives (migrations/*.sql stay tracked)
 chemist_pos.sql
+shop2 db.sql
+deployment/shop2-ready/
 deployment/postgresql/giga_chemist_full.sql
 pos.zip
 

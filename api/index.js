@@ -588,7 +588,9 @@ function toMedicine(r) {
   };
 }
 async function getAllMedicines(q = pgPool) {
-  const res = await q.query(`${MEDICINE_SELECT} ORDER BY m.name ASC`);
+  const res = await q.query(
+    `${MEDICINE_SELECT} WHERE COALESCE(m.status, 'active') <> 'archived' ORDER BY m.name ASC`
+  );
   return res.rows.map(toMedicine);
 }
 async function getMedicineById(id, q = pgPool) {
@@ -1407,7 +1409,12 @@ function toBatch(r) {
   };
 }
 async function getAllBatches(q = pgPool) {
-  const res = await q.query(`${BATCH_SELECT} ORDER BY b.expiry_date ASC NULLS LAST, b.created_at ASC`);
+  const res = await q.query(
+    `${BATCH_SELECT}
+     WHERE COALESCE(b.status, 'active') <> 'archived'
+       AND COALESCE(m.status, 'active') <> 'archived'
+     ORDER BY b.expiry_date ASC NULLS LAST, b.created_at ASC`
+  );
   return res.rows.map(toBatch);
 }
 
@@ -3614,17 +3621,56 @@ function buildRemoteAdminRouter(deps) {
     const rt = await runtimeRow(deps, shopId);
     const st = rt?.status || {};
     const mismatches = Array.isArray(st.inventory?.mismatches) ? st.inventory.mismatches : [];
-    const conflicts = await deps.withShopId(shopId, async (c) => {
+    if (mismatches.length === 0) {
+      return {
+        shop_id: shopId,
+        healthy: true,
+        stock_mismatch_count: 0,
+        last_checked: st.inventory?.stock_parity_checked_at || rt?.reported_at || null,
+        conflicts: []
+      };
+    }
+    const conflicts = await deps.withCloud(async (c) => {
       const cloudMeds = (await c.query(`
-        SELECT id, name, current_stock, stock_version, stock_fingerprint, updated_at
-          FROM medicines
-         WHERE status <> 'archived'
-      `)).rows;
+        SELECT
+          m.medicine_id AS id,
+          m.name,
+          COALESCE((
+            SELECT SUM(
+              CASE
+                WHEN s.has_baseline THEN s.baseline_quantity + s.delta_since_baseline
+                ELSE s.last_reported_quantity
+              END
+            )
+            FROM giga_cloud.stock_levels s
+            WHERE s.shop_id = m.shop_id AND s.medicine_id = m.medicine_id
+          ), 0)::int AS current_stock,
+          COALESCE(m.stock_version, 1)::bigint AS stock_version,
+          m.stock_fingerprint,
+          m.updated_at
+        FROM giga_cloud.medicines m
+        WHERE m.shop_id = $1 AND m.status <> 'archived'
+      `, [shopId])).rows;
       const cloudBatches = (await c.query(`
-        SELECT id, medicine_id, batch_number, quantity_available, stock_version, expiry_date, updated_at
-          FROM medicine_batches
-         WHERE status <> 'archived'
-      `)).rows;
+        SELECT
+          b.batch_id AS id,
+          b.medicine_id,
+          b.batch_number,
+          COALESCE(
+            CASE
+              WHEN s.has_baseline THEN s.baseline_quantity + s.delta_since_baseline
+              ELSE s.last_reported_quantity
+            END,
+            0
+          )::int AS quantity_available,
+          COALESCE(s.stock_version, 1)::bigint AS stock_version,
+          b.expiry_date,
+          b.updated_at
+        FROM giga_cloud.medicine_batches b
+        LEFT JOIN giga_cloud.stock_levels s
+          ON s.shop_id = b.shop_id AND s.batch_id = b.batch_id
+        WHERE b.shop_id = $1 AND b.status <> 'archived'
+      `, [shopId])).rows;
       const medMap = new Map(cloudMeds.map((m) => [m.id, m]));
       const batchMap = /* @__PURE__ */ new Map();
       for (const b of cloudBatches) {

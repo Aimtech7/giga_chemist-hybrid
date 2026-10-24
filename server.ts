@@ -21,6 +21,14 @@ async function startServer() {
   // Refuse to start without a real JWT secret (there is no built-in fallback).
   assertAuthConfiguration();
 
+  // Shop 2 Isolation Guard: Prevent Shop 1 contamination
+  const FORBIDDEN_SHOP1_ID = 'c2a176c8-a50f-456f-a370-225c11d2e32f';
+  const configuredShopId = (process.env.SHOP_ID || '').toLowerCase().trim();
+  const configuredDb = (process.env.DB_NAME || '').toLowerCase().trim();
+  if (configuredDb === 'giga_chemist_shop2' && configuredShopId === FORBIDDEN_SHOP1_ID) {
+    throw new Error('FATAL: Shop 1 ID detected in Shop 2 workspace. Startup aborted.');
+  }
+
   const app = express();
   const httpServer = http.createServer(app);
   // Server port defaults to 3000
