@@ -7136,16 +7136,19 @@ async function executeOnlineSaleCheckout(client, shopId, input, user) {
          jsonb_set(
            jsonb_set(
              jsonb_set(
-               COALESCE(data, '{}'::jsonb),
-               '{total_sales}', to_jsonb(COALESCE((data->>'total_sales')::numeric, 0) + $1)
+               jsonb_set(
+                 COALESCE(data, '{}'::jsonb),
+                 '{total_sales}', to_jsonb(COALESCE((data->>'total_sales')::numeric, 0) + $1)
+               ),
+               '{total_transactions}', to_jsonb(COALESCE((data->>'total_transactions')::int, 0) + 1)
              ),
-             '{total_transactions}', to_jsonb(COALESCE((data->>'total_transactions')::int, 0) + 1)
+             '{cash_sales}', to_jsonb(COALESCE((data->>'cash_sales')::numeric, 0) + $2)
            ),
-           '{cash_sales}', to_jsonb(COALESCE((data->>'cash_sales')::numeric, 0) + $2)
+           '{mpesa_sales}', to_jsonb(COALESCE((data->>'mpesa_sales')::numeric, 0) + $3)
          ),
-         '{mpesa_sales}', to_jsonb(COALESCE((data->>'mpesa_sales')::numeric, 0) + $3)
+         '{units_sold}', to_jsonb(COALESCE((data->>'units_sold')::int, 0) + $4)
        ),
-       units_sold = COALESCE(units_sold, 0) + $4,
+       total_sales = COALESCE(total_sales, 0) + $1,
        updated_at = now()
        WHERE shop_id = $5 AND shift_id = $6`,
       [fromCents3(totalCents), fromCents3(cashCents), fromCents3(mpesaCents), totalUnitsSold, shopId, shiftId]
@@ -7203,6 +7206,222 @@ async function executeOnlineSaleCheckout(client, shopId, input, user) {
     sale,
     medicines: returnMedicines,
     batches: [...touchedBatches.values()]
+  };
+}
+function buildLiveTotals(row) {
+  const d = row?.data || {};
+  const totalSales = Number(d.total_sales ?? row.total_sales ?? 0);
+  const cashSales = Number(d.cash_sales ?? row.cash_sales ?? 0);
+  const mpesaSales = Number(d.mpesa_sales ?? row.mpesa_sales ?? 0);
+  const cardSales = Number(d.card_sales ?? row.card_sales ?? 0);
+  const bankSales = Number(d.bank_sales ?? row.bank_sales ?? 0);
+  const otherSales = Number(d.other_sales ?? row.other_sales ?? 0);
+  const refundTotal = Number(d.refund_total ?? row.refund_total ?? 0);
+  const cashRefunds = Number(d.cash_refunds ?? row.cash_refunds ?? 0);
+  const cashExpenses = Number(d.cash_expenses ?? row.cash_expenses ?? 0);
+  const openingFloat = Number(row.opening_float ?? 0);
+  const computedExpected = Math.round((openingFloat + cashSales - cashRefunds - cashExpenses) * 100) / 100;
+  const expectedCash2 = row.status === "OPEN" ? computedExpected : row.expected_cash !== null && row.expected_cash !== void 0 ? Number(row.expected_cash) : computedExpected;
+  return {
+    total_transactions: Number(d.total_transactions ?? row.total_transactions ?? 0),
+    total_sales: totalSales,
+    cash_sales: cashSales,
+    mpesa_sales: mpesaSales,
+    card_sales: cardSales,
+    bank_sales: bankSales,
+    other_sales: otherSales,
+    units_sold: Number(d.units_sold ?? row.units_sold ?? 0),
+    voided_count: Number(d.voided_count ?? row.voided_count ?? 0),
+    voided_total: Number(d.voided_total ?? row.voided_total ?? 0),
+    returns_count: Number(d.returns_count ?? row.returns_count ?? 0),
+    refund_total: refundTotal,
+    cash_refunds: cashRefunds,
+    cash_expenses: cashExpenses,
+    expected_cash: expectedCash2,
+    mixed_transactions: 0,
+    non_cash_refunds: Math.max(0, refundTotal - cashRefunds),
+    net_sales: totalSales
+  };
+}
+function formatOnlineShift(row) {
+  const d = row?.data || {};
+  const live = buildLiveTotals(row);
+  return {
+    id: row.shift_id || row.id,
+    shift_id: row.shift_id || row.id,
+    shop_id: row.shop_id,
+    shop_code: null,
+    shop_name: null,
+    shift_number: row.shift_number,
+    cashier_id: row.cashier_id,
+    cashier_name: row.cashier_name || "Cashier",
+    device_id: row.device_id || "ONLINE_POS",
+    status: row.status,
+    opened_at: row.opened_at ? new Date(row.opened_at).toISOString() : (/* @__PURE__ */ new Date()).toISOString(),
+    opened_business_date: row.opened_business_date ? new Date(row.opened_business_date).toISOString().slice(0, 10) : (/* @__PURE__ */ new Date()).toISOString().slice(0, 10),
+    opening_float: Number(row.opening_float || 0),
+    closed_at: row.closed_at ? new Date(row.closed_at).toISOString() : null,
+    closed_by_name: d.closed_by_name || null,
+    close_method: d.close_method || null,
+    admin_close_reason: d.admin_close_reason || null,
+    actual_cash: row.actual_cash !== null && row.actual_cash !== void 0 ? Number(row.actual_cash) : null,
+    cash_variance: row.cash_variance !== null && row.cash_variance !== void 0 ? Number(row.cash_variance) : null,
+    variance_status: row.cash_variance > 0 ? "OVER" : row.cash_variance < 0 ? "SHORT" : row.cash_variance === 0 ? "BALANCED" : null,
+    effective_actual_cash: row.actual_cash !== null && row.actual_cash !== void 0 ? Number(row.actual_cash) : null,
+    effective_variance: row.cash_variance !== null && row.cash_variance !== void 0 ? Number(row.cash_variance) : null,
+    corrected: false,
+    closing_notes: d.closing_notes || null,
+    reviewed_by_name: d.reviewed_by_name || null,
+    reviewed_at: row.reviewed_at ? new Date(row.reviewed_at).toISOString() : null,
+    review_notes: d.review_notes || null,
+    live: true,
+    ...live
+  };
+}
+async function openOnlineShift(client, shopId, input, user) {
+  const cashierId = user.local_user_id || user.id;
+  const openingFloat = Math.max(0, Math.round((Number(input?.opening_float) || 0) * 100) / 100);
+  await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`shift-open:${shopId}:${cashierId}`]);
+  const existing = (await client.query(
+    `SELECT shift_id AS id, status, opened_at, opened_business_date, opening_float, cashier_id,
+            cashier_name, shift_number, device_id, shop_id, expected_cash, actual_cash, cash_variance, data
+     FROM giga_cloud.cashier_shifts
+     WHERE shop_id = $1 AND (cashier_id = $2 OR cashier_id = $3) AND status = 'OPEN'
+     ORDER BY opened_at DESC
+     LIMIT 1`,
+    [shopId, cashierId, user.id]
+  )).rows[0];
+  if (existing) {
+    const formatted2 = formatOnlineShift(existing);
+    return {
+      created: false,
+      shift: formatted2,
+      live: buildLiveTotals(existing)
+    };
+  }
+  const shiftId = crypto4.randomUUID();
+  const dateStr = (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
+  const randomSuffix = Math.floor(1e4 + Math.random() * 9e4);
+  const shiftNumber = `SHIFT-${dateStr.replace(/-/g, "")}-${randomSuffix}`;
+  const initialData = {
+    total_transactions: 0,
+    total_sales: 0,
+    cash_sales: 0,
+    mpesa_sales: 0,
+    card_sales: 0,
+    bank_sales: 0,
+    other_sales: 0,
+    units_sold: 0,
+    voided_count: 0,
+    voided_total: 0,
+    returns_count: 0,
+    refund_total: 0,
+    cash_refunds: 0,
+    cash_expenses: 0,
+    close_method: null,
+    closing_notes: null
+  };
+  await client.query(
+    `INSERT INTO giga_cloud.cashier_shifts (
+       shop_id, shift_id, shift_number, cashier_id, cashier_name,
+       device_id, status, opened_at, opened_business_date, opening_float,
+       expected_cash, total_sales, source_seq, data, updated_at
+     ) VALUES (
+       $1, $2, $3, $4, $5,
+       'ONLINE_POS', 'OPEN', now(), CURRENT_DATE, $6,
+       $6, 0, 0, $7::jsonb, now()
+     )`,
+    [shopId, shiftId, shiftNumber, cashierId, user.name, openingFloat, JSON.stringify(initialData)]
+  );
+  await client.query(
+    `INSERT INTO giga_cloud.online_audit (shop_id, online_user_id, user_email, action, details, client_ip, user_agent)
+     VALUES ($1, $2, $3, 'SHIFT_OPENED', $4, 'ONLINE_POS', 'Online POS Terminal')`,
+    [shopId, user.id, user.email, JSON.stringify({ shift_id: shiftId, shift_number: shiftNumber, opening_float: openingFloat })]
+  ).catch(() => {
+  });
+  const newShiftRow = {
+    shift_id: shiftId,
+    shift_number: shiftNumber,
+    cashier_id: cashierId,
+    cashier_name: user.name,
+    device_id: "ONLINE_POS",
+    shop_id: shopId,
+    status: "OPEN",
+    opened_at: (/* @__PURE__ */ new Date()).toISOString(),
+    opened_business_date: dateStr,
+    opening_float: openingFloat,
+    expected_cash: openingFloat,
+    total_sales: 0,
+    data: initialData
+  };
+  const formatted = formatOnlineShift(newShiftRow);
+  return {
+    created: true,
+    shift: formatted,
+    live: buildLiveTotals(newShiftRow)
+  };
+}
+async function closeOnlineShift(client, shopId, shiftId, input, user) {
+  const cashierId = user.local_user_id || user.id;
+  const actualCash = Math.max(0, Math.round((Number(input?.actual_cash) || 0) * 100) / 100);
+  const notes = String(input?.closing_notes || "").trim();
+  const shift = (await client.query(
+    `SELECT * FROM giga_cloud.cashier_shifts WHERE shop_id = $1 AND shift_id = $2 FOR UPDATE`,
+    [shopId, shiftId]
+  )).rows[0];
+  if (!shift) throw new HttpError(404, "Shift not found.");
+  if (shift.status !== "OPEN") throw new HttpError(409, `This shift is already ${shift.status.toLowerCase()}; a closed shift cannot be reopened.`);
+  const own = shift.cashier_id === cashierId || shift.cashier_id === user.id;
+  if (!own && user.role !== "ADMIN") throw new HttpError(403, "You can only close your own shift.");
+  const d = shift.data || {};
+  const cashSales = Number(d.cash_sales || 0);
+  const cashRefunds = Number(d.cash_refunds || 0);
+  const cashExpenses = Number(d.cash_expenses || 0);
+  const openingFloat = Number(shift.opening_float || 0);
+  const expected = Math.round((openingFloat + cashSales - cashRefunds - cashExpenses) * 100) / 100;
+  const variance = Math.round((actualCash - expected) * 100) / 100;
+  const totalSales = Number(d.total_sales || shift.total_sales || 0);
+  const updatedData = {
+    ...d,
+    close_method: own ? "CASHIER" : "ADMIN",
+    closing_notes: notes || null,
+    closed_by_name: user.name,
+    admin_close_reason: own ? null : input?.admin_close_reason || null
+  };
+  await client.query(
+    `UPDATE giga_cloud.cashier_shifts
+     SET status = 'CLOSED',
+         closed_at = now(),
+         closed_business_date = CURRENT_DATE,
+         actual_cash = $3,
+         expected_cash = $4,
+         cash_variance = $5,
+         total_sales = $6,
+         data = $7::jsonb,
+         updated_at = now()
+     WHERE shop_id = $1 AND shift_id = $2`,
+    [shopId, shiftId, actualCash, expected, variance, totalSales, JSON.stringify(updatedData)]
+  );
+  await client.query(
+    `INSERT INTO giga_cloud.online_audit (shop_id, online_user_id, user_email, action, details, client_ip, user_agent)
+     VALUES ($1, $2, $3, 'SHIFT_CLOSED', $4, 'ONLINE_POS', 'Online POS Terminal')`,
+    [shopId, user.id, user.email, JSON.stringify({ shift_id: shiftId, actual_cash: actualCash, expected_cash: expected, variance })]
+  ).catch(() => {
+  });
+  const closedRow = {
+    ...shift,
+    status: "CLOSED",
+    closed_at: (/* @__PURE__ */ new Date()).toISOString(),
+    actual_cash: actualCash,
+    expected_cash: expected,
+    cash_variance: variance,
+    total_sales: totalSales,
+    data: updatedData
+  };
+  return {
+    success: true,
+    shift: formatOnlineShift(closedRow),
+    medicines: []
   };
 }
 
@@ -7675,6 +7894,114 @@ function buildOnlineRouter() {
       }
     });
   };
+  r.get("/shifts/open-tills", requirePermission("expenses.manage"), async (req, res) => {
+    try {
+      const shopId = requestShop(req);
+      const tills = await withCloud(async (client) => {
+        const rows = await client.query(
+          `SELECT shift_id AS id, shift_number, cashier_name, opened_at
+           FROM giga_cloud.cashier_shifts
+           WHERE shop_id = $1 AND status = 'OPEN'
+           ORDER BY opened_at ASC`,
+          [shopId]
+        );
+        return rows.rows;
+      });
+      res.json({ tills });
+    } catch (err) {
+      send(res, err, "GET /shifts/open-tills");
+    }
+  });
+  r.post("/shifts/open", requirePermission("shift.open"), async (req, res) => {
+    try {
+      const u = req.onlineUser;
+      const shopId = requestShop(req);
+      const result = await withCloud(async (client) => {
+        await client.query("BEGIN");
+        try {
+          const out = await openOnlineShift(client, shopId, req.body || {}, {
+            id: u.id,
+            name: u.name,
+            email: u.email,
+            role: u.role,
+            local_user_id: u.local_user_id,
+            shop_id: u.shop_id
+          });
+          await client.query("COMMIT");
+          return out;
+        } catch (err) {
+          await client.query("ROLLBACK").catch(() => {
+          });
+          throw err;
+        }
+      });
+      res.status(result.created ? 201 : 200).json(result);
+    } catch (err) {
+      send(res, err, "POST /shifts/open");
+    }
+  });
+  r.post("/shifts/:id/close", requirePermission("shift.close"), async (req, res) => {
+    try {
+      const u = req.onlineUser;
+      const shopId = requestShop(req);
+      const result = await withCloud(async (client) => {
+        await client.query("BEGIN");
+        try {
+          const out = await closeOnlineShift(client, shopId, req.params.id, req.body || {}, {
+            id: u.id,
+            name: u.name,
+            email: u.email,
+            role: u.role,
+            local_user_id: u.local_user_id,
+            shop_id: u.shop_id
+          });
+          await client.query("COMMIT");
+          return out;
+        } catch (err) {
+          await client.query("ROLLBACK").catch(() => {
+          });
+          throw err;
+        }
+      });
+      res.json(result);
+    } catch (err) {
+      send(res, err, "POST /shifts/:id/close");
+    }
+  });
+  r.post("/shifts/close", requirePermission("shift.close"), async (req, res) => {
+    try {
+      const u = req.onlineUser;
+      const shopId = requestShop(req);
+      const cashierId = u.local_user_id || u.id;
+      const result = await withCloud(async (client) => {
+        await client.query("BEGIN");
+        try {
+          const cur = (await client.query(
+            `SELECT shift_id FROM giga_cloud.cashier_shifts WHERE shop_id = $1 AND (cashier_id = $2 OR cashier_id = $3) AND status = 'OPEN' ORDER BY opened_at DESC LIMIT 1`,
+            [shopId, cashierId, u.id]
+          )).rows[0];
+          if (!cur) throw new HttpError(404, "No open shift found to close.");
+          const out = await closeOnlineShift(client, shopId, cur.shift_id, req.body || {}, {
+            id: u.id,
+            name: u.name,
+            email: u.email,
+            role: u.role,
+            local_user_id: u.local_user_id,
+            shop_id: u.shop_id
+          });
+          await client.query("COMMIT");
+          return out;
+        } catch (err) {
+          await client.query("ROLLBACK").catch(() => {
+          });
+          throw err;
+        }
+      });
+      res.json(result);
+    } catch (err) {
+      send(res, err, "POST /shifts/close");
+    }
+  });
   r.use(buildShiftRouter({
     canView: requirePermission("shift.view_own"),
     canViewAll: requirePermission("shift.view_all"),
@@ -7699,9 +8026,8 @@ function buildOnlineRouter() {
      */
     getCurrentShift: async (req) => {
       const u = req.onlineUser;
-      if (!u.local_user_id) return { shift: null };
       const shopId = requestShop(req);
-      const cashierId = String(u.local_user_id).toLowerCase();
+      const cashierId = u.local_user_id ? String(u.local_user_id).toLowerCase() : u.id;
       const cfg = getOnlineConfig();
       if (cfg.error) throw new HttpError(503, `Online API not configured: ${cfg.error}`);
       const client = await getPool(cfg).connect();
@@ -7709,55 +8035,18 @@ function buildOnlineRouter() {
         const row = (await client.query(
           `SELECT shift_id AS id, status, opened_at, opened_business_date, opening_float, cashier_id,
                   cashier_name, shift_number, device_id, shop_id,
-                  (data->>'total_transactions')::int      AS total_transactions,
-                  (data->>'total_sales')::numeric         AS total_sales,
-                  (data->>'cash_sales')::numeric          AS cash_sales,
-                  (data->>'mpesa_sales')::numeric         AS mpesa_sales,
-                  (data->>'card_sales')::numeric          AS card_sales,
-                  (data->>'bank_sales')::numeric          AS bank_sales,
-                  (data->>'other_sales')::numeric         AS other_sales,
-                  (data->>'units_sold')::int              AS units_sold,
-                  (data->>'voided_count')::int            AS voided_count,
-                  (data->>'voided_total')::numeric        AS voided_total,
-                  (data->>'returns_count')::int           AS returns_count,
-                  (data->>'refund_total')::numeric        AS refund_total,
-                  (data->>'cash_refunds')::numeric        AS cash_refunds,
-                  (data->>'cash_expenses')::numeric       AS cash_expenses,
                   expected_cash, actual_cash, cash_variance,
-                  closed_at, closed_business_date,
-                  data->>'close_method'       AS close_method,
-                  data->>'closing_notes'      AS closing_notes,
-                  data->>'reviewed_by_name'   AS reviewed_by_name,
-                  data->>'review_notes'       AS review_notes,
-                  reviewed_at
+                  closed_at, closed_business_date, data
              FROM giga_cloud.cashier_shifts
-            WHERE shop_id = $1 AND cashier_id = $2 AND status = 'OPEN'
+            WHERE shop_id = $1 AND (cashier_id = $2 OR cashier_id = $3) AND status = 'OPEN'
             ORDER BY opened_at DESC
             LIMIT 1`,
-          [shopId, cashierId]
+          [shopId, cashierId, u.id]
         )).rows[0];
         if (!row) return { shift: null };
-        const live = {
-          total_transactions: Number(row.total_transactions ?? 0),
-          total_sales: Number(row.total_sales ?? 0),
-          cash_sales: Number(row.cash_sales ?? 0),
-          mpesa_sales: Number(row.mpesa_sales ?? 0),
-          card_sales: Number(row.card_sales ?? 0),
-          bank_sales: Number(row.bank_sales ?? 0),
-          other_sales: Number(row.other_sales ?? 0),
-          units_sold: Number(row.units_sold ?? 0),
-          voided_count: Number(row.voided_count ?? 0),
-          voided_total: Number(row.voided_total ?? 0),
-          returns_count: Number(row.returns_count ?? 0),
-          refund_total: Number(row.refund_total ?? 0),
-          cash_refunds: Number(row.cash_refunds ?? 0),
-          cash_expenses: Number(row.cash_expenses ?? 0),
-          expected_cash: row.expected_cash !== null ? Number(row.expected_cash) : null,
-          mixed_transactions: 0,
-          non_cash_refunds: Number(row.refund_total ?? 0) - Number(row.cash_refunds ?? 0),
-          net_sales: Number(row.total_sales ?? 0)
-        };
-        return { shift: { ...row, live: true }, live };
+        const live = buildLiveTotals(row);
+        const formatted = formatOnlineShift(row);
+        return { shift: formatted, live };
       } finally {
         client.release();
       }

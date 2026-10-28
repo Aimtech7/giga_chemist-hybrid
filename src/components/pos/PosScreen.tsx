@@ -721,7 +721,7 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
               <span className="hidden md:inline font-semibold">Scanner Ready</span>
             </div>
 
-            {shiftStatus === 'NO_SHIFT' && !isOnline && (
+            {shiftStatus === 'NO_SHIFT' && (
               <button
                 type="button"
                 onClick={focusOrOpenShift}
@@ -905,7 +905,7 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
           </div>
 
           <div className="flex items-center gap-2">
-            {shiftStatus === 'NO_SHIFT' && !isOnline && (
+            {shiftStatus === 'NO_SHIFT' && (
               <button
                 type="button"
                 onClick={focusOrOpenShift}
@@ -1140,12 +1140,12 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
               <div className="flex items-center gap-1.5">
                 <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
                 <span className="font-semibold text-[11px]">
-                  {shiftStatus === 'NO_SHIFT' && (isOnline ? 'Shift not open — open shift from local Shop POS terminal.' : 'Shift not open — open shift to enable sales.')}
+                  {shiftStatus === 'NO_SHIFT' && 'Shift not open — open shift to enable sales.'}
                   {shiftStatus === 'ERROR' && (shiftErrorReason || 'Shift status unavailable.')}
                   {shiftStatus === 'LOADING' && 'Checking shift status...'}
                 </span>
               </div>
-              {shiftStatus === 'NO_SHIFT' && !isOnline && (
+              {shiftStatus === 'NO_SHIFT' && (
                 <button
                   type="button"
                   onClick={focusOrOpenShift}
@@ -1182,8 +1182,8 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
                   setIsPaymentOpen(true);
                 } else if (shiftLocked) {
                   if (shiftStatus === 'NO_SHIFT') {
-                    setWarningMessage(isOnline ? 'No open shift is reported. Open shift from local Shop POS terminal.' : 'You must open a shift before completing sales.');
-                    if (!isOnline) focusOrOpenShift();
+                    setWarningMessage('You must open a shift before completing sales.');
+                    focusOrOpenShift();
                   } else if (shiftStatus === 'ERROR') {
                     setWarningMessage(`Cannot complete sale: ${shiftErrorReason || 'Shift status unavailable'}`);
                   }

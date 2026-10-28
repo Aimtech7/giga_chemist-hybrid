@@ -23,7 +23,7 @@ import { buildHistoryRouter } from '../http/historyRoutes';
 import { buildInventoryRouter } from '../http/inventoryRoutes';
 import { businessDaySummary } from '../db/businessDay';
 import { buildShiftRouter } from '../http/shiftRoutes';
-import { executeOnlineSaleCheckout, getOnlineSales } from './sales';
+import { executeOnlineSaleCheckout, getOnlineSales, openOnlineShift, closeOnlineShift, buildLiveTotals, formatOnlineShift } from './sales';
 import type { HistoryScope } from '../db/history';
 import type { UserRole } from '../../src/types';
 
@@ -602,6 +602,116 @@ export function buildOnlineRouter() {
     });
   };
 
+  // --- Online Cashier Shift Operations (Open, Close, Open Tills) ---
+  r.get('/shifts/open-tills', requirePermission('expenses.manage'), async (req: OnlineRequest, res: Response) => {
+    try {
+      const shopId = requestShop(req);
+      const tills = await withCloud(async (client) => {
+        const rows = await client.query(
+          `SELECT shift_id AS id, shift_number, cashier_name, opened_at
+           FROM giga_cloud.cashier_shifts
+           WHERE shop_id = $1 AND status = 'OPEN'
+           ORDER BY opened_at ASC`,
+          [shopId]
+        );
+        return rows.rows;
+      });
+      res.json({ tills });
+    } catch (err: any) {
+      send(res, err, 'GET /shifts/open-tills');
+    }
+  });
+
+  r.post('/shifts/open', requirePermission('shift.open'), async (req: OnlineRequest, res: Response) => {
+    try {
+      const u = req.onlineUser!;
+      const shopId = requestShop(req);
+      const result = await withCloud(async (client) => {
+        await client.query('BEGIN');
+        try {
+          const out = await openOnlineShift(client, shopId, req.body || {}, {
+            id: u.id,
+            name: u.name,
+            email: u.email,
+            role: u.role,
+            local_user_id: u.local_user_id,
+            shop_id: u.shop_id,
+          });
+          await client.query('COMMIT');
+          return out;
+        } catch (err) {
+          await client.query('ROLLBACK').catch(() => {});
+          throw err;
+        }
+      });
+      res.status(result.created ? 201 : 200).json(result);
+    } catch (err: any) {
+      send(res, err, 'POST /shifts/open');
+    }
+  });
+
+  r.post('/shifts/:id/close', requirePermission('shift.close'), async (req: OnlineRequest, res: Response) => {
+    try {
+      const u = req.onlineUser!;
+      const shopId = requestShop(req);
+      const result = await withCloud(async (client) => {
+        await client.query('BEGIN');
+        try {
+          const out = await closeOnlineShift(client, shopId, req.params.id, req.body || {}, {
+            id: u.id,
+            name: u.name,
+            email: u.email,
+            role: u.role,
+            local_user_id: u.local_user_id,
+            shop_id: u.shop_id,
+          });
+          await client.query('COMMIT');
+          return out;
+        } catch (err) {
+          await client.query('ROLLBACK').catch(() => {});
+          throw err;
+        }
+      });
+      res.json(result);
+    } catch (err: any) {
+      send(res, err, 'POST /shifts/:id/close');
+    }
+  });
+
+  r.post('/shifts/close', requirePermission('shift.close'), async (req: OnlineRequest, res: Response) => {
+    try {
+      const u = req.onlineUser!;
+      const shopId = requestShop(req);
+      const cashierId = u.local_user_id || u.id;
+      const result = await withCloud(async (client) => {
+        await client.query('BEGIN');
+        try {
+          const cur = (await client.query(
+            `SELECT shift_id FROM giga_cloud.cashier_shifts WHERE shop_id = $1 AND (cashier_id = $2 OR cashier_id = $3) AND status = 'OPEN' ORDER BY opened_at DESC LIMIT 1`,
+            [shopId, cashierId, u.id]
+          )).rows[0];
+          if (!cur) throw new HttpError(404, 'No open shift found to close.');
+          const out = await closeOnlineShift(client, shopId, cur.shift_id, req.body || {}, {
+            id: u.id,
+            name: u.name,
+            email: u.email,
+            role: u.role,
+            local_user_id: u.local_user_id,
+            shop_id: u.shop_id,
+          });
+          await client.query('COMMIT');
+          return out;
+        } catch (err) {
+          await client.query('ROLLBACK').catch(() => {});
+          throw err;
+        }
+      });
+      res.json(result);
+    } catch (err: any) {
+      send(res, err, 'POST /shifts/close');
+    }
+  });
+
   // Cashier shifts (cloud copy, read only). A shop CASHIER account sees only the shifts of its own shop
   // staff account (local_user_id); Administrators / Managers every shift of their authorized shop(s).
   // Reviewing a shift online = the SHIFT_REVIEW command (Remote administration), applied by the shop.
@@ -633,69 +743,27 @@ export function buildOnlineRouter() {
      */
     getCurrentShift: async (req) => {
       const u = (req as OnlineRequest).onlineUser!;
-      // Administrators / Managers see the full shift list; /current is meaningful only for a cashier.
-      if (!u.local_user_id) return { shift: null };
       const shopId = requestShop(req);
-      const cashierId = String(u.local_user_id).toLowerCase();
+      const cashierId = u.local_user_id ? String(u.local_user_id).toLowerCase() : u.id;
       const cfg = getOnlineConfig();
       if (cfg.error) throw new HttpError(503, `Online API not configured: ${cfg.error}`);
       const client = await getPool(cfg).connect();
       try {
-        // Query giga_cloud.cashier_shifts directly (the authoritative cloud mirror).
         const row = (await client.query(
           `SELECT shift_id AS id, status, opened_at, opened_business_date, opening_float, cashier_id,
                   cashier_name, shift_number, device_id, shop_id,
-                  (data->>'total_transactions')::int      AS total_transactions,
-                  (data->>'total_sales')::numeric         AS total_sales,
-                  (data->>'cash_sales')::numeric          AS cash_sales,
-                  (data->>'mpesa_sales')::numeric         AS mpesa_sales,
-                  (data->>'card_sales')::numeric          AS card_sales,
-                  (data->>'bank_sales')::numeric          AS bank_sales,
-                  (data->>'other_sales')::numeric         AS other_sales,
-                  (data->>'units_sold')::int              AS units_sold,
-                  (data->>'voided_count')::int            AS voided_count,
-                  (data->>'voided_total')::numeric        AS voided_total,
-                  (data->>'returns_count')::int           AS returns_count,
-                  (data->>'refund_total')::numeric        AS refund_total,
-                  (data->>'cash_refunds')::numeric        AS cash_refunds,
-                  (data->>'cash_expenses')::numeric       AS cash_expenses,
                   expected_cash, actual_cash, cash_variance,
-                  closed_at, closed_business_date,
-                  data->>'close_method'       AS close_method,
-                  data->>'closing_notes'      AS closing_notes,
-                  data->>'reviewed_by_name'   AS reviewed_by_name,
-                  data->>'review_notes'       AS review_notes,
-                  reviewed_at
+                  closed_at, closed_business_date, data
              FROM giga_cloud.cashier_shifts
-            WHERE shop_id = $1 AND cashier_id = $2 AND status = 'OPEN'
+            WHERE shop_id = $1 AND (cashier_id = $2 OR cashier_id = $3) AND status = 'OPEN'
             ORDER BY opened_at DESC
             LIMIT 1`,
-          [shopId, cashierId]
+          [shopId, cashierId, u.id]
         )).rows[0];
         if (!row) return { shift: null };
-        // Build live totals from the stored cloud columns (accumulated as SHIFT_OPENED/SHIFT_CLOSED
-        // events are ingested; for an OPEN shift these reflect what has synced so far).
-        const live = {
-          total_transactions: Number(row.total_transactions ?? 0),
-          total_sales:        Number(row.total_sales ?? 0),
-          cash_sales:         Number(row.cash_sales ?? 0),
-          mpesa_sales:        Number(row.mpesa_sales ?? 0),
-          card_sales:         Number(row.card_sales ?? 0),
-          bank_sales:         Number(row.bank_sales ?? 0),
-          other_sales:        Number(row.other_sales ?? 0),
-          units_sold:         Number(row.units_sold ?? 0),
-          voided_count:       Number(row.voided_count ?? 0),
-          voided_total:       Number(row.voided_total ?? 0),
-          returns_count:      Number(row.returns_count ?? 0),
-          refund_total:       Number(row.refund_total ?? 0),
-          cash_refunds:       Number(row.cash_refunds ?? 0),
-          cash_expenses:      Number(row.cash_expenses ?? 0),
-          expected_cash:      row.expected_cash !== null ? Number(row.expected_cash) : null,
-          mixed_transactions: 0,
-          non_cash_refunds:   Number(row.refund_total ?? 0) - Number(row.cash_refunds ?? 0),
-          net_sales:          Number(row.total_sales ?? 0),
-        };
-        return { shift: { ...row, live: true }, live };
+        const live = buildLiveTotals(row);
+        const formatted = formatOnlineShift(row);
+        return { shift: formatted, live };
       } finally {
         client.release();
       }
