@@ -563,7 +563,7 @@ export const SyncCenter: React.FC<{ online: boolean }> = ({ online }) => {
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
               <div className="bg-slate-50 p-2.5 rounded-lg border border-slate-200">
                 <div className="text-[10px] uppercase text-slate-500 font-bold">Shop</div>
-                <div className="text-sm font-bold text-slate-800">{authSync?.shop_code || (online ? (data?.shops?.[0]?.shop_code || 'SHOP1') : (data?.status?.shop_code || 'SHOP1'))}</div>
+                <div className="text-sm font-bold text-slate-800">{authSync?.shop_code || (online ? (data?.shops?.[0]?.shop_code || '—') : (data?.status?.shop_code || '—'))}</div>
                 <div className="text-[10px] text-slate-400 truncate">{authSync?.shop_name || 'Authoritative Node'}</div>
               </div>
 

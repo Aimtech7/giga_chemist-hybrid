@@ -52,7 +52,7 @@ export async function loginWithPinOrEmail(identifier: string, secret: string): P
     if (!data?.token || !data.user) throw new Error('The server returned an incomplete login response.');
 
     setAuthToken(data.token);
-    setCachedUser(data.user);
+    setCachedUser({ ...data.user, shop_id: data.account?.shop_id, local_user_id: data.account?.local_user_id } as any);
     setOnlineAccount(data.account ?? null);
     // A cache filled for another shop (other account on this browser) is emptied BEFORE any screen renders.
     await purgeIfShopChanged().catch((e) => console.warn('[Auth] Cache shop check failed:', e));
@@ -82,7 +82,7 @@ export async function verifySession(): Promise<User | null> {
   }
   try {
     const data = await apiFetch<{ user: User; account?: OnlineAccount }>('/api/auth/me');
-    const merged = { ...(getCachedUser() || {}), ...data.user } as User;
+    const merged = { ...(getCachedUser() || {}), ...data.user, shop_id: data.account?.shop_id ?? (getCachedUser() as any)?.shop_id, local_user_id: data.account?.local_user_id ?? (getCachedUser() as any)?.local_user_id } as any;
     setCachedUser(merged);
     setOnlineAccount(data.account ?? null);
     // A cache filled for another shop (other account on this browser) is emptied BEFORE any screen renders.

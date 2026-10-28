@@ -6,6 +6,7 @@ import {
   type LiveTotals, type Shift, type ShiftMedicine, type ShiftStatusState,
 } from '../../services/shifts';
 import { navigateTo } from '../../services/navigation';
+import { getServerMode } from '../../services/remoteAdmin';
 import { hasPermission } from '../../services/permissions';
 import type { PharmacySettings, User as UserType } from '../../types';
 
@@ -19,6 +20,7 @@ export interface ShiftBarProps {
   onRetry?: () => void | Promise<void>;
   onChanged: () => void | Promise<void>;
   openShiftInputRef?: React.RefObject<HTMLInputElement | null>;
+  online?: boolean;
 }
 
 /**
@@ -35,7 +37,15 @@ export const ShiftBar: React.FC<ShiftBarProps> = ({
   onRetry,
   onChanged,
   openShiftInputRef,
+  online,
 }) => {
+  const [serverOnline, setServerOnline] = useState<boolean>(false);
+  useEffect(() => {
+    if (online === undefined) {
+      void getServerMode().then((m) => setServerOnline(m === 'online'));
+    }
+  }, [online]);
+  const isOnlineMode = online ?? serverOnline;
   const cur = settings.currency || 'KES';
   const money = (n: number | null | undefined) => fmtMoney(cur, n);
   const [float, setFloat] = useState('0');
@@ -108,6 +118,31 @@ export const ShiftBar: React.FC<ShiftBarProps> = ({
 
   // 3. NO SHIFT STATE
   if (status === 'NO_SHIFT' || !shift) {
+    if (isOnlineMode) {
+      return (
+        <>
+          {dialog}
+          <div className="mx-3 mt-2 rounded-lg border-2 border-amber-300 bg-amber-50 p-3.5 text-xs text-amber-950 shadow-xs flex items-center gap-3">
+            <div className="w-9 h-9 rounded-full bg-amber-200 border border-amber-300 flex items-center justify-center shrink-0">
+              <Lock className="w-5 h-5 text-amber-800" />
+            </div>
+            <div>
+              <div className="text-sm font-black tracking-wide text-amber-950 flex items-center gap-2">
+                <span>SHIFT NOT OPEN</span>
+                <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-200 text-amber-900 uppercase">Cloud Copy · Read-Only</span>
+              </div>
+              <div className="text-xs text-amber-900 font-medium mt-1">
+                No open shift is currently reported by the shop.
+              </div>
+              <div className="text-[11px] text-amber-800 mt-0.5">
+                Open your shift from the local Shop POS terminal. The online system will display it after synchronization.
+              </div>
+            </div>
+          </div>
+        </>
+      );
+    }
+
     const canOpen = currentUser ? hasPermission(currentUser, 'shift.open') : true;
 
     if (!canOpen) {
@@ -218,7 +253,9 @@ export const ShiftBar: React.FC<ShiftBarProps> = ({
         {!!t?.bank_sales && <span>Bank: <b>{money(t.bank_sales)}</b></span>}
         <div className="ml-auto flex gap-1.5">
           <button onClick={() => navigateTo('history', 'shifts', { shift_id: shift.id })} className="px-2.5 py-1 rounded border border-emerald-400 bg-white hover:bg-emerald-50 text-emerald-800 font-semibold transition cursor-pointer">Shift Details</button>
-          <button onClick={() => setClosing({ shift, live })} className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-900 text-white font-bold transition cursor-pointer">Close Shift</button>
+          {!isOnlineMode && (
+            <button onClick={() => setClosing({ shift, live })} className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-900 text-white font-bold transition cursor-pointer">Close Shift</button>
+          )}
         </div>
       </div>
       {dialog}

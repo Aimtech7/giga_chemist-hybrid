@@ -88,7 +88,7 @@ export const DeleteMedicineModal: React.FC<DeleteMedicineModalProps> = ({
 
     try {
       if (isRemote && shopId) {
-        setLoadingStage('Requesting authoritative preflight from Shop 1 PostgreSQL...');
+        setLoadingStage('Requesting authoritative preflight from shop server...');
         const preflightUrl = `/api/admin/medicines/${medicine.id}/delete-preflight?shop_id=${shopId}`;
         const previewUrl = `/api/admin/medicines/${medicine.id}/delete-preview?shop_id=${shopId}`;
         const resp = await apiFetch<any>(preflightUrl || previewUrl, {
@@ -119,14 +119,14 @@ export const DeleteMedicineModal: React.FC<DeleteMedicineModalProps> = ({
             } else if (cmd.status === 'REJECTED') {
               cleanupPolling();
               setLoading(false);
-              setError(cmd.error || 'Shop 1 rejected delete preflight.');
+              setError(cmd.error || 'Shop server rejected delete preflight.');
             } else if (cmd.status === 'DELIVERED') {
-              setLoadingStage('Shop 1 computing authoritative inventory & references...');
+              setLoadingStage('Shop server computing authoritative inventory & references...');
             } else if (attempts >= maxAttempts) {
               cleanupPolling();
               setLoading(false);
               setIsShopOffline(true);
-              setError('WAITING FOR SHOP 1: Shop 1 has not picked up preflight request yet.');
+              setError('WAITING FOR SHOP: Shop server has not picked up preflight request yet.');
             }
           } catch (pollErr: any) {
             cleanupPolling();
@@ -227,7 +227,7 @@ export const DeleteMedicineModal: React.FC<DeleteMedicineModalProps> = ({
               setRemoteStep('APPLIED');
               const res = {
                 action: (cmd.result?.action || (isPermanent ? 'DELETED' : 'ARCHIVED')) as 'DELETED' | 'ARCHIVED',
-                reason: cmd.result?.reason || 'Authoritative deletion completed on Shop 1.',
+                reason: cmd.result?.reason || 'Authoritative deletion completed on shop server.',
               };
               setCompletionResult(res);
               // Notify parent
@@ -243,9 +243,9 @@ export const DeleteMedicineModal: React.FC<DeleteMedicineModalProps> = ({
                 errText.includes('Medicine version conflict')
               ) {
                 setIsStalePreflight(true);
-                setError('SHOP DATA CHANGED: Shop 1 state changed after preflight was issued. Refresh preview before trying again.');
+                setError('SHOP DATA CHANGED: Shop state changed after preflight was issued. Refresh preview before trying again.');
               } else {
-                setError(cmd.error || 'Command rejected by Shop 1.');
+                setError(cmd.error || 'Command rejected by shop server.');
               }
             } else if (pollCount > 25 && !cmd.shop_online) {
               setIsShopOffline(true);
@@ -382,7 +382,7 @@ export const DeleteMedicineModal: React.FC<DeleteMedicineModalProps> = ({
                   {isShopOffline && remoteStep === 'PENDING' && (
                     <div className="p-2 bg-amber-950/80 border border-amber-600/50 rounded text-amber-200 text-[11px] mt-2 flex items-center gap-2">
                       <Clock className="w-4 h-4 text-amber-400 shrink-0" />
-                      <span>WAITING FOR SHOP 1: Shop 1 is offline or reconnecting. Command remains queued in Sync Center.</span>
+                      <span>WAITING FOR SHOP: Shop server is offline or reconnecting. Command remains queued in Sync Center.</span>
                     </div>
                   )}
                 </div>
@@ -516,7 +516,7 @@ export const DeleteMedicineModal: React.FC<DeleteMedicineModalProps> = ({
                   </div>
                   <p className="text-xs leading-relaxed">
                     {isPermanent
-                      ? 'This medicine has ZERO historical references and ZERO stock. It will be permanently removed inside an atomic transaction on Shop 1.'
+                      ? 'This medicine has ZERO historical references and ZERO stock. It will be permanently removed inside an atomic transaction on the shop server.'
                       : 'This medicine has historical business records and cannot be permanently erased without corrupting financial audits. It will be deactivated and safely archived.'}
                   </p>
                 </div>

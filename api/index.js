@@ -4,7 +4,7 @@
 import express8 from "express";
 
 // server/online/app.ts
-import crypto4 from "crypto";
+import crypto5 from "crypto";
 import fs from "fs";
 import path from "path";
 import express7 from "express";
@@ -588,7 +588,9 @@ function toMedicine(r) {
   };
 }
 async function getAllMedicines(q = pgPool) {
-  const res = await q.query(`${MEDICINE_SELECT} ORDER BY m.name ASC`);
+  const res = await q.query(
+    `${MEDICINE_SELECT} WHERE COALESCE(m.status, 'active') <> 'archived' ORDER BY m.name ASC`
+  );
   return res.rows.map(toMedicine);
 }
 async function getMedicineById(id, q = pgPool) {
@@ -1131,189 +1133,6 @@ async function shiftsCsv(scope, query, viewer) {
 // server/db/sales.ts
 var toCents2 = (n) => Math.round(Number(n) * 100);
 var fromCents2 = (c) => c / 100;
-var PAYMENT_METHODS = ["Cash", "M-Pesa", "Card", "Bank", "Mixed"];
-var PRICE_MODES = ["RETAIL", "WHOLESALE"];
-function requirePriceMode(value, field) {
-  if (value === void 0 || value === null || value === "") return "RETAIL";
-  if (!PRICE_MODES.includes(value)) throw new HttpError(400, `${field} must be RETAIL or WHOLESALE.`);
-  return value;
-}
-var SALE_COLUMNS = `
-  s.id, s.branch_id, s.sale_number, s.receipt_number,
-  s.cashier_id, COALESCE(sale_cashier_name(s.id, s.cashier_id, s.created_at), u.name) AS cashier_name,
-  s.customer_id, c.name AS customer_name, c.phone AS customer_phone,
-  s.device_id, s.date, s.time,
-  COALESCE(s.subtotal, 0)::float AS subtotal,
-  COALESCE(s.discount_percent, 0)::float AS discount_percent,
-  COALESCE(s.discount_total, 0)::float AS discount_total,
-  COALESCE(s.tax_total, 0)::float AS tax_total,
-  COALESCE(s.total, 0)::float AS total,
-  COALESCE(s.cost_total, 0)::float AS cost_total,
-  COALESCE(s.gross_profit, 0)::float AS gross_profit,
-  s.payment_method, s.payment_reference,
-  COALESCE(s.amount_received, 0)::float AS amount_received,
-  COALESCE(s.change_given, 0)::float AS change_given,
-  s.status, s.void_reason, s.voided_by, s.idempotency_key, s.price_mode, s.created_at`;
-async function hydrateSales(q, rows) {
-  if (rows.length === 0) return [];
-  const ids = rows.map((r) => r.id);
-  const items = await q.query(
-    `SELECT si.id, si.sale_id, si.medicine_id, m.name AS medicine_name, m.generic_name,
-            si.batch_id, si.batch_number, si.expiry_date,
-            si.quantity::int AS quantity, si.unit_price::float AS unit_price, COALESCE(si.discount, 0)::float AS discount,
-            si.cost_price_snapshot::float AS cost_price_snapshot, si.total::float AS total, si.price_mode
-     FROM sale_items si LEFT JOIN medicines m ON si.medicine_id = m.id
-     WHERE si.sale_id = ANY($1::uuid[])
-     ORDER BY si.created_at, si.id`,
-    [ids]
-  );
-  const payments = await q.query(
-    `SELECT sale_id, method, amount::float AS amount, reference FROM payments
-     WHERE sale_id = ANY($1::uuid[]) ORDER BY created_at, id`,
-    [ids]
-  );
-  const returned = await q.query(
-    `SELECT sale_id, medicine_id, batch_id,
-            COALESCE(SUM(approved_quantity) FILTER (WHERE status = 'APPROVED'), 0)::int AS qty,
-            COALESCE(SUM(quantity) FILTER (WHERE status = 'PENDING'), 0)::int AS pending,
-            COALESCE(SUM(refund_amount) FILTER (WHERE status = 'APPROVED'), 0)::float AS refunded
-     FROM returns WHERE sale_id = ANY($1::uuid[]) GROUP BY sale_id, medicine_id, batch_id`,
-    [ids]
-  );
-  const itemsBySale = /* @__PURE__ */ new Map();
-  for (const it of items.rows) {
-    const list = itemsBySale.get(it.sale_id) || [];
-    list.push({
-      id: it.id,
-      medicine_id: it.medicine_id,
-      medicine_name: it.medicine_name || "Pharmaceutical Item",
-      generic_name: it.generic_name || "",
-      batch_id: it.batch_id,
-      batch_number: it.batch_number,
-      expiry_date: it.expiry_date || "",
-      quantity: Number(it.quantity) || 0,
-      unit_price: Number(it.unit_price) || 0,
-      discount: Number(it.discount) || 0,
-      cost_price_snapshot: Number(it.cost_price_snapshot) || 0,
-      total: Number(it.total) || 0,
-      price_mode: it.price_mode || null
-    });
-    itemsBySale.set(it.sale_id, list);
-  }
-  const paymentsBySale = /* @__PURE__ */ new Map();
-  for (const p of payments.rows) {
-    const list = paymentsBySale.get(p.sale_id) || [];
-    list.push({ method: p.method, amount: Number(p.amount) || 0, reference: p.reference || void 0 });
-    paymentsBySale.set(p.sale_id, list);
-  }
-  const returnedBySale = /* @__PURE__ */ new Map();
-  for (const r of returned.rows) {
-    const list = returnedBySale.get(r.sale_id) || [];
-    list.push({ medicine_id: r.medicine_id, batch_id: r.batch_id, quantity: Number(r.qty) || 0, pending: Number(r.pending) || 0, refunded: Number(r.refunded) || 0 });
-    returnedBySale.set(r.sale_id, list);
-  }
-  return rows.map((r) => {
-    const pays = paymentsBySale.get(r.id) || [];
-    return {
-      id: r.id,
-      branch_id: r.branch_id || void 0,
-      sale_number: r.sale_number,
-      receipt_number: r.receipt_number,
-      date: r.date || "",
-      time: r.time || "",
-      timestamp: r.created_at ? new Date(r.created_at).getTime() : Date.now(),
-      cashier_id: r.cashier_id,
-      cashier_name: r.cashier_name || "Cashier",
-      customer_id: r.customer_id || void 0,
-      customer_name: r.customer_name || "Walk-in",
-      customer_phone: r.customer_phone || void 0,
-      device_id: r.device_id,
-      items: itemsBySale.get(r.id) || [],
-      price_mode: r.price_mode || null,
-      subtotal: Number(r.subtotal) || 0,
-      discount_percent: Number(r.discount_percent) || 0,
-      discount_total: Number(r.discount_total) || 0,
-      tax_total: Number(r.tax_total) || 0,
-      total: Number(r.total) || 0,
-      cost_total: Number(r.cost_total) || 0,
-      gross_profit: Number(r.gross_profit) || 0,
-      payment_method: r.payment_method || "Cash",
-      payment_reference: r.payment_reference || void 0,
-      amount_received: Number(r.amount_received) || 0,
-      change_given: Number(r.change_given) || 0,
-      split_payments: r.payment_method === "Mixed" ? pays : void 0,
-      status: r.status || "completed",
-      void_reason: r.void_reason || void 0,
-      voided_by: r.voided_by || void 0,
-      sync_status: "synced",
-      retry_count: 0,
-      idempotency_key: r.idempotency_key,
-      returned_items: returnedBySale.get(r.id) || []
-    };
-  });
-}
-var SALE_STATUSES = ["completed", "partially_returned", "returned", "voided"];
-var DATE_RE3 = /^\d{4}-\d{2}-\d{2}$/;
-async function getAllSales(params, q = pgPool) {
-  const page = Math.max(1, Number(params?.page) || 1);
-  const limit = Math.min(500, Math.max(1, Number(params?.limit) || 50));
-  const offset = (page - 1) * limit;
-  const conditions = [];
-  const values = [];
-  if (params?.search?.trim()) {
-    values.push(`%${params.search.trim()}%`);
-    conditions.push(`(s.receipt_number ILIKE $${values.length} OR s.sale_number ILIKE $${values.length} OR s.payment_reference ILIKE $${values.length} OR c.name ILIKE $${values.length})`);
-  }
-  if (params?.startDate) {
-    if (!DATE_RE3.test(params.startDate)) throw new HttpError(400, "startDate must be YYYY-MM-DD.");
-    values.push(params.startDate);
-    conditions.push(`s.date >= $${values.length}`);
-  }
-  if (params?.endDate) {
-    if (!DATE_RE3.test(params.endDate)) throw new HttpError(400, "endDate must be YYYY-MM-DD.");
-    values.push(params.endDate);
-    conditions.push(`s.date <= $${values.length}`);
-  }
-  if (params?.cashierId) {
-    values.push(requireUuid(params.cashierId, "cashierId"));
-    conditions.push(`s.cashier_id = $${values.length}`);
-  }
-  if (params?.paymentMethod) {
-    if (!PAYMENT_METHODS.includes(params.paymentMethod)) throw new HttpError(400, `paymentMethod must be one of ${PAYMENT_METHODS.join(", ")}.`);
-    values.push(params.paymentMethod);
-    conditions.push(`(s.payment_method = $${values.length} OR EXISTS (SELECT 1 FROM payments px WHERE px.sale_id = s.id AND px.method = $${values.length}))`);
-  }
-  if (params?.customerId) {
-    values.push(requireUuid(params.customerId, "customerId"));
-    conditions.push(`s.customer_id = $${values.length}`);
-  }
-  if (params?.priceMode) {
-    const mode = requirePriceMode(params.priceMode, "priceMode");
-    values.push(mode);
-    conditions.push(`COALESCE(s.price_mode, 'RETAIL') = $${values.length}`);
-  }
-  if (params?.status) {
-    if (params.status === "not_voided") conditions.push(`s.status <> 'voided'`);
-    else {
-      if (!SALE_STATUSES.includes(params.status)) throw new HttpError(400, `status must be one of ${SALE_STATUSES.join(", ")}, not_voided.`);
-      values.push(params.status);
-      conditions.push(`s.status = $${values.length}`);
-    }
-  }
-  const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
-  const from = `FROM sales s LEFT JOIN users u ON s.cashier_id = u.id LEFT JOIN customers c ON s.customer_id = c.id`;
-  const count = await q.query(`SELECT COUNT(*)::int AS n ${from} ${where}`, values);
-  const rows = await q.query(
-    `SELECT ${SALE_COLUMNS} ${from} ${where} ORDER BY s.created_at DESC, s.id DESC LIMIT $${values.length + 1} OFFSET $${values.length + 2}`,
-    [...values, limit, offset]
-  );
-  const sales = await hydrateSales(q, rows.rows);
-  if (params?.page || params?.limit) {
-    const total = count.rows[0].n;
-    return { sales, total, page, limit, totalPages: Math.ceil(total / limit) || 1 };
-  }
-  return sales;
-}
 async function getTodaySalesSummary(options, q = pgPool) {
   const cashierId = options.cashierId ? requireUuid(options.cashierId, "cashierId") : null;
   const { date: today2 } = await businessNow(q);
@@ -1407,7 +1226,12 @@ function toBatch(r) {
   };
 }
 async function getAllBatches(q = pgPool) {
-  const res = await q.query(`${BATCH_SELECT} ORDER BY b.expiry_date ASC NULLS LAST, b.created_at ASC`);
+  const res = await q.query(
+    `${BATCH_SELECT}
+     WHERE COALESCE(b.status, 'active') <> 'archived'
+       AND COALESCE(m.status, 'active') <> 'archived'
+     ORDER BY b.expiry_date ASC NULLS LAST, b.created_at ASC`
+  );
   return res.rows.map(toBatch);
 }
 
@@ -3614,17 +3438,56 @@ function buildRemoteAdminRouter(deps) {
     const rt = await runtimeRow(deps, shopId);
     const st = rt?.status || {};
     const mismatches = Array.isArray(st.inventory?.mismatches) ? st.inventory.mismatches : [];
-    const conflicts = await deps.withShopId(shopId, async (c) => {
+    if (mismatches.length === 0) {
+      return {
+        shop_id: shopId,
+        healthy: true,
+        stock_mismatch_count: 0,
+        last_checked: st.inventory?.stock_parity_checked_at || rt?.reported_at || null,
+        conflicts: []
+      };
+    }
+    const conflicts = await deps.withCloud(async (c) => {
       const cloudMeds = (await c.query(`
-        SELECT id, name, current_stock, stock_version, stock_fingerprint, updated_at
-          FROM medicines
-         WHERE status <> 'archived'
-      `)).rows;
+        SELECT
+          m.medicine_id AS id,
+          m.name,
+          COALESCE((
+            SELECT SUM(
+              CASE
+                WHEN s.has_baseline THEN s.baseline_quantity + s.delta_since_baseline
+                ELSE s.last_reported_quantity
+              END
+            )
+            FROM giga_cloud.stock_levels s
+            WHERE s.shop_id = m.shop_id AND s.medicine_id = m.medicine_id
+          ), 0)::int AS current_stock,
+          COALESCE(m.stock_version, 1)::bigint AS stock_version,
+          m.stock_fingerprint,
+          m.updated_at
+        FROM giga_cloud.medicines m
+        WHERE m.shop_id = $1 AND m.status <> 'archived'
+      `, [shopId])).rows;
       const cloudBatches = (await c.query(`
-        SELECT id, medicine_id, batch_number, quantity_available, stock_version, expiry_date, updated_at
-          FROM medicine_batches
-         WHERE status <> 'archived'
-      `)).rows;
+        SELECT
+          b.batch_id AS id,
+          b.medicine_id,
+          b.batch_number,
+          COALESCE(
+            CASE
+              WHEN s.has_baseline THEN s.baseline_quantity + s.delta_since_baseline
+              ELSE s.last_reported_quantity
+            END,
+            0
+          )::int AS quantity_available,
+          COALESCE(s.stock_version, 1)::bigint AS stock_version,
+          b.expiry_date,
+          b.updated_at
+        FROM giga_cloud.medicine_batches b
+        LEFT JOIN giga_cloud.stock_levels s
+          ON s.shop_id = b.shop_id AND s.batch_id = b.batch_id
+        WHERE b.shop_id = $1 AND b.status <> 'archived'
+      `, [shopId])).rows;
       const medMap = new Map(cloudMeds.map((m) => [m.id, m]));
       const batchMap = /* @__PURE__ */ new Map();
       for (const b of cloudBatches) {
@@ -4989,7 +4852,7 @@ var CLOUD2 = {
 };
 var rel2 = (s) => s.mode === "local" ? LOCAL2 : CLOUD2;
 var PAGE_SIZES = [25, 50, 100];
-var DATE_RE4 = /^\d{4}-\d{2}-\d{2}$/;
+var DATE_RE3 = /^\d{4}-\d{2}-\d{2}$/;
 var str2 = (v, max = 100) => typeof v === "string" ? v.trim().slice(0, max) : "";
 var like = (v) => `%${v.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
 var num2 = (v) => v === null || v === void 0 ? null : Math.round(Number(v) * 100) / 100;
@@ -5022,8 +4885,8 @@ function shopFilter(w, scope, alias, query) {
 }
 function dateRange(w, expr, query) {
   const from = str2(query.from, 10), to = str2(query.to, 10);
-  if (from && !DATE_RE4.test(from)) throw new HttpError(400, "from must be YYYY-MM-DD.");
-  if (to && !DATE_RE4.test(to)) throw new HttpError(400, "to must be YYYY-MM-DD.");
+  if (from && !DATE_RE3.test(from)) throw new HttpError(400, "from must be YYYY-MM-DD.");
+  if (to && !DATE_RE3.test(to)) throw new HttpError(400, "to must be YYYY-MM-DD.");
   if (from) w.add((p) => `${expr} >= ${p}::date`, from);
   if (to) w.add((p) => `${expr} <= ${p}::date`, to);
 }
@@ -5506,7 +5369,7 @@ async function historyCsv(scope, kind, query) {
 async function soldMedicines(scope, query, opts) {
   const R = rel2(scope);
   const requested = str2(query.date, 10);
-  if (requested && (!DATE_RE4.test(requested) || (/* @__PURE__ */ new Date(`${requested}T00:00:00Z`)).toISOString().slice(0, 10) !== requested)) {
+  if (requested && (!DATE_RE3.test(requested) || (/* @__PURE__ */ new Date(`${requested}T00:00:00Z`)).toISOString().slice(0, 10) !== requested)) {
     throw new HttpError(400, "date must be a valid YYYY-MM-DD date.");
   }
   const today2 = (await scope.q.query(`SELECT to_char(now() AT TIME ZONE 'Africa/Nairobi', 'YYYY-MM-DD') AS d`)).rows[0].d;
@@ -5598,7 +5461,7 @@ async function soldMedicines(scope, query, opts) {
 var TZ = "Africa/Nairobi";
 var MAX_RANGE_DAYS = 62;
 var STOCK_PAGE_SIZES = [50, 100, 250, 500];
-var DATE_RE5 = /^\d{4}-\d{2}-\d{2}$/;
+var DATE_RE4 = /^\d{4}-\d{2}-\d{2}$/;
 var str3 = (v, max = 100) => typeof v === "string" ? v.trim().slice(0, max) : "";
 var LOCAL3 = {
   shops: `(SELECT si.shop_id, si.shop_code, COALESCE(si.shop_name, 'This shop') AS shop_name FROM shop_identity si WHERE si.shop_id = ANY($1::uuid[]))`,
@@ -5684,7 +5547,7 @@ var CATEGORY_LABELS = {
 function parseStockQuery(scope, query, today2, opts = {}) {
   const date2 = str3(query.date, 10), fromRaw = str3(query.from, 10), toRaw = str3(query.to, 10);
   for (const [k, v] of [["date", date2], ["from", fromRaw], ["to", toRaw]]) {
-    if (v && (!DATE_RE5.test(v) || isNaN(Date.parse(`${v}T00:00:00Z`)))) throw new HttpError(400, `${k} must be YYYY-MM-DD.`);
+    if (v && (!DATE_RE4.test(v) || isNaN(Date.parse(`${v}T00:00:00Z`)))) throw new HttpError(400, `${k} must be YYYY-MM-DD.`);
   }
   let from = date2 || fromRaw || toRaw || today2;
   let to = date2 || toRaw || fromRaw || today2;
@@ -6515,12 +6378,12 @@ var CLOUD5 = {
   shops: `(SELECT s.shop_id, s.shop_code FROM giga_cloud.shops s WHERE s.shop_id = ANY($1::uuid[]))`
 };
 var NOT_ADJUSTMENT2 = ["SALE", "PURCHASE", "VOID_REVERSAL", "CUSTOMER_RETURN", "RETURN_APPROVED", "RETURN_APPROVED_NOT_RESTOCKED", "PHYSICAL_STOCK_COUNT", "DEV_STOCK_RESET"];
-var DATE_RE6 = /^\d{4}-\d{2}-\d{2}$/;
+var DATE_RE5 = /^\d{4}-\d{2}-\d{2}$/;
 var r22 = (n) => Math.round(Number(n || 0) * 100) / 100;
 async function businessDaySummary(scope, query) {
   const R = scope.mode === "local" ? LOCAL5 : CLOUD5;
   const today2 = (await scope.q.query(`SELECT to_char(now() AT TIME ZONE '${TZ2}', 'YYYY-MM-DD') AS d`)).rows[0].d;
-  const valid = (v) => typeof v === "string" && DATE_RE6.test(v) && (/* @__PURE__ */ new Date(`${v}T00:00:00Z`)).toISOString().slice(0, 10) === v;
+  const valid = (v) => typeof v === "string" && DATE_RE5.test(v) && (/* @__PURE__ */ new Date(`${v}T00:00:00Z`)).toISOString().slice(0, 10) === v;
   const from = valid(query.from) ? String(query.from) : valid(query.date) ? String(query.date) : today2;
   const to = valid(query.to) ? String(query.to) : valid(query.date) ? String(query.date) : from;
   if (query.from && !valid(query.from) || query.to && !valid(query.to) || query.date && !valid(query.date)) throw new HttpError(400, "Dates must be valid YYYY-MM-DD.");
@@ -6617,6 +6480,10 @@ function buildShiftRouter(deps) {
       deps.send(res, err, label);
     }
   };
+  r.get("/shifts/current", deps.canView, handle("GET /shifts/current", async (req) => {
+    if (deps.getCurrentShift) return deps.getCurrentShift(req);
+    return { shift: null };
+  }));
   r.get("/shifts", deps.canView, handle("GET /shifts", (req) => deps.withScope(req, (s) => listShifts(s, req.query, deps.viewer(req)))));
   r.get("/shifts/overview", deps.canViewAll, handle("GET /shifts/overview", (req) => deps.withScope(req, (s) => shiftOverview(s))));
   r.get("/shifts/export", deps.canView, handle("GET /shifts/export", async (req, res) => {
@@ -6631,6 +6498,712 @@ function buildShiftRouter(deps) {
     return shiftMedicines(s, req.params.id, d.shift.shop_id);
   })));
   return r;
+}
+
+// server/online/sales.ts
+import crypto4 from "crypto";
+var toCents3 = (n) => Math.round(Number(n) * 100);
+var fromCents3 = (c) => c / 100;
+var CASHIER_MAX_DISCOUNT_PERCENT = 10;
+var ADMIN_MAX_DISCOUNT_PERCENT = 100;
+var PAYMENT_METHODS = ["Cash", "M-Pesa", "Card", "Bank", "Mixed"];
+var SPLIT_METHODS = ["Cash", "M-Pesa", "Card", "Bank"];
+var MPESA_REF = /^[A-Z0-9]{6,20}$/;
+var PRICE_MODES = ["RETAIL", "WHOLESALE"];
+function requirePriceMode(value, field) {
+  if (value === void 0 || value === null || value === "") return "RETAIL";
+  if (!PRICE_MODES.includes(value)) throw new HttpError(400, `${field} must be RETAIL or WHOLESALE.`);
+  return value;
+}
+function validateDiscount(value, role2) {
+  if (value === void 0 || value === null || value === "") return 0;
+  const d = Number(value);
+  if (typeof value === "boolean" || !Number.isFinite(d)) throw new HttpError(400, "Discount must be a number.");
+  if (d < 0) throw new HttpError(400, "Discount cannot be negative.");
+  if (Math.round(d * 100) !== d * 100) throw new HttpError(400, "Discount may have at most 2 decimal places.");
+  const max = role2 === "ADMIN" ? ADMIN_MAX_DISCOUNT_PERCENT : CASHIER_MAX_DISCOUNT_PERCENT;
+  if (d > max) {
+    throw new HttpError(400, role2 === "ADMIN" ? `Discount cannot exceed ${max}%.` : `Cashier discount cannot exceed ${max}%.`);
+  }
+  return d;
+}
+function normalizeItems(items, saleMode) {
+  if (!Array.isArray(items) || items.length === 0) throw new HttpError(400, "A sale must contain at least one item.");
+  if (items.length > 200) throw new HttpError(400, "Too many lines in one sale.");
+  const merged = /* @__PURE__ */ new Map();
+  for (const raw of items) {
+    const id = requireUuid(raw?.medicine_id, "medicine_id");
+    const qty = Number(raw?.quantity);
+    if (!Number.isInteger(qty) || qty < 1 || qty > 1e5) throw new HttpError(400, "Each quantity must be a whole number of at least 1.");
+    const price = raw?.unit_price === void 0 || raw?.unit_price === null ? void 0 : Number(raw.unit_price);
+    if (price !== void 0 && !Number.isFinite(price)) throw new HttpError(400, "unit_price must be a number.");
+    const mode = raw?.price_mode === void 0 ? saleMode : requirePriceMode(raw.price_mode, "Item price_mode");
+    if (saleMode === "RETAIL" && mode === "WHOLESALE") throw new HttpError(400, "A RETAIL sale cannot contain wholesale-priced lines.");
+    const fallback = raw?.retail_fallback_confirmed === true;
+    const existing = merged.get(id);
+    if (existing) {
+      if (existing.price_mode !== mode) throw new HttpError(400, "The same medicine appears with two different price modes.");
+      existing.quantity += qty;
+      if (price !== void 0 && existing.unit_price !== void 0 && toCents3(price) !== toCents3(existing.unit_price)) {
+        throw new HttpError(400, "The same medicine appears with two different prices.");
+      }
+    } else {
+      merged.set(id, { medicine_id: id, quantity: qty, unit_price: price, price_mode: mode, retail_fallback_confirmed: fallback });
+    }
+  }
+  return [...merged.values()];
+}
+function planPayment(payment, totalCents) {
+  const method = payment?.method;
+  if (!method || !PAYMENT_METHODS.includes(method)) {
+    throw new HttpError(400, `Payment method must be one of ${PAYMENT_METHODS.join(", ")}.`);
+  }
+  const ref = (v) => typeof v === "string" && v.trim() ? v.trim().toUpperCase().slice(0, 100) : null;
+  if (method === "Cash") {
+    const received = toCents3(Number(payment.amount_received));
+    if (!Number.isFinite(received) || received < totalCents) {
+      throw new HttpError(400, `Cash received must be at least the sale total (${fromCents3(totalCents).toFixed(2)}).`);
+    }
+    return {
+      method,
+      reference: null,
+      amountReceivedCents: received,
+      changeCents: received - totalCents,
+      rows: [{ method: "Cash", amountCents: totalCents, reference: null }]
+    };
+  }
+  if (method === "Mixed") {
+    const split = payment.split;
+    if (!Array.isArray(split) || split.length < 2) throw new HttpError(400, "A split payment needs at least two parts.");
+    const rows = split.map((p) => {
+      if (!SPLIT_METHODS.includes(p?.method)) throw new HttpError(400, "Split payment parts must be Cash, M-Pesa, Card or Bank.");
+      const amountCents = toCents3(Number(p.amount));
+      if (!Number.isFinite(amountCents) || amountCents <= 0) throw new HttpError(400, "Each split payment amount must be greater than zero.");
+      const reference2 = ref(p.reference);
+      if (p.method === "M-Pesa" && (!reference2 || !MPESA_REF.test(reference2))) {
+        throw new HttpError(400, "The M-Pesa part of a split payment needs a valid transaction code.");
+      }
+      return { method: p.method, amountCents, reference: reference2 };
+    });
+    const sum = rows.reduce((s, r) => s + r.amountCents, 0);
+    if (sum !== totalCents) {
+      throw new HttpError(400, `Split payments (${fromCents3(sum).toFixed(2)}) must equal the sale total (${fromCents3(totalCents).toFixed(2)}).`);
+    }
+    return { method, reference: null, amountReceivedCents: totalCents, changeCents: 0, rows };
+  }
+  const reference = ref(payment.reference);
+  if (method === "M-Pesa" && (!reference || !MPESA_REF.test(reference))) {
+    throw new HttpError(400, "A valid M-Pesa transaction code (6-20 letters/digits) is required.");
+  }
+  return { method, reference, amountReceivedCents: totalCents, changeCents: 0, rows: [{ method, amountCents: totalCents, reference }] };
+}
+async function hydrateOnlineSale(client, shopId, saleRow2, isCashier) {
+  const [sale] = await hydrateOnlineSalesList(client, shopId, [saleRow2], isCashier);
+  return sale;
+}
+async function hydrateOnlineSalesList(client, shopId, saleRows, isCashier) {
+  if (saleRows.length === 0) return [];
+  const saleIds = saleRows.map((r) => r.sale_id || r.id);
+  const itemsRes = await client.query(
+    `SELECT si.sale_item_id AS id, si.sale_id, si.medicine_id, m.name AS medicine_name, (m.data->>'generic_name')::text AS generic_name,
+            si.batch_id, si.batch_number, (si.data->>'expiry_date')::text AS expiry_date,
+            si.quantity, si.unit_price::float AS unit_price, si.discount::float AS discount,
+            si.cost_price_snapshot::float AS cost_price_snapshot, si.total::float AS total, si.price_mode
+     FROM giga_cloud.sale_items si
+     LEFT JOIN giga_cloud.medicines m ON m.shop_id = si.shop_id AND m.medicine_id = si.medicine_id
+     WHERE si.shop_id = $1 AND si.sale_id = ANY($2::uuid[])
+     ORDER BY si.sale_item_id`,
+    [shopId, saleIds]
+  );
+  const paymentsRes = await client.query(
+    `SELECT sale_id, method, amount::float AS amount, reference
+     FROM giga_cloud.payments
+     WHERE shop_id = $1 AND sale_id = ANY($2::uuid[])
+     ORDER BY payment_id`,
+    [shopId, saleIds]
+  );
+  const customerIds = [...new Set(saleRows.map((r) => r.customer_id).filter(Boolean))];
+  const customerMap = /* @__PURE__ */ new Map();
+  if (customerIds.length > 0) {
+    const custRes = await client.query(
+      "SELECT customer_id, name, phone FROM giga_cloud.customers WHERE shop_id = $1 AND customer_id = ANY($2::uuid[])",
+      [shopId, customerIds]
+    );
+    for (const c of custRes.rows) {
+      customerMap.set(c.customer_id, { name: c.name, phone: c.phone });
+    }
+  }
+  const itemsBySale = /* @__PURE__ */ new Map();
+  for (const it of itemsRes.rows) {
+    const list = itemsBySale.get(it.sale_id) || [];
+    list.push({
+      id: it.id,
+      medicine_id: it.medicine_id,
+      medicine_name: it.medicine_name || "Pharmaceutical Item",
+      generic_name: it.generic_name || "",
+      batch_id: it.batch_id,
+      batch_number: it.batch_number,
+      expiry_date: it.expiry_date || "",
+      quantity: Number(it.quantity) || 0,
+      unit_price: Number(it.unit_price) || 0,
+      discount: Number(it.discount) || 0,
+      cost_price_snapshot: isCashier ? 0 : Number(it.cost_price_snapshot) || 0,
+      total: Number(it.total) || 0,
+      price_mode: it.price_mode || null
+    });
+    itemsBySale.set(it.sale_id, list);
+  }
+  const paymentsBySale = /* @__PURE__ */ new Map();
+  for (const p of paymentsRes.rows) {
+    const list = paymentsBySale.get(p.sale_id) || [];
+    list.push({
+      method: p.method,
+      amount: Number(p.amount) || 0,
+      reference: p.reference || void 0
+    });
+    paymentsBySale.set(p.sale_id, list);
+  }
+  return saleRows.map((saleRow2) => {
+    const saleId = saleRow2.sale_id || saleRow2.id;
+    const items = itemsBySale.get(saleId) || [];
+    const payments = paymentsBySale.get(saleId) || [];
+    const cust = saleRow2.customer_id ? customerMap.get(saleRow2.customer_id) : null;
+    const d = saleRow2.data || {};
+    const businessDate = saleRow2.business_date ? new Date(saleRow2.business_date).toISOString().slice(0, 10) : d.date || "";
+    return {
+      id: saleId,
+      branch_id: d.branch_id || void 0,
+      sale_number: saleRow2.sale_number,
+      receipt_number: saleRow2.receipt_number,
+      date: businessDate,
+      time: saleRow2.business_time || d.time || "",
+      timestamp: saleRow2.created_at_local ? new Date(saleRow2.created_at_local).getTime() : Date.now(),
+      cashier_id: saleRow2.cashier_id,
+      cashier_name: saleRow2.cashier_name || "Cashier",
+      customer_id: saleRow2.customer_id || void 0,
+      customer_name: cust?.name || d.customer_name || "Walk-in",
+      customer_phone: cust?.phone || d.customer_phone || void 0,
+      device_id: saleRow2.device_id || "ONLINE_POS",
+      items,
+      price_mode: saleRow2.price_mode || null,
+      subtotal: Number(saleRow2.subtotal) || 0,
+      discount_percent: Number(d.discount_percent || 0),
+      discount_total: Number(saleRow2.discount_total) || 0,
+      tax_total: Number(saleRow2.tax_total) || 0,
+      total: Number(saleRow2.total) || 0,
+      cost_total: isCashier ? 0 : Number(saleRow2.cost_total) || 0,
+      gross_profit: isCashier ? 0 : Number(saleRow2.gross_profit) || 0,
+      payment_method: saleRow2.payment_method || "Cash",
+      payment_reference: d.payment_reference || void 0,
+      amount_received: Number(d.amount_received || saleRow2.total) || 0,
+      change_given: Number(d.change_given || 0),
+      split_payments: saleRow2.payment_method === "Mixed" ? payments : void 0,
+      status: saleRow2.status || "completed",
+      void_reason: saleRow2.void_reason || void 0,
+      voided_by: saleRow2.voided_by || void 0,
+      sync_status: "synced",
+      retry_count: 0,
+      idempotency_key: saleRow2.local_idempotency_key || d.idempotency_key,
+      returned_items: []
+    };
+  });
+}
+async function getOnlineSales(client, shopId, params, isCashier) {
+  const page = Math.max(1, Number(params.page) || 1);
+  const limit = Math.min(500, Math.max(1, Number(params.limit) || 50));
+  const offset = (page - 1) * limit;
+  const conditions = ["s.shop_id = $1"];
+  const values = [shopId];
+  if (params.search?.trim()) {
+    values.push(`%${params.search.trim()}%`);
+    conditions.push(
+      `(s.receipt_number ILIKE $${values.length} OR s.sale_number ILIKE $${values.length} OR s.cashier_name ILIKE $${values.length} OR (s.data->>'customer_name') ILIKE $${values.length})`
+    );
+  }
+  if (params.startDate) {
+    values.push(params.startDate);
+    conditions.push(`s.business_date >= $${values.length}`);
+  }
+  if (params.endDate) {
+    values.push(params.endDate);
+    conditions.push(`s.business_date <= $${values.length}`);
+  }
+  if (params.cashierId) {
+    values.push(params.cashierId);
+    conditions.push(`s.cashier_id = $${values.length}`);
+  }
+  if (params.paymentMethod) {
+    values.push(params.paymentMethod);
+    conditions.push(
+      `(s.payment_method = $${values.length} OR EXISTS (SELECT 1 FROM giga_cloud.payments px WHERE px.shop_id = s.shop_id AND px.sale_id = s.sale_id AND px.method = $${values.length}))`
+    );
+  }
+  if (params.customerId) {
+    values.push(params.customerId);
+    conditions.push(`s.customer_id = $${values.length}`);
+  }
+  if (params.priceMode) {
+    values.push(params.priceMode);
+    conditions.push(`COALESCE(s.price_mode, 'RETAIL') = $${values.length}`);
+  }
+  if (params.status) {
+    if (params.status === "not_voided") {
+      conditions.push(`s.status <> 'voided'`);
+    } else {
+      values.push(params.status);
+      conditions.push(`s.status = $${values.length}`);
+    }
+  }
+  const where = conditions.join(" AND ");
+  const countRes = await client.query(`SELECT COUNT(*)::int AS n FROM giga_cloud.sales s WHERE ${where}`, values);
+  const total = countRes.rows[0]?.n || 0;
+  const rowsRes = await client.query(
+    `SELECT s.* FROM giga_cloud.sales s WHERE ${where} ORDER BY s.created_at_local DESC, s.sale_id DESC LIMIT $${values.length + 1} OFFSET $${values.length + 2}`,
+    [...values, limit, offset]
+  );
+  const sales = await hydrateOnlineSalesList(client, shopId, rowsRes.rows, isCashier);
+  return {
+    sales,
+    total,
+    page,
+    limit,
+    totalPages: Math.ceil(total / limit) || 1
+  };
+}
+async function executeOnlineSaleCheckout(client, shopId, input, user) {
+  const key = typeof input?.idempotency_key === "string" ? input.idempotency_key.trim() : "";
+  if (key.length < 8 || key.length > 255) throw new HttpError(400, "idempotency_key (8-255 characters) is required.");
+  const saleMode = requirePriceMode(input?.price_mode, "price_mode");
+  const items = normalizeItems(input?.items, saleMode);
+  const discountPct = validateDiscount(input?.discount_percent, user.role);
+  const customerId = input?.customer_id ? requireUuid(input.customer_id, "customer_id") : null;
+  const isCashier = user.role === "CASHIER";
+  const cashierId = user.local_user_id || user.id;
+  await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`${shopId}:${key}`]);
+  const existing = await client.query(
+    "SELECT * FROM giga_cloud.sales WHERE shop_id = $1 AND local_idempotency_key = $2",
+    [shopId, key]
+  );
+  if (existing.rows[0]) {
+    const row = existing.rows[0];
+    if (row.cashier_id !== cashierId && row.cashier_id !== user.id) {
+      throw new HttpError(409, "This idempotency key belongs to another sale.");
+    }
+    const sale2 = await hydrateOnlineSale(client, shopId, row, isCashier);
+    return { success: true, duplicate: true, sale: sale2, medicines: [], batches: [] };
+  }
+  let customerName = "Walk-in";
+  let customerPhone = void 0;
+  if (customerId) {
+    const cust = await client.query("SELECT name, phone FROM giga_cloud.customers WHERE shop_id = $1 AND customer_id = $2", [shopId, customerId]);
+    if (!cust.rows[0]) throw new HttpError(400, "Customer not found.");
+    customerName = cust.rows[0].name || customerName;
+    customerPhone = cust.rows[0].phone || void 0;
+  }
+  const openShift = await client.query(
+    `SELECT shift_id FROM giga_cloud.cashier_shifts WHERE shop_id = $1 AND cashier_id = $2 AND status = 'OPEN' ORDER BY opened_at DESC LIMIT 1`,
+    [shopId, cashierId]
+  );
+  const shiftId = openShift.rows[0]?.shift_id || null;
+  const ids = items.map((i) => i.medicine_id).sort();
+  const medRes = await client.query(
+    `SELECT medicine_id AS id, name, status, selling_price::float AS selling_price,
+            wholesale_price::float AS wholesale_price, purchase_price::float AS purchase_price,
+            stock_version
+     FROM giga_cloud.medicines
+     WHERE shop_id = $1 AND medicine_id = ANY($2::uuid[])
+     ORDER BY medicine_id
+     FOR UPDATE`,
+    [shopId, ids]
+  );
+  const meds = new Map(medRes.rows.map((m) => [m.id, m]));
+  const allocations = [];
+  const priceChanges = [];
+  const missingWholesale = [];
+  const todayStr = (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
+  for (const item of [...items].sort((a, b) => a.medicine_id.localeCompare(b.medicine_id))) {
+    const med = meds.get(item.medicine_id);
+    if (!med) throw new HttpError(404, `Medicine ${item.medicine_id} not found in this shop.`);
+    if (med.status !== "active") throw new HttpError(409, `${med.name} is not active and cannot be sold.`);
+    const hasWholesale = med.wholesale_price != null && Number(med.wholesale_price) > 0;
+    if (item.price_mode === "WHOLESALE" && !hasWholesale) {
+      missingWholesale.push({ medicine_id: med.id, name: med.name, retail_price: med.selling_price });
+      continue;
+    }
+    if (saleMode === "WHOLESALE" && item.price_mode === "RETAIL") {
+      if (hasWholesale) throw new HttpError(400, `${med.name} has a wholesale price; a wholesale sale must use it.`);
+      if (!item.retail_fallback_confirmed) {
+        missingWholesale.push({ medicine_id: med.id, name: med.name, retail_price: med.selling_price });
+        continue;
+      }
+    }
+    const unitPrice = item.price_mode === "WHOLESALE" ? Number(med.wholesale_price) : med.selling_price;
+    const priceCents = toCents3(unitPrice);
+    if (priceCents <= 0) throw new HttpError(409, `${med.name} has no valid ${item.price_mode.toLowerCase()} price.`);
+    if (item.unit_price !== void 0 && toCents3(item.unit_price) !== priceCents) {
+      priceChanges.push({ medicine_id: med.id, name: med.name, expected: item.unit_price, current: unitPrice, price_mode: item.price_mode });
+      continue;
+    }
+    const batchRes = await client.query(
+      `SELECT b.batch_id AS id, b.medicine_id, b.batch_number, b.expiry_date, b.status,
+              COALESCE((b.data->>'purchase_price')::numeric, 0) AS purchase_price,
+              s.has_baseline, s.baseline_quantity, s.delta_since_baseline, s.last_reported_quantity,
+              s.stock_version,
+              CASE WHEN s.has_baseline THEN s.baseline_quantity + s.delta_since_baseline ELSE COALESCE(s.last_reported_quantity, 0) END::int AS quantity_available
+       FROM giga_cloud.medicine_batches b
+       JOIN giga_cloud.stock_levels s ON s.shop_id = b.shop_id AND s.batch_id = b.batch_id
+       WHERE b.shop_id = $1
+         AND b.medicine_id = $2
+         AND b.status = 'active'
+         AND (b.expiry_date IS NULL OR b.expiry_date > $3::date)
+       ORDER BY b.expiry_date ASC NULLS LAST, b.updated_at ASC, b.batch_id ASC
+       FOR UPDATE OF s`,
+      [shopId, med.id, todayStr]
+    );
+    const sellable = batchRes.rows.reduce((s, b) => s + Number(b.quantity_available), 0);
+    if (sellable < item.quantity) {
+      throw new HttpError(
+        409,
+        `Insufficient sellable stock for ${med.name}: requested ${item.quantity}, available ${sellable}.`
+      );
+    }
+    let remaining = item.quantity;
+    for (const b of batchRes.rows) {
+      if (remaining === 0) break;
+      const avail = Number(b.quantity_available);
+      if (avail <= 0) continue;
+      const take = Math.min(remaining, avail);
+      const cost = Number(b.purchase_price) > 0 ? Number(b.purchase_price) : Number(med.purchase_price) || 0;
+      allocations.push({ medicine_id: med.id, batch: b, quantity: take, priceCents, costCents: toCents3(cost), priceMode: item.price_mode });
+      remaining -= take;
+    }
+  }
+  if (missingWholesale.length > 0) {
+    throw Object.assign(
+      new HttpError(
+        409,
+        `No wholesale price is set for ${missingWholesale.map((m) => m.name).join(", ")}. Confirm selling at the retail price, or ask an Administrator to set a wholesale price.`
+      ),
+      { code: "WHOLESALE_PRICE_MISSING", details: missingWholesale }
+    );
+  }
+  if (priceChanges.length > 0) {
+    throw Object.assign(
+      new HttpError(409, `Price changed for ${priceChanges.map((p) => p.name).join(", ")}. Refresh the cart and confirm the current price.`),
+      { code: "PRICE_CHANGED", details: priceChanges }
+    );
+  }
+  let subtotalCents = 0;
+  let discountCents = 0;
+  let costCents = 0;
+  const lines = allocations.map((a) => {
+    const lineSubtotal = a.priceCents * a.quantity;
+    const lineDiscount = Math.round(lineSubtotal * discountPct / 100);
+    subtotalCents += lineSubtotal;
+    discountCents += lineDiscount;
+    costCents += a.costCents * a.quantity;
+    return { ...a, lineSubtotal, lineDiscount, lineTotal: lineSubtotal - lineDiscount };
+  });
+  const netCents = subtotalCents - discountCents;
+  const settingsRes = await client.query("SELECT data FROM giga_cloud.shop_settings WHERE shop_id = $1", [shopId]);
+  const sData = settingsRes.rows[0]?.data;
+  const taxCents = sData?.tax_enabled ? Math.round(netCents * (Number(sData.tax_rate) || 0) / 100) : 0;
+  const totalCents = netCents + taxCents;
+  const payment = planPayment(input?.payment, totalCents);
+  const ymd = todayStr.replace(/-/g, "");
+  const now = /* @__PURE__ */ new Date();
+  const timeStr = now.toTimeString().slice(0, 8);
+  const seqRes = await client.query(
+    `SELECT COALESCE(MAX(SUBSTRING(receipt_number FROM '[0-9]+$')::bigint), 0) + 1 AS n
+     FROM giga_cloud.sales
+     WHERE shop_id = $1 AND business_date = $2::date`,
+    [shopId, todayStr]
+  );
+  const serial = String(seqRes.rows[0].n).padStart(6, "0");
+  const saleId = crypto4.randomUUID();
+  const saleNumber = `SALE-${ymd}-${serial}`;
+  const receiptNumber = `RCP-${ymd}-${serial}`;
+  const cashierName = user.name || "Cashier";
+  const saleData = {
+    id: saleId,
+    sale_number: saleNumber,
+    receipt_number: receiptNumber,
+    cashier_id: cashierId,
+    cashier_name: cashierName,
+    customer_id: customerId,
+    customer_name: customerName,
+    customer_phone: customerPhone,
+    device_id: "ONLINE_POS",
+    date: todayStr,
+    time: timeStr,
+    subtotal: fromCents3(subtotalCents),
+    discount_percent: discountPct,
+    discount_total: fromCents3(discountCents),
+    tax_total: fromCents3(taxCents),
+    total: fromCents3(totalCents),
+    cost_total: fromCents3(costCents),
+    gross_profit: fromCents3(netCents - costCents),
+    payment_method: payment.method,
+    payment_reference: payment.reference,
+    amount_received: fromCents3(payment.amountReceivedCents),
+    change_given: fromCents3(payment.changeCents),
+    price_mode: saleMode,
+    shift_id: shiftId,
+    status: "completed",
+    idempotency_key: key,
+    created_at: now.toISOString()
+  };
+  await client.query(
+    `INSERT INTO giga_cloud.sales (
+       shop_id, sale_id, sale_number, receipt_number, business_date, business_time,
+       cashier_id, cashier_name, customer_id, device_id, price_mode, subtotal,
+       discount_total, tax_total, total, cost_total, gross_profit, payment_method,
+       status, local_idempotency_key, created_at_local, data, source_seq
+     ) VALUES (
+       $1, $2, $3, $4, $5::date, $6,
+       $7, $8, $9, 'ONLINE_POS', $10, $11,
+       $12, $13, $14, $15, $16, $17,
+       'completed', $18, $19, $20, 0
+     )`,
+    [
+      shopId,
+      saleId,
+      saleNumber,
+      receiptNumber,
+      todayStr,
+      timeStr,
+      cashierId,
+      cashierName,
+      customerId,
+      saleMode,
+      fromCents3(subtotalCents),
+      fromCents3(discountCents),
+      fromCents3(taxCents),
+      fromCents3(totalCents),
+      fromCents3(costCents),
+      fromCents3(netCents - costCents),
+      payment.method,
+      key,
+      now.toISOString(),
+      JSON.stringify(saleData)
+    ]
+  );
+  const touchedBatches = /* @__PURE__ */ new Map();
+  const returnBatches = [];
+  for (const l of lines) {
+    const saleItemId = crypto4.randomUUID();
+    const itemData = {
+      id: saleItemId,
+      sale_id: saleId,
+      medicine_id: l.medicine_id,
+      batch_id: l.batch.id,
+      batch_number: l.batch.batch_number,
+      expiry_date: l.batch.expiry_date,
+      quantity: l.quantity,
+      unit_price: fromCents3(l.priceCents),
+      discount: fromCents3(l.lineDiscount),
+      cost_price_snapshot: fromCents3(l.costCents),
+      total: fromCents3(l.lineTotal),
+      price_mode: l.priceMode,
+      created_at: now.toISOString()
+    };
+    await client.query(
+      `INSERT INTO giga_cloud.sale_items (
+         shop_id, sale_item_id, sale_id, medicine_id, batch_id, batch_number,
+         quantity, unit_price, discount, cost_price_snapshot, total, price_mode, data
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+      [
+        shopId,
+        saleItemId,
+        saleId,
+        l.medicine_id,
+        l.batch.id,
+        l.batch.batch_number,
+        l.quantity,
+        fromCents3(l.priceCents),
+        fromCents3(l.lineDiscount),
+        fromCents3(l.costCents),
+        fromCents3(l.lineTotal),
+        l.priceMode,
+        JSON.stringify(itemData)
+      ]
+    );
+    const prev = Number(l.batch.quantity_available);
+    const next = prev - l.quantity;
+    await client.query(
+      `UPDATE giga_cloud.stock_levels
+       SET delta_since_baseline = delta_since_baseline - $1::int,
+           last_reported_quantity = last_reported_quantity - $1::int,
+           stock_version = stock_version + 1,
+           last_movement_at = now()
+       WHERE shop_id = $2 AND batch_id = $3`,
+      [l.quantity, shopId, l.batch.id]
+    );
+    await client.query(
+      `UPDATE giga_cloud.medicine_batches
+       SET data = jsonb_set(COALESCE(data, '{}'::jsonb), '{quantity_available}', to_jsonb($1::int)),
+           updated_at = now()
+       WHERE shop_id = $2 AND batch_id = $3`,
+      [next, shopId, l.batch.id]
+    );
+    const movementId = crypto4.randomUUID();
+    const eventId = crypto4.randomUUID();
+    await client.query(
+      `INSERT INTO giga_cloud.inventory_movements (
+         shop_id, movement_id, event_id, local_seq, medicine_id, batch_id, movement_type, reason, delta,
+         previous_quantity, new_quantity, reference_id, notes, user_id, device_id, occurred_at
+       ) VALUES ($1, $2, $3, 0, $4, $5, 'SALE', 'SALE', $6, $7, $8, $9, $10, $11, 'ONLINE_POS', now())`,
+      [
+        shopId,
+        movementId,
+        eventId,
+        l.medicine_id,
+        l.batch.id,
+        -l.quantity,
+        prev,
+        next,
+        receiptNumber,
+        `Sold on receipt ${receiptNumber}`,
+        cashierId
+      ]
+    );
+    touchedBatches.set(l.batch.id, {
+      id: l.batch.id,
+      medicine_id: l.medicine_id,
+      batch_number: l.batch.batch_number,
+      quantity_available: next,
+      status: l.batch.status,
+      stock_version: Number(l.batch.stock_version || 1) + 1
+    });
+  }
+  for (const p of payment.rows) {
+    const paymentId = crypto4.randomUUID();
+    const payData = {
+      id: paymentId,
+      sale_id: saleId,
+      method: p.method,
+      amount: fromCents3(p.amountCents),
+      reference: p.reference,
+      created_at: now.toISOString()
+    };
+    await client.query(
+      `INSERT INTO giga_cloud.payments (
+         shop_id, payment_id, sale_id, method, amount, reference, data
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [shopId, paymentId, saleId, p.method, fromCents3(p.amountCents), p.reference, JSON.stringify(payData)]
+    );
+  }
+  const returnMedicines = [];
+  for (const medId of ids) {
+    const updMed = await client.query(
+      `UPDATE giga_cloud.medicines
+       SET stock_version = stock_version + 1,
+           updated_at = now()
+       WHERE shop_id = $1 AND medicine_id = $2
+       RETURNING medicine_id AS id, stock_version`,
+      [shopId, medId]
+    );
+    const stockSumRes = await client.query(
+      `SELECT COALESCE(SUM(CASE WHEN has_baseline THEN baseline_quantity + delta_since_baseline ELSE COALESCE(last_reported_quantity, 0) END), 0)::int AS current_stock
+       FROM giga_cloud.stock_levels
+       WHERE shop_id = $1 AND medicine_id = $2`,
+      [shopId, medId]
+    );
+    returnMedicines.push({
+      id: medId,
+      current_stock: stockSumRes.rows[0]?.current_stock ?? 0,
+      stock_version: Number(updMed.rows[0]?.stock_version || 1)
+    });
+  }
+  if (customerId) {
+    await client.query(
+      `UPDATE giga_cloud.customers
+       SET data = jsonb_set(
+         jsonb_set(COALESCE(data, '{}'::jsonb), '{total_spent}', to_jsonb(COALESCE((data->>'total_spent')::numeric, 0) + $1)),
+         '{last_visit}', to_jsonb(now())
+       ), updated_at = now()
+       WHERE shop_id = $2 AND customer_id = $3`,
+      [fromCents3(totalCents), shopId, customerId]
+    );
+  }
+  if (shiftId) {
+    const cashCents = payment.rows.filter((r) => r.method === "Cash").reduce((s, r) => s + r.amountCents, 0);
+    const mpesaCents = payment.rows.filter((r) => r.method === "M-Pesa").reduce((s, r) => s + r.amountCents, 0);
+    const totalUnitsSold = lines.reduce((s, l) => s + l.quantity, 0);
+    await client.query(
+      `UPDATE giga_cloud.cashier_shifts
+       SET data = jsonb_set(
+         jsonb_set(
+           jsonb_set(
+             jsonb_set(
+               COALESCE(data, '{}'::jsonb),
+               '{total_sales}', to_jsonb(COALESCE((data->>'total_sales')::numeric, 0) + $1)
+             ),
+             '{total_transactions}', to_jsonb(COALESCE((data->>'total_transactions')::int, 0) + 1)
+           ),
+           '{cash_sales}', to_jsonb(COALESCE((data->>'cash_sales')::numeric, 0) + $2)
+         ),
+         '{mpesa_sales}', to_jsonb(COALESCE((data->>'mpesa_sales')::numeric, 0) + $3)
+       ),
+       units_sold = COALESCE(units_sold, 0) + $4,
+       updated_at = now()
+       WHERE shop_id = $5 AND shift_id = $6`,
+      [fromCents3(totalCents), fromCents3(cashCents), fromCents3(mpesaCents), totalUnitsSold, shopId, shiftId]
+    ).catch(() => {
+    });
+  }
+  await client.query(
+    `INSERT INTO giga_cloud.online_audit (shop_id, online_user_id, user_email, action, details, client_ip, user_agent)
+     VALUES ($1, $2, $3, 'ONLINE_SALE_COMPLETED', $4, 'ONLINE_POS', 'Online POS Terminal')`,
+    [
+      shopId,
+      user.id,
+      user.email,
+      JSON.stringify({
+        sale_id: saleId,
+        receipt_number: receiptNumber,
+        total: fromCents3(totalCents),
+        lines_count: lines.length,
+        payment_method: payment.method
+      })
+    ]
+  ).catch(() => {
+  });
+  const sale = await hydrateOnlineSale(
+    client,
+    shopId,
+    {
+      sale_id: saleId,
+      sale_number: saleNumber,
+      receipt_number: receiptNumber,
+      business_date: todayStr,
+      business_time: timeStr,
+      cashier_id: cashierId,
+      cashier_name: cashierName,
+      customer_id: customerId,
+      device_id: "ONLINE_POS",
+      price_mode: saleMode,
+      subtotal: fromCents3(subtotalCents),
+      discount_total: fromCents3(discountCents),
+      tax_total: fromCents3(taxCents),
+      total: fromCents3(totalCents),
+      cost_total: fromCents3(costCents),
+      gross_profit: fromCents3(netCents - costCents),
+      payment_method: payment.method,
+      status: "completed",
+      local_idempotency_key: key,
+      created_at_local: now.toISOString(),
+      data: saleData
+    },
+    isCashier
+  );
+  return {
+    success: true,
+    duplicate: false,
+    sale,
+    medicines: returnMedicines,
+    batches: [...touchedBatches.values()]
+  };
 }
 
 // server/online/app.ts
@@ -6762,7 +7335,7 @@ async function maintenanceGate(req, res, next) {
 }
 var loginAttempts = /* @__PURE__ */ new Map();
 var loginFailures = /* @__PURE__ */ new Map();
-var LOGIN_DUMMY_HASH = hashCredential(crypto4.randomBytes(16).toString("hex")).combined;
+var LOGIN_DUMMY_HASH = hashCredential(crypto5.randomBytes(16).toString("hex")).combined;
 function identifierLocked(id) {
   const f = loginFailures.get(id);
   return Boolean(f && f.until > Date.now());
@@ -6915,7 +7488,7 @@ function buildOnlineRouter() {
   });
   r.get("/health", async (_req, res) => {
     const cfg = getOnlineConfig();
-    const base = { status: "online", system: "GIGA CHEMIST POS API", mode: "online", app_mode: "online", version, timestamp: Date.now(), read_only: true, remote_admin_commands: true };
+    const base = { status: "online", system: "GIGA CHEMIST POS API", mode: "online", app_mode: "online", version, timestamp: Date.now(), read_only: false, cashier_sales: true, remote_admin_commands: true, local_database_required: false };
     if (cfg.error) return res.json({ ...base, database: { provider: "Supabase PostgreSQL", connected: false, configured: false, error: cfg.error } });
     try {
       const info = await withCloud(async (c) => {
@@ -6990,16 +7563,30 @@ function buildOnlineRouter() {
   })));
   r.get("/sync/status", requireAuth, route("GET /sync/status", async (req) => {
     const shop = await withCloud((c) => c.query("SELECT last_event_at FROM giga_cloud.shops WHERE shop_id = $1", [requestShop(req)]));
-    return { mode: "online", enabled: false, read_only: true, local_database: { connected: true }, cloud_reachable: true, counts: null, last_sync: shop.rows[0]?.last_event_at || null };
+    return { mode: "online", enabled: false, read_only: false, cashier_sales: true, remote_admin_commands: true, local_database_required: false, local_database: { connected: true }, cloud_reachable: true, counts: null, last_sync: shop.rows[0]?.last_event_at || null };
   }));
   const stripCost = (req, rows, fields) => req.onlineUser.role === "CASHIER" ? rows.map((x) => Object.fromEntries(Object.entries(x).map(([k, v]) => [k, fields.includes(k) ? 0 : v]))) : rows;
   r.get("/medicines", requirePermission("medicine.view"), route("GET /medicines", async (req) => stripCost(req, await withShop(requestShop(req), (c) => getAllMedicines(c)), ["purchase_price"])));
-  r.get("/categories", requirePermission("medicine.view"), route("GET /categories", (req) => withShop(requestShop(req), (c) => getAllCategories(c))));
+  r.get("/categories", requirePermission("medicine.view"), route("GET /categories", (req) => withShop(requestShop(req), async (c) => {
+    const cats = await getAllCategories(c);
+    if (cats.length > 0) return cats;
+    const derived = await c.query(
+      `SELECT DISTINCT COALESCE(NULLIF(TRIM(m.medicine_type), ''), 'General') AS name
+         FROM medicines m
+        WHERE COALESCE(m.status, 'active') <> 'archived'
+        ORDER BY 1`
+    );
+    return derived.rows.map((row, idx) => ({
+      id: `00000000-0000-0000-0000-${String(idx + 1).padStart(12, "0")}`,
+      name: row.name
+    }));
+  })));
   r.get("/batches", requirePermission("medicine.view"), route("GET /batches", async (req) => stripCost(req, await withShop(requestShop(req), (c) => getAllBatches(c)), ["purchase_price"])));
   r.get("/customers", requirePermission("sales.view_own"), route("GET /customers", (req) => withShop(requestShop(req), (c) => getAllCustomers(c))));
   r.get("/sales", requirePermission("sales.view_own"), route("GET /sales", async (req) => {
     const q = req.query;
-    const result = await withShop(requestShop(req), (c) => getAllSales({
+    const isCashier = req.onlineUser.role === "CASHIER";
+    return await withShop(requestShop(req), (c) => getOnlineSales(c, requestShop(req), {
       page: Number(q.page) || 1,
       limit: Number(q.limit) || 50,
       search: q.search,
@@ -7010,10 +7597,7 @@ function buildOnlineRouter() {
       customerId: q.customerId || void 0,
       priceMode: q.priceMode || void 0,
       status: q.status || void 0
-    }, c));
-    if (req.onlineUser.role !== "CASHIER") return result;
-    const strip = (s) => ({ ...s, cost_total: 0, gross_profit: 0, items: s.items?.map((i) => ({ ...i, cost_price_snapshot: 0 })) });
-    return { ...result, sales: result.sales.map(strip) };
+    }, isCashier));
   }));
   r.get("/sales/today-summary", requireAuth, route("GET /sales/today-summary", async (req) => {
     const s = await withShop(requestShop(req), (c) => getTodaySalesSummary({ cashierId: cashierScope(req.onlineUser) ?? (req.query.cashierId || void 0) }, c));
@@ -7025,6 +7609,42 @@ function buildOnlineRouter() {
     const range = await resolveRange(req.query.range, req.query.start, req.query.end, c);
     return getSalesReport(range, { cashierId: isAdmin ? req.query.cashierId || null : cashierScope(req.onlineUser), includeCost: isAdmin }, c);
   })));
+  async function handleOnlineCheckout(req, res) {
+    try {
+      const u = req.onlineUser;
+      const shopId = requestShop(req);
+      const input = req.body || {};
+      const result = await withCloud(async (client) => {
+        await client.query("BEGIN");
+        try {
+          const out = await executeOnlineSaleCheckout(
+            client,
+            shopId,
+            input,
+            {
+              id: u.id,
+              name: u.name,
+              email: u.email,
+              role: u.role,
+              local_user_id: u.local_user_id,
+              shop_id: u.shop_id
+            }
+          );
+          await client.query("COMMIT");
+          return out;
+        } catch (err) {
+          await client.query("ROLLBACK").catch(() => {
+          });
+          throw err;
+        }
+      });
+      res.status(result.duplicate ? 200 : 201).json(result);
+    } catch (err) {
+      send(res, err, "POST /sales/checkout");
+    }
+  }
+  r.post("/sales/checkout", requirePermission("sales.create"), handleOnlineCheckout);
+  r.post("/sales", requirePermission("sales.create"), handleOnlineCheckout);
   r.get("/returns", requirePermission("returns.create"), route("GET /returns", (req) => withShop(requestShop(req), (c) => {
     const status = typeof req.query.status === "string" && req.query.status ? req.query.status.toUpperCase() : void 0;
     return getAllReturns({ userId: cashierScope(req.onlineUser), status }, c);
@@ -7065,7 +7685,83 @@ function buildOnlineRouter() {
       return { ownCashierId: String(u.local_user_id).toLowerCase() };
     },
     withScope: withCloudScope,
-    send: (res, err, label) => send(res, err, label)
+    send: (res, err, label) => send(res, err, label),
+    /**
+     * GET /shifts/current — cloud-copy implementation (Part 2).
+     *
+     * For a CASHIER: queries giga_cloud.cashier_shifts using the cashier's local_user_id (the shop
+     * staff account that the online account is linked to) and the request's authorized shop_id.
+     * Returns the most recent OPEN shift, or { shift: null } when none exists.
+     * Never returns a fake / non-UUID shift id.
+     *
+     * For an Administrator / Manager (shift.view_all): /current is a cashier convenience endpoint.
+     * We return null for non-cashier roles (they use /shifts list / /shifts/:id instead).
+     */
+    getCurrentShift: async (req) => {
+      const u = req.onlineUser;
+      if (!u.local_user_id) return { shift: null };
+      const shopId = requestShop(req);
+      const cashierId = String(u.local_user_id).toLowerCase();
+      const cfg = getOnlineConfig();
+      if (cfg.error) throw new HttpError(503, `Online API not configured: ${cfg.error}`);
+      const client = await getPool(cfg).connect();
+      try {
+        const row = (await client.query(
+          `SELECT shift_id AS id, status, opened_at, opened_business_date, opening_float, cashier_id,
+                  cashier_name, shift_number, device_id, shop_id,
+                  (data->>'total_transactions')::int      AS total_transactions,
+                  (data->>'total_sales')::numeric         AS total_sales,
+                  (data->>'cash_sales')::numeric          AS cash_sales,
+                  (data->>'mpesa_sales')::numeric         AS mpesa_sales,
+                  (data->>'card_sales')::numeric          AS card_sales,
+                  (data->>'bank_sales')::numeric          AS bank_sales,
+                  (data->>'other_sales')::numeric         AS other_sales,
+                  (data->>'units_sold')::int              AS units_sold,
+                  (data->>'voided_count')::int            AS voided_count,
+                  (data->>'voided_total')::numeric        AS voided_total,
+                  (data->>'returns_count')::int           AS returns_count,
+                  (data->>'refund_total')::numeric        AS refund_total,
+                  (data->>'cash_refunds')::numeric        AS cash_refunds,
+                  (data->>'cash_expenses')::numeric       AS cash_expenses,
+                  expected_cash, actual_cash, cash_variance,
+                  closed_at, closed_business_date,
+                  data->>'close_method'       AS close_method,
+                  data->>'closing_notes'      AS closing_notes,
+                  data->>'reviewed_by_name'   AS reviewed_by_name,
+                  data->>'review_notes'       AS review_notes,
+                  reviewed_at
+             FROM giga_cloud.cashier_shifts
+            WHERE shop_id = $1 AND cashier_id = $2 AND status = 'OPEN'
+            ORDER BY opened_at DESC
+            LIMIT 1`,
+          [shopId, cashierId]
+        )).rows[0];
+        if (!row) return { shift: null };
+        const live = {
+          total_transactions: Number(row.total_transactions ?? 0),
+          total_sales: Number(row.total_sales ?? 0),
+          cash_sales: Number(row.cash_sales ?? 0),
+          mpesa_sales: Number(row.mpesa_sales ?? 0),
+          card_sales: Number(row.card_sales ?? 0),
+          bank_sales: Number(row.bank_sales ?? 0),
+          other_sales: Number(row.other_sales ?? 0),
+          units_sold: Number(row.units_sold ?? 0),
+          voided_count: Number(row.voided_count ?? 0),
+          voided_total: Number(row.voided_total ?? 0),
+          returns_count: Number(row.returns_count ?? 0),
+          refund_total: Number(row.refund_total ?? 0),
+          cash_refunds: Number(row.cash_refunds ?? 0),
+          cash_expenses: Number(row.cash_expenses ?? 0),
+          expected_cash: row.expected_cash !== null ? Number(row.expected_cash) : null,
+          mixed_transactions: 0,
+          non_cash_refunds: Number(row.refund_total ?? 0) - Number(row.cash_refunds ?? 0),
+          net_sales: Number(row.total_sales ?? 0)
+        };
+        return { shift: { ...row, live: true }, live };
+      } finally {
+        client.release();
+      }
+    }
   }));
   r.get("/business-day", requirePermission("reports.view"), async (req, res) => {
     try {

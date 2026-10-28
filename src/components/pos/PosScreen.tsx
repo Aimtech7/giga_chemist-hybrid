@@ -32,6 +32,7 @@ import { applyServerStockResult, refreshCacheAfterCommit } from '../../services/
 import { CATALOG_REFRESHED_EVENT, isCatalogForCurrentShop } from '../../services/syncEngine';
 import { CatalogStatusBanner } from '../common/CatalogStatusBanner';
 import { navigateTo } from '../../services/navigation';
+import { getServerMode } from '../../services/remoteAdmin';
 import { ShiftBar } from '../shifts/ShiftBar';
 import { getCurrentShift, type LiveTotals, type Shift, type ShiftStatusState } from '../../services/shifts';
 import type {
@@ -112,6 +113,10 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
   const [completedSale, setCompletedSale] = useState<Sale | null>(null);
   // Cashier shift state: explicit LOADING, NO_SHIFT, OPEN_SHIFT, ERROR.
   const [shiftStatus, setShiftStatus] = useState<ShiftStatusState>('LOADING');
+  const [isOnline, setIsOnline] = useState<boolean>(false);
+  useEffect(() => {
+    void getServerMode().then((m) => setIsOnline(m === 'online'));
+  }, []);
   const [shift, setShift] = useState<Shift | null>(null);
   const [shiftLive, setShiftLive] = useState<LiveTotals | null>(null);
   const [shiftErrorReason, setShiftErrorReason] = useState<string | null>(null);
@@ -651,6 +656,7 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
       <ShiftBar
         settings={settings}
         shiftStatus={shiftStatus}
+        online={isOnline}
         shift={shift}
         live={shiftLive}
         errorReason={shiftErrorReason}
@@ -711,7 +717,7 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
               <span className="hidden md:inline font-semibold">Scanner Ready</span>
             </div>
 
-            {shiftStatus === 'NO_SHIFT' && (
+            {shiftStatus === 'NO_SHIFT' && !isOnline && (
               <button
                 type="button"
                 onClick={focusOrOpenShift}
@@ -895,7 +901,7 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
           </div>
 
           <div className="flex items-center gap-2">
-            {shiftStatus === 'NO_SHIFT' && (
+            {shiftStatus === 'NO_SHIFT' && !isOnline && (
               <button
                 type="button"
                 onClick={focusOrOpenShift}
@@ -1130,12 +1136,12 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
               <div className="flex items-center gap-1.5">
                 <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
                 <span className="font-semibold text-[11px]">
-                  {shiftStatus === 'NO_SHIFT' && 'Shift not open — open shift to enable sales.'}
+                  {shiftStatus === 'NO_SHIFT' && (isOnline ? 'Shift not open — open shift from local Shop POS terminal.' : 'Shift not open — open shift to enable sales.')}
                   {shiftStatus === 'ERROR' && (shiftErrorReason || 'Shift status unavailable.')}
                   {shiftStatus === 'LOADING' && 'Checking shift status...'}
                 </span>
               </div>
-              {shiftStatus === 'NO_SHIFT' && (
+              {shiftStatus === 'NO_SHIFT' && !isOnline && (
                 <button
                   type="button"
                   onClick={focusOrOpenShift}
@@ -1172,8 +1178,8 @@ export const PosScreen: React.FC<PosScreenProps> = ({ currentUser, settings }) =
                   setIsPaymentOpen(true);
                 } else if (shiftLocked) {
                   if (shiftStatus === 'NO_SHIFT') {
-                    setWarningMessage('You must open a shift before completing sales.');
-                    focusOrOpenShift();
+                    setWarningMessage(isOnline ? 'No open shift is reported. Open shift from local Shop POS terminal.' : 'You must open a shift before completing sales.');
+                    if (!isOnline) focusOrOpenShift();
                   } else if (shiftStatus === 'ERROR') {
                     setWarningMessage(`Cannot complete sale: ${shiftErrorReason || 'Shift status unavailable'}`);
                   }
