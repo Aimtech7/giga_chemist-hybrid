@@ -146,7 +146,7 @@ export const MedicineList: React.FC<MedicineListProps> = ({ currentUser, setting
             </h1>
             {isCashierUser && (
               <span className="px-2 py-0.5 rounded bg-slate-100 border border-slate-200 text-slate-600 text-[10px] font-semibold">
-                Read-Only Formulary
+                Formulary Lookup
               </span>
             )}
           </div>
@@ -199,7 +199,7 @@ export const MedicineList: React.FC<MedicineListProps> = ({ currentUser, setting
           ) : (
             <div className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-slate-100 text-slate-500 text-xs font-medium border border-slate-200">
               <Lock className="w-3.5 h-3.5 text-slate-400" />
-              <span>Catalog Read-Only</span>
+              <span>Catalog View</span>
             </div>
           )}
         </div>
