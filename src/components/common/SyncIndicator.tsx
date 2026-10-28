@@ -37,7 +37,7 @@ const LABELS: Record<SyncIndicatorState, (n: number) => string> = {
   SERVER_UNREACHABLE: () => 'POS SERVER UNREACHABLE',
   DATABASE_UNAVAILABLE: () => 'DATABASE UNAVAILABLE',
   LOCAL: () => 'LOCAL',
-  ONLINE_READONLY: () => 'ONLINE — CLOUD COPY (READ-ONLY)',
+  ONLINE_READONLY: () => 'ONLINE · LIVE POS',
   LOCAL_SYNC_OFF: (n) => (n > 0 ? `LOCAL — CLOUD SYNC OFF (${n} queued)` : 'LOCAL — CLOUD SYNC OFF'),
   ONLINE_SYNCED: () => 'ONLINE — SYNCED',
   ONLINE_SYNCING: (n) => `ONLINE — SYNCING (${n})`,
@@ -51,7 +51,7 @@ const DOT: Record<SyncIndicatorState, string> = {
   SERVER_UNREACHABLE: 'bg-rose-500',
   DATABASE_UNAVAILABLE: 'bg-rose-500',
   LOCAL: 'bg-slate-400',
-  ONLINE_READONLY: 'bg-sky-400',
+  ONLINE_READONLY: 'bg-emerald-400',
   LOCAL_SYNC_OFF: 'bg-slate-400',
   ONLINE_SYNCED: 'bg-emerald-500',
   ONLINE_SYNCING: 'bg-teal-400 animate-pulse',
@@ -115,7 +115,7 @@ export const SyncIndicator: React.FC<SyncIndicatorProps> = ({ currentUser, onRef
   const state = snap?.state || 'UNKNOWN';
   const pending = snap?.pending || 0;
   // Online Administrators can queue remote changes (applied by the shop computer); the cloud copy itself stays read-only.
-  const label = state === 'ONLINE_READONLY' && admin ? 'ONLINE — CLOUD COPY · REMOTE ADMIN ENABLED' : LABELS[state](pending);
+  const label = state === 'ONLINE_READONLY' && admin ? 'ONLINE · LIVE POS · ADMIN' : LABELS[state](pending);
   const s = snap?.status;
   const lines = connectivityLines(snap);
   const title = [
