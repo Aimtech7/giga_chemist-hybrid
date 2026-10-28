@@ -9,6 +9,8 @@ import {
   EyeOff,
   Wifi,
   WifiOff,
+  Cloud,
+  CloudOff,
 } from 'lucide-react';
 import { loginWithPinOrEmail } from '../../services/auth';
 import { verifyServerReachability } from '../../services/network';
@@ -31,6 +33,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onSuccess, onBackToHome })
   // Same screen for the shop server and the online app. The PIN is a shop-only quick login: the
   // online app accepts the account PASSWORD only (same password as at the shop).
   const [onlineApp, setOnlineApp] = useState(false);
+  const isOnlineDeployment = onlineApp || (typeof window !== 'undefined' && window.location.hostname.includes('vercel.app'));
   useEffect(() => {
     void getServerMode().then((m) => setOnlineApp(m === 'online'));
   }, []);
@@ -84,14 +87,14 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onSuccess, onBackToHome })
           {isOnline ? (
             <>
               <span className="w-2 h-2 rounded-full bg-emerald-500" />
-              <Wifi className="w-3.5 h-3.5 text-slate-600" />
-              <span>POS server connected</span>
+              {isOnlineDeployment ? <Cloud className="w-3.5 h-3.5 text-emerald-600" /> : <Wifi className="w-3.5 h-3.5 text-slate-600" />}
+              <span>{isOnlineDeployment ? 'Cloud POS connected' : 'POS server connected'}</span>
             </>
           ) : (
             <>
-              <span className="w-2 h-2 rounded-full bg-amber-500" />
-              <WifiOff className="w-3.5 h-3.5 text-amber-600" />
-              <span>POS server unreachable</span>
+              <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
+              {isOnlineDeployment ? <CloudOff className="w-3.5 h-3.5 text-amber-600" /> : <WifiOff className="w-3.5 h-3.5 text-amber-600" />}
+              <span>{isOnlineDeployment ? 'Connecting to Cloud POS…' : 'POS server unreachable'}</span>
             </>
           )}
         </div>

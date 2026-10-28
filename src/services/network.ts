@@ -10,23 +10,34 @@ let currentState: NetworkState = 'ONLINE_SYNCED';
 let currentPendingCount = 0;
 
 /**
- * Is the LOCAL POS server reachable? Deliberately ignores navigator.onLine: losing the internet
- * does not stop this browser from reaching the shop's server (same PC or LAN).
+ * Is the API server reachable? Handles both local POS server and cloud serverless deployments.
+ * Uses a generous 6-second timeout with single retry to prevent false alarms on cold starts or
+ * high-latency mobile networks.
  */
 export async function verifyServerReachability(): Promise<boolean> {
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 2500);
-    const res = await fetch(apiUrl('/api/health'), {
-      method: 'GET',
-      signal: controller.signal,
-      headers: { 'Cache-Control': 'no-cache' },
-    });
-    clearTimeout(timeout);
-    return res.ok;
-  } catch (e) {
-    return false;
-  }
+  const tryPing = async (timeoutMs: number): Promise<boolean> => {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
+      const res = await fetch(apiUrl('/api/health'), {
+        method: 'GET',
+        signal: controller.signal,
+        headers: { 'Cache-Control': 'no-cache' },
+      });
+      clearTimeout(timeout);
+      return res.ok;
+    } catch {
+      return false;
+    }
+  };
+
+  // Attempt with 6-second timeout (sufficient for cloud serverless cold-starts & international latency)
+  const firstTry = await tryPing(6000);
+  if (firstTry) return true;
+
+  // Retry once with 4-second timeout if first attempt timed out or encountered transient jitter
+  await new Promise((r) => setTimeout(r, 400));
+  return tryPing(4000);
 }
 
 export async function refreshNetworkStatus(): Promise<{ state: NetworkState; pendingCount: number }> {
