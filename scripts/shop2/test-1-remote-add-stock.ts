@@ -289,7 +289,7 @@ async function main() {
   console.log(`  Final Cloud Batch Quantity:  ${cloudStockAfter} (Expected: 15)`);
   console.log(`  Local Fingerprint:           ${parity.local_fingerprint}`);
   console.log(`  Cloud Fingerprint:           ${parity.cloud_fingerprint}`);
-  console.log(`  Parity Status:               ${parity.status} (Equal: ${parity.fingerprints_equal})`);
+  console.log(`  Parity Status:               ${parity.parity} (In Sync: ${parity.in_sync})`);
 
   // --------------------------------------------------------------------------
   // STEP 9: VERIFY SHOP 1 IS COMPLETELY UNCHANGED

@@ -12,7 +12,7 @@
 
 ## Fast Automated Installation
 On the target Windows server (Shop 2):
-1. Copy `deployment/shop2-ready/GIGA-CHEMIST-POS` to `C:\GIGA-CHEMIST-POS`.
+1. Copy `deployment/shop2-ready/GIGA-CHEMIST-POS` to `C:\GIGA-CHEMIST-POS-2`.
 2. Copy `deployment/shop2` alongside it.
 3. Open PowerShell as Administrator and run:
 ```powershell

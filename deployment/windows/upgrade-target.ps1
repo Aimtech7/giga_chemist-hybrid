@@ -32,12 +32,37 @@
   powershell -ExecutionPolicy Bypass -File deployment\windows\upgrade-target.ps1
 #>
 param(
-    [string]$ProjectRoot = "C:\GIGA-CHEMIST-POS",
-    [string]$ExpectedDatabase = "giga_chemist",
+    [string]$ProjectRoot = "",
+    [string]$ExpectedDatabase = "",
     [int]$Port = 3000,
     [switch]$ValidateOnly,
     [switch]$SkipInstall
 )
+
+if (-not $ProjectRoot) {
+    if ($PSScriptRoot) {
+        $candidate = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+        if (Test-Path (Join-Path $candidate "server.ts")) { $ProjectRoot = $candidate }
+    }
+    if (-not $ProjectRoot) {
+        if (Test-Path "C:\GIGA-CHEMIST-POS-2\server.ts") { $ProjectRoot = "C:\GIGA-CHEMIST-POS-2" }
+        elseif (Test-Path "C:\GIGA-CHEMIST-POS\server.ts") { $ProjectRoot = "C:\GIGA-CHEMIST-POS" }
+        else { $ProjectRoot = (Get-Location).Path }
+    }
+}
+
+if (-not $ExpectedDatabase) {
+    $envFile = Join-Path $ProjectRoot ".env"
+    if (Test-Path $envFile) {
+        foreach ($l in Get-Content $envFile) {
+            if ($l -match "^\s*DB_NAME\s*=\s*(.*)\s*$") {
+                $ExpectedDatabase = $Matches[1].Trim().Trim('"').Trim("'")
+                break
+            }
+        }
+    }
+    if (-not $ExpectedDatabase) { $ExpectedDatabase = "giga_chemist" }
+}
 
 $ErrorActionPreference = "Stop"
 $TaskName = "GigaChemistPOS_Service"

@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { db, getSettings } from './db/dexie';
+import { db, getSettings, DEFAULT_SETTINGS } from './db/dexie';
 import { getCachedUser, setCachedUser, logoutUser, verifySession } from './services/auth';
 import { SESSION_EXPIRED_EVENT } from './services/session';
 import { getOrRegisterDevice } from './services/device';
@@ -173,38 +173,72 @@ export default function App() {
   };
 
   useEffect(() => {
+    let isMounted = true;
     async function init() {
       try {
         // Register device ID
-        await getOrRegisterDevice();
+        await getOrRegisterDevice().catch((e) => console.warn('[App] Device reg error:', e));
 
-        // Load settings
-        const loadedSettings = await getSettings();
-        setSettings(loadedSettings);
+        // Load settings with fallback
+        let loadedSettings: PharmacySettings | null = null;
+        try {
+          loadedSettings = await getSettings();
+        } catch (e) {
+          console.warn('[App] Failed to load settings:', e);
+        }
+        if (isMounted) {
+          setSettings(loadedSettings || DEFAULT_SETTINGS);
+        }
 
         // Restore the session only if the server still accepts its token (role/active from the DB).
-        const verified = await verifySession();
-        if (verified) {
-          setCurrentUser(verified);
-          if (isCashier(verified)) {
-            setCurrentModule('pos');
+        try {
+          const verified = await verifySession();
+          if (verified && isMounted) {
+            setCurrentUser(verified);
+            if (isCashier(verified)) {
+              setCurrentModule('pos');
+            }
+            syncFromLocalApiToDexie().catch((e) => console.warn('[App] Local sync failed:', e));
+          } else if (isMounted) {
+            setCurrentUser(null);
           }
-          syncFromLocalApiToDexie().catch((e) => console.warn('[App] Local sync failed:', e));
-        } else {
-          setCurrentUser(null);
+        } catch (e) {
+          console.warn('[App] Session verification error:', e);
         }
 
         // Initialize network and sync monitoring
-        await refreshNetworkStatus();
+        try {
+          await refreshNetworkStatus();
+        } catch (e) {
+          console.warn('[App] Network refresh error:', e);
+        }
 
-        setIsInitialized(true);
+        if (isMounted) {
+          setIsInitialized(true);
+        }
       } catch (err) {
         console.error('Initialization error:', err);
-        setIsInitialized(true);
+        if (isMounted) {
+          setSettings((prev) => prev || DEFAULT_SETTINGS);
+          setIsInitialized(true);
+        }
       }
     }
 
+    // Safety timeout: Never hang on bootstrap screen for more than 3 seconds
+    const timeout = setTimeout(() => {
+      if (isMounted) {
+        setSettings((prev) => prev || DEFAULT_SETTINGS);
+        setIsInitialized(true);
+      }
+    }, 3000);
+
     init();
+
+    return () => {
+      isMounted = false;
+      clearTimeout(timeout);
+    };
   }, []);
 
   const handleLogout = async () => {

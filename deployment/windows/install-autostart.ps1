@@ -6,11 +6,17 @@
   Also configures Windows Firewall to permit LAN counter terminals on port 3000.
 #>
 
+param(
+    [string]$ProjectRoot = ""
+)
+
 # 1. Require Administrator Privileges
 $IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $IsAdmin) {
     Write-Warning "Administrator privileges required. Relaunching with elevation..."
-    Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    $argList = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    if ($ProjectRoot) { $argList += " -ProjectRoot `"$ProjectRoot`"" }
+    Start-Process powershell.exe -Verb RunAs -ArgumentList $argList
     exit
 }
 
@@ -21,8 +27,17 @@ Write-Host "====================================================================
 Write-Host ""
 
 # 2. Resolve Root Directory
-$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$ProjectRoot = (Resolve-Path "$ScriptDir\..\..").Path
+if (-not $ProjectRoot) {
+    if ($PSScriptRoot) {
+        $candidate = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+        if (Test-Path (Join-Path $candidate "server.ts")) { $ProjectRoot = $candidate }
+    }
+    if (-not $ProjectRoot) {
+        if (Test-Path "C:\GIGA-CHEMIST-POS-2\server.ts") { $ProjectRoot = "C:\GIGA-CHEMIST-POS-2" }
+        elseif (Test-Path "C:\GIGA-CHEMIST-POS\server.ts") { $ProjectRoot = "C:\GIGA-CHEMIST-POS" }
+        else { $ProjectRoot = (Get-Location).Path }
+    }
+}
 $RunnerScript = Join-Path $ProjectRoot "deployment\windows\service-runner.ps1"
 
 if (-not (Test-Path $RunnerScript)) {

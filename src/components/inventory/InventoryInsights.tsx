@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Lightbulb, Loader2, RefreshCw, Search, ShoppingCart } from 'lucide-react';
 import { apiFetch } from '../../services/http';
 import { queueRemoteCommand } from '../../services/remoteAdmin';
+import { generateUUID } from '../../utils/uuid';
 import type { User } from '../../types';
 
 /**
@@ -174,7 +175,7 @@ const ReorderTable: React.FC<{ data: any; isAdmin: boolean; online: boolean; pic
       const items = chosen.map((r: any) => ({ medicine_id: r.medicine_id, quantity: picked[r.medicine_id], purchase_price: r.unit_cost ?? 0, batch_number: `REORDER-${day}` }));
       const notes = 'Created from reorder suggestions (update batch numbers / expiry before receiving).';
       if (online) {
-        const r: any = await queueRemoteCommand('purchase-create', { purchase_id: crypto.randomUUID(), supplier_id: supplier, items, notes });
+        const r: any = await queueRemoteCommand('purchase-create', { purchase_id: generateUUID(), supplier_id: supplier, items, notes });
         setMsg({ ok: true, text: `Purchase draft queued for the shop computer (${r.status}).` });
       } else {
         const r: any = await apiFetch('/api/purchases/drafts', { body: { supplier_id: supplier, items, notes } });

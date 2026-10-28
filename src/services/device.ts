@@ -17,21 +17,31 @@ function readStoredDeviceId(): string {
   }
 }
 
+import { generateUUID } from '../utils/uuid';
+
+function generateDeviceId(): string {
+  return `POS-${generateUUID()}`;
+}
+
 export async function getOrRegisterDevice(): Promise<DeviceInfo> {
   let deviceId = readStoredDeviceId();
   if (!deviceId) {
-    deviceId = `POS-${crypto.randomUUID()}`;
+    deviceId = generateDeviceId();
     try {
       localStorage.setItem(DEVICE_STORAGE_KEY, deviceId);
     } catch {}
   }
 
   const now = new Date().toISOString();
-  const existing = await db.devices.get(deviceId);
-  if (existing) {
-    existing.last_seen = now;
-    await db.devices.put(existing);
-    return existing;
+  try {
+    const existing = await db.devices.get(deviceId);
+    if (existing) {
+      existing.last_seen = now;
+      await db.devices.put(existing).catch(() => {});
+      return existing;
+    }
+  } catch (e) {
+    console.warn('[Device] IndexedDB lookup error, using memory device:', e);
   }
 
   const userAgent = typeof navigator !== 'undefined' ? navigator.userAgent.toLowerCase() : '';
@@ -47,7 +57,9 @@ export async function getOrRegisterDevice(): Promise<DeviceInfo> {
     first_registered: now,
     last_seen: now,
   };
-  await db.devices.put(device);
+  try {
+    await db.devices.put(device);
+  } catch {}
   return device;
 }
 

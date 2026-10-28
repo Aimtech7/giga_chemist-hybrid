@@ -12,7 +12,24 @@ if (-not $IsAdmin) {
     exit
 }
 
-$TaskName = "GigaChemistPOS_Service"
+param(
+    [string]$ProjectRoot = ""
+)
+
+if (-not $ProjectRoot) {
+    if ($PSScriptRoot) {
+        $candidate = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+        if (Test-Path (Join-Path $candidate "server.ts")) { $ProjectRoot = $candidate }
+    }
+    if (-not $ProjectRoot) {
+        if (Test-Path "C:\GIGA-CHEMIST-POS-2\server.ts") { $ProjectRoot = "C:\GIGA-CHEMIST-POS-2" }
+        elseif (Test-Path "C:\GIGA-CHEMIST-POS\server.ts") { $ProjectRoot = "C:\GIGA-CHEMIST-POS" }
+        else { $ProjectRoot = (Get-Location).Path }
+    }
+}
+
+$PrimaryTask = "GIGA CHEMIST POS Server"
+$LegacyTask = "GigaChemistPOS_Service"
 
 Write-Host "======================================================================" -ForegroundColor Cyan
 Write-Host "   GIGA CHEMIST — RESTARTING POS SERVICE" -ForegroundColor Green
@@ -21,7 +38,8 @@ Write-Host ""
 
 # 1. Stop Task & Process
 Write-Host "[1/3] Stopping current service instance..." -ForegroundColor Yellow
-Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+Stop-ScheduledTask -TaskName $PrimaryTask -ErrorAction SilentlyContinue
+Stop-ScheduledTask -TaskName $LegacyTask -ErrorAction SilentlyContinue
 
 $Conn = Get-NetTCPConnection -LocalPort 3000 -State Listen -ErrorAction SilentlyContinue
 if ($Conn) {
@@ -32,14 +50,19 @@ Start-Sleep -Seconds 2
 
 # 2. Start Task
 Write-Host "[2/3] Starting GIGA CHEMIST Scheduled Task..." -ForegroundColor Yellow
-$TaskExists = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-if ($TaskExists) {
-    Start-ScheduledTask -TaskName $TaskName
+$task = Get-ScheduledTask -TaskName $PrimaryTask -ErrorAction SilentlyContinue
+if (-not $task) {
+    $task = Get-ScheduledTask -TaskName $LegacyTask -ErrorAction SilentlyContinue
+}
+if ($task) {
+    Start-ScheduledTask -TaskName $task.TaskName
 } else {
-    Write-Warning "Scheduled task '$TaskName' not found. Starting manual runner..."
-    $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-    $RunnerScript = Join-Path $ScriptDir "service-runner.ps1"
-    Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$RunnerScript`"" -WindowStyle Hidden
+    Write-Warning "Scheduled task not found. Starting manual runner from $ProjectRoot..."
+    $RunnerScript = Join-Path $ProjectRoot "deployment\windows\giga-service-runner.ps1"
+    if (-not (Test-Path $RunnerScript)) {
+        $RunnerScript = Join-Path $ProjectRoot "deployment\windows\service-runner.ps1"
+    }
+    Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$RunnerScript`" -ProjectRoot `"$ProjectRoot`"" -WindowStyle Hidden
 }
 
 # 3. Verify Health

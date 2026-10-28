@@ -3,7 +3,19 @@
   Shows the updater task and the last update status (logs\runtime\update-state.json, logs\update.log).
   Exit 0 = task installed and last check succeeded.
 #>
-param([string]$ProjectRoot = "C:\GIGA-CHEMIST-POS")
+param([string]$ProjectRoot = "")
+
+if (-not $ProjectRoot) {
+    if ($PSScriptRoot) {
+        $candidate = (Resolve-Path (Join-Path $PSScriptRoot "..\..\..")).Path
+        if (Test-Path (Join-Path $candidate "server.ts")) { $ProjectRoot = $candidate }
+    }
+    if (-not $ProjectRoot) {
+        if (Test-Path "C:\GIGA-CHEMIST-POS-2\server.ts") { $ProjectRoot = "C:\GIGA-CHEMIST-POS-2" }
+        elseif (Test-Path "C:\GIGA-CHEMIST-POS\server.ts") { $ProjectRoot = "C:\GIGA-CHEMIST-POS" }
+        else { $ProjectRoot = (Get-Location).Path }
+    }
+}
 $TaskName = "GIGA CHEMIST Updater"
 $ok = $true
 $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue

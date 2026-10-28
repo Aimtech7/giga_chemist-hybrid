@@ -84,6 +84,14 @@ export function getOnlineAccount(): OnlineAccount | null {
       username: (user as any).username || null,
     };
   }
+  if (user && (user as any).shop_id) {
+    return {
+      type: 'SHOP_USER',
+      shop_id: String((user as any).shop_id).toLowerCase(),
+      local_user_id: (user as any).local_user_id || null,
+      username: (user as any).username || null,
+    };
+  }
   return null;
 }
 
@@ -120,6 +128,7 @@ export function getSelectedShop(): ShopRef | null {
 }
 /** Header value for API requests (null = the server's default shop / the account's own shop). */
 export function selectedShopId(): string | null {
+  if (!isGlobalAdminAccount()) return null;
   return getSelectedShop()?.shop_id ?? null;
 }
 export function setSelectedShop(shop: ShopRef | null): void {

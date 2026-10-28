@@ -12,10 +12,22 @@
   second one; it keeps watching and takes over when that one stops.
 #>
 param(
-    [string]$ProjectRoot = "C:\GIGA-CHEMIST-POS",
+    [string]$ProjectRoot = "",
     [string]$NodeExe = "",
     [int]$Port = 3000
 )
+
+if (-not $ProjectRoot) {
+    if ($PSScriptRoot) {
+        $candidate = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+        if (Test-Path (Join-Path $candidate "server.ts")) { $ProjectRoot = $candidate }
+    }
+    if (-not $ProjectRoot) {
+        if (Test-Path "C:\GIGA-CHEMIST-POS-2\server.ts") { $ProjectRoot = "C:\GIGA-CHEMIST-POS-2" }
+        elseif (Test-Path "C:\GIGA-CHEMIST-POS\server.ts") { $ProjectRoot = "C:\GIGA-CHEMIST-POS" }
+        else { $ProjectRoot = (Get-Location).Path }
+    }
+}
 
 $ErrorActionPreference = "Continue"
 Set-Location -Path $ProjectRoot

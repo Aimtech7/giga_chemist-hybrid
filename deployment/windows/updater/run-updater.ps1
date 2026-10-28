@@ -7,10 +7,22 @@
 param(
     [ValidateSet("check", "auto", "install", "rollback")]
     [string]$Mode = "check",
-    [string]$ProjectRoot = "C:\GIGA-CHEMIST-POS",
+    [string]$ProjectRoot = "",
     [string]$NodeExe = "",
     [string]$Commit = ""
 )
+
+if (-not $ProjectRoot) {
+    if ($PSScriptRoot) {
+        $candidate = (Resolve-Path (Join-Path $PSScriptRoot "..\..\..")).Path
+        if (Test-Path (Join-Path $candidate "server.ts")) { $ProjectRoot = $candidate }
+    }
+    if (-not $ProjectRoot) {
+        if (Test-Path "C:\GIGA-CHEMIST-POS-2\server.ts") { $ProjectRoot = "C:\GIGA-CHEMIST-POS-2" }
+        elseif (Test-Path "C:\GIGA-CHEMIST-POS\server.ts") { $ProjectRoot = "C:\GIGA-CHEMIST-POS" }
+        else { $ProjectRoot = (Get-Location).Path }
+    }
+}
 
 $runtime = Join-Path $ProjectRoot "logs\runtime"
 if (-not (Test-Path $runtime)) { New-Item -ItemType Directory -Path $runtime -Force | Out-Null }

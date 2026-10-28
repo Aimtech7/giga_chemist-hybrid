@@ -4,7 +4,19 @@
   boot or watchdog run (within 5 minutes); with -Disable it stays stopped until start-giga.ps1.
   Run as administrator. Data is not touched.
 #>
-param([string]$ProjectRoot = "C:\GIGA-CHEMIST-POS", [int]$Port = 3000, [switch]$Disable)
+param([string]$ProjectRoot = "", [int]$Port = 3000, [switch]$Disable)
+
+if (-not $ProjectRoot) {
+    if ($PSScriptRoot) {
+        $candidate = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+        if (Test-Path (Join-Path $candidate "server.ts")) { $ProjectRoot = $candidate }
+    }
+    if (-not $ProjectRoot) {
+        if (Test-Path "C:\GIGA-CHEMIST-POS-2\server.ts") { $ProjectRoot = "C:\GIGA-CHEMIST-POS-2" }
+        elseif (Test-Path "C:\GIGA-CHEMIST-POS\server.ts") { $ProjectRoot = "C:\GIGA-CHEMIST-POS" }
+        else { $ProjectRoot = (Get-Location).Path }
+    }
+}
 $TaskName = "GIGA CHEMIST POS Server"
 if ($Disable) { Disable-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue | Out-Null; Write-Host "Task disabled (start-giga.ps1 re-enables it)." }
 Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue

@@ -102,16 +102,25 @@ export const DEFAULT_SETTINGS: PharmacySettings = {
 };
 
 export async function getSettings(): Promise<PharmacySettings> {
-  const record = await db.settings.get('pharmacy_settings');
-  if (record && record.value) {
-    return record.value;
+  try {
+    const record = await db.settings.get('pharmacy_settings');
+    if (record && record.value) {
+      return record.value;
+    }
+    await db.settings.put({ key: 'pharmacy_settings', value: DEFAULT_SETTINGS }).catch(() => {});
+    return DEFAULT_SETTINGS;
+  } catch (err) {
+    console.warn('[Dexie] Failed to get settings from IndexedDB, falling back to DEFAULT_SETTINGS:', err);
+    return DEFAULT_SETTINGS;
   }
-  await db.settings.put({ key: 'pharmacy_settings', value: DEFAULT_SETTINGS });
-  return DEFAULT_SETTINGS;
 }
 
 export async function saveSettings(settings: PharmacySettings): Promise<void> {
-  await db.settings.put({ key: 'pharmacy_settings', value: settings });
+  try {
+    await db.settings.put({ key: 'pharmacy_settings', value: settings });
+  } catch (err) {
+    console.warn('[Dexie] Failed to save settings to IndexedDB:', err);
+  }
 }
 
 export { getDeviceId } from '../services/device';

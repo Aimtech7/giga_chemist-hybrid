@@ -3,7 +3,19 @@
   Starts the GIGA CHEMIST server through its scheduled task (same as at boot) and waits for health.
   Use instead of "npm run dev". Run as administrator.
 #>
-param([string]$ProjectRoot = "C:\GIGA-CHEMIST-POS", [int]$Port = 3000)
+param([string]$ProjectRoot = "", [int]$Port = 3000)
+
+if (-not $ProjectRoot) {
+    if ($PSScriptRoot) {
+        $candidate = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+        if (Test-Path (Join-Path $candidate "server.ts")) { $ProjectRoot = $candidate }
+    }
+    if (-not $ProjectRoot) {
+        if (Test-Path "C:\GIGA-CHEMIST-POS-2\server.ts") { $ProjectRoot = "C:\GIGA-CHEMIST-POS-2" }
+        elseif (Test-Path "C:\GIGA-CHEMIST-POS\server.ts") { $ProjectRoot = "C:\GIGA-CHEMIST-POS" }
+        else { $ProjectRoot = (Get-Location).Path }
+    }
+}
 $TaskName = "GIGA CHEMIST POS Server"
 $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if (-not $task) { Write-Host "Task '$TaskName' is not installed. Run install-giga-service.ps1 first." -ForegroundColor Red; exit 1 }

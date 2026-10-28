@@ -3,7 +3,7 @@
 # =====================================================================
 param(
     [string]$PostgresPassword = "Aim",
-    [string]$InstallDir = "C:\GIGA-CHEMIST-POS"
+    [string]$InstallDir = "C:\GIGA-CHEMIST-POS-2"
 )
 
 $ErrorActionPreference = "Stop"

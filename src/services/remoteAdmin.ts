@@ -123,19 +123,14 @@ export interface RemoteStatus {
   last_successful_command: { command_id: string; command_type: string; applied_at: string } | null;
 }
 
+import { generateUUID } from '../utils/uuid';
+
 export const STOCK_REMOVE_REASONS = ['Damaged', 'Expired', 'Lost', 'Physical stock correction', 'Other'] as const;
 
 export const isFinal = (s: CommandStatus) => s === 'APPLIED' || s === 'REJECTED';
 
 function newRequestId(): string {
-  try {
-    return crypto.randomUUID();
-  } catch {
-    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
-      const r = (Math.random() * 16) | 0;
-      return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
-    });
-  }
+  return generateUUID();
 }
 
 /**

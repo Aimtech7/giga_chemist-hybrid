@@ -107,7 +107,7 @@ async function main() {
   console.log(`initial purchase price: 50.00`);
   console.log(`Cloud medicine name:    ${cloudMed?.name}`);
   console.log(`Cloud batch quantity:   ${cloudStock?.last_reported_quantity}`);
-  console.log(`Parity Status:          ${parity.status} (Equal: ${parity.fingerprints_equal})`);
+  console.log(`Parity Status:          ${parity.parity} (In Sync: ${parity.in_sync})`);
 
   await localPool.end();
   await cloudClient.end();

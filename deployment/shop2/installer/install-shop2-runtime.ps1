@@ -2,7 +2,7 @@
 # GIGA CHEMIST SHOP 2 - RUNTIME & APPLICATION INSTALLER
 # =====================================================================
 param(
-    [string]$InstallDir = "C:\GIGA-CHEMIST-POS"
+    [string]$InstallDir = "C:\GIGA-CHEMIST-POS-2"
 )
 
 $ErrorActionPreference = "Stop"

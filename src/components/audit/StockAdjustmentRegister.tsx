@@ -355,7 +355,7 @@ export const StockAdjustmentRegister: React.FC = () => {
                     {new Date(rec.date_applied || rec.date_submitted).toLocaleString()}
                   </td>
                   <td className="px-3 py-2 font-sans font-medium text-slate-900 whitespace-nowrap">
-                    {rec.shop_name || 'Shop 1'}
+                    {rec.shop_name || 'Shop'}
                   </td>
                   <td className="px-3 py-2 font-sans">
                     <div className="font-semibold text-slate-900">{rec.medicine_name}</div>

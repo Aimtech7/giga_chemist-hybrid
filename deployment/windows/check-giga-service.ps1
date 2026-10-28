@@ -8,9 +8,21 @@
     powershell -ExecutionPolicy Bypass -File C:\GIGA-CHEMIST-POS\deployment\windows\check-giga-service.ps1
 #>
 param(
-    [string]$ProjectRoot = "C:\GIGA-CHEMIST-POS",
+    [string]$ProjectRoot = "",
     [int]$Port = 3000
 )
+
+if (-not $ProjectRoot) {
+    if ($PSScriptRoot) {
+        $candidate = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+        if (Test-Path (Join-Path $candidate "server.ts")) { $ProjectRoot = $candidate }
+    }
+    if (-not $ProjectRoot) {
+        if (Test-Path "C:\GIGA-CHEMIST-POS-2\server.ts") { $ProjectRoot = "C:\GIGA-CHEMIST-POS-2" }
+        elseif (Test-Path "C:\GIGA-CHEMIST-POS\server.ts") { $ProjectRoot = "C:\GIGA-CHEMIST-POS" }
+        else { $ProjectRoot = (Get-Location).Path }
+    }
+}
 
 $TaskName = "GIGA CHEMIST POS Server"
 $problems = 0
@@ -24,7 +36,8 @@ Write-Host "GIGA CHEMIST - service check ($(Get-Date -Format 'yyyy-MM-dd HH:mm:s
 $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if (-not $task) {
     Bad "Scheduled task '$TaskName' is not installed (run install-giga-service.ps1 as administrator)."
-} else {
+}
+else {
     $info = Get-ScheduledTaskInfo -TaskName $TaskName
     if ($task.State -eq "Disabled") { Bad "Task is DISABLED." } else { Ok "Task '$TaskName' state: $($task.State)" }
     if ($task.Principal.UserId -notmatch "SYSTEM") { Warn "Task runs as $($task.Principal.UserId) (expected SYSTEM)." } else { Ok "Runs as SYSTEM (no logon needed)" }
@@ -55,7 +68,8 @@ try {
     Ok "Server answers on port $Port (mode: $($h.app_mode), version $($h.version))"
     if ($h.database.connected) { Ok "Local PostgreSQL connected" } else { Bad "Server is up but the database is NOT connected: $($h.database.error)" }
     if ($h.app_mode -ne "hybrid") { Bad "Server runs in '$($h.app_mode)' mode: cloud sync and remote admin need APP_MODE=hybrid." }
-} catch {
+}
+catch {
     Bad "No answer from http://127.0.0.1:$Port/api/health ($($_.Exception.Message))."
 }
 $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -78,7 +92,8 @@ if (Test-Path $envFile) {
     foreach ($k in @("SUPABASE_URL", "SYNC_SHOP_TOKEN", "SHOP_ID")) {
         if ((& $get $k).Trim()) { Ok ".env $k is set (value not shown)" } else { Bad ".env $k is empty" }
     }
-} else {
+}
+else {
     Bad ".env not found in $ProjectRoot"
 }
 
@@ -88,11 +103,12 @@ if ($pg) {
     $wide = $pg | Where-Object { $_.LocalAddress -in @("0.0.0.0", "::") }
     if ($wide) { Warn "PostgreSQL listens on all interfaces ($($wide.LocalAddress -join ', ')). Prefer listen_addresses = 'localhost' in postgresql.conf." }
     else { Ok "PostgreSQL listens on $((($pg.LocalAddress) | Select-Object -Unique) -join ', ') only" }
-} else {
+}
+else {
     Bad "Nothing listens on PostgreSQL port 5432."
 }
 $pgRules = Get-NetFirewallPortFilter -Protocol TCP -ErrorAction SilentlyContinue | Where-Object { $_.LocalPort -eq "5432" } |
-    Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object { $_.Enabled -eq "True" -and $_.Direction -eq "Inbound" -and $_.Action -eq "Allow" }
+Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object { $_.Enabled -eq "True" -and $_.Direction -eq "Inbound" -and $_.Action -eq "Allow" }
 if ($pgRules) { Warn "Firewall allows inbound 5432: $($pgRules.DisplayName -join ', ')" } else { Ok "No inbound firewall rule opens PostgreSQL" }
 
 # 5. Recent logs
