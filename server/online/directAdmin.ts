@@ -1,4 +1,5 @@
 import type pg from 'pg';
+import { HttpError } from '../db/client';
 import type { CommandType } from '../sync/commandSchema';
 
 /**
@@ -46,6 +47,34 @@ export async function applyCommandDirect(
   type: CommandType,
   payload: Record<string, any>,
   userId: string,
+): Promise<{ applied: true; result?: Record<string, unknown> }> {
+  // The API supplies a transaction so the business change and audit commit together.
+  return withCloud(async (client) => {
+    const bound = Object.create(client) as pg.PoolClient;
+    bound.query = (async (sql: string, values: any[] = []) => {
+      const result = await client.query(sql, values);
+      if (/INSERT INTO giga_cloud\.stock_levels/.test(sql)) {
+        // Advance the medicine version and protect stock metadata from older sync events.
+        const seq = directSeq();
+        await client.query(
+          `UPDATE giga_cloud.medicines SET stock_version = stock_version + 1,
+             source_seq = GREATEST(source_seq, $3::bigint), updated_at = now()
+           WHERE shop_id = $1 AND medicine_id = $2`, [shopId, values[1], seq],
+        );
+        await client.query(
+          `UPDATE giga_cloud.medicine_batches SET source_seq = GREATEST(source_seq, $3::bigint), updated_at = now()
+           WHERE shop_id = $1 AND batch_id = $2`, [shopId, values[2], seq],
+        );
+      }
+      return result;
+    }) as typeof client.query;
+    return dispatchDirect(async (fn) => fn(bound), withShopId, shopId, type, payload, userId);
+  });
+}
+
+async function dispatchDirect(
+  withCloud: WithCloud, withShopId: WithShopId, shopId: string,
+  type: CommandType, payload: Record<string, any>, userId: string,
 ): Promise<{ applied: true; result?: Record<string, unknown> }> {
   const seq = directSeq();
 
@@ -368,7 +397,7 @@ export async function applyCommandDirect(
         );
         const currentStock = Number(stockRow.rows[0]?.current_stock ?? 0);
         if (currentStock > 0) {
-          throw new Error(`Cannot delete medicine: it still has ${currentStock} units of stock.`);
+          throw new HttpError(409, `Cannot delete medicine: it still has ${currentStock} units of stock.`);
         }
         await c.query(`DELETE FROM giga_cloud.stock_levels WHERE shop_id = $1 AND medicine_id = $2`, [shopId, medicine_id]);
         await c.query(`DELETE FROM giga_cloud.medicine_batches WHERE shop_id = $1 AND medicine_id = $2`, [shopId, medicine_id]);
@@ -673,6 +702,10 @@ export async function applyCommandDirect(
       sets.push(`source_seq = $${params.length}`);
 
       await withCloud(async (c) => {
+        const purchase = (await c.query('SELECT data FROM giga_cloud.purchases WHERE shop_id = $1 AND purchase_id = $2 FOR UPDATE', [shopId, purchase_id])).rows[0];
+        if (!purchase) throw new HttpError(404, 'Purchase not found.');
+        if (purchase.data?.status !== 'pending') throw new HttpError(409, 'Only pending purchases can be edited.');
+
         await c.query(
           `UPDATE giga_cloud.purchases SET ${sets.join(', ')} WHERE shop_id = $1 AND purchase_id = $2`,
           params,
@@ -699,15 +732,20 @@ export async function applyCommandDirect(
     case 'PURCHASE_RECEIVE': {
       const { purchase_id, invoice_number, payment_status, supplier_id, items, notes } = payload;
       await withCloud(async (c) => {
-        let receiveItems = items;
-        if (!receiveItems) {
-          // Receiving an existing pending purchase — load items from data
-          const pur = (await c.query(
-            `SELECT data FROM giga_cloud.purchases WHERE shop_id = $1 AND purchase_id = $2`,
-            [shopId, purchase_id],
-          )).rows[0];
-          receiveItems = pur?.data?.items;
+        let pur = (await c.query(
+          `SELECT data FROM giga_cloud.purchases WHERE shop_id = $1 AND purchase_id = $2 FOR UPDATE`,
+          [shopId, purchase_id],
+        )).rows[0];
+        if (!pur && items) {
+          await dispatchDirect(withCloud, withShopId, shopId, 'PURCHASE_CREATE', payload, userId);
+          pur = { data: { status: 'pending', items } };
         }
+        if (!pur) throw new HttpError(404, 'Purchase not found.');
+        if (pur.data?.status !== 'pending') throw new HttpError(409, 'Only pending purchases can be received.');
+        const receiveItems = items ?? (await c.query(
+          `SELECT medicine_id, batch_number, quantity, purchase_price, data FROM giga_cloud.purchase_items WHERE shop_id = $1 AND purchase_id = $2`,
+          [shopId, purchase_id],
+        )).rows.map((line: any) => ({ ...line.data, ...line }));
 
         // Update purchase record
         const sets: string[] = [`received_date = CURRENT_DATE`, `source_seq = $3`];
@@ -715,19 +753,7 @@ export async function applyCommandDirect(
         const dataPayload: Record<string, any> = { status: 'received' };
         if (notes !== undefined) dataPayload.notes = notes;
         if (items !== undefined) {
-          // Insert items
-          for (const item of items) {
-            await c.query(
-              `INSERT INTO giga_cloud.purchase_items
-                 (shop_id, purchase_item_id, purchase_id, medicine_id, batch_number,
-                  quantity, purchase_price, total, data)
-               VALUES ($1, gen_random_uuid(), $2, $3, $4, $5, $6, $7, $8::jsonb)
-               ON CONFLICT DO NOTHING`,
-              [shopId, purchase_id, item.medicine_id, item.batch_number, item.quantity,
-                item.purchase_price, Math.round(item.quantity * item.purchase_price * 100) / 100,
-                JSON.stringify({ expiry_date: item.expiry_date, manufacturing_date: item.manufacturing_date })],
-            );
-          }
+          // Newly received purchases already have their lines from PURCHASE_CREATE.
           if (supplier_id) { params.push(supplier_id); sets.push(`supplier_id = $${params.length}`); }
           if (invoice_number) { params.push(invoice_number); sets.push(`invoice_number = $${params.length}`); }
           const total = Math.round(items.reduce((s: number, i: any) => s + i.quantity * i.purchase_price, 0) * 100) / 100;
@@ -793,8 +819,7 @@ export async function applyCommandDirect(
       await withCloud((c) =>
         c.query(
           `UPDATE giga_cloud.purchases
-              SET payment_status = 'cancelled',
-                  data = data || $3::jsonb,
+              SET data = data || $3::jsonb,
                   source_seq = $4
             WHERE shop_id = $1 AND purchase_id = $2`,
           [shopId, purchase_id, JSON.stringify({ status: 'cancelled', cancel_reason: reason ?? null }), seq],
@@ -869,10 +894,12 @@ export async function applyCommandDirect(
       await withCloud(async (c) => {
         // Get return data for amounts
         const ret = (await c.query(
-          `SELECT data, quantity, requested_refund, medicine_id, batch_id FROM giga_cloud.returns WHERE shop_id = $1 AND return_id = $2`,
+          `SELECT data, quantity, requested_refund, medicine_id, batch_id, status FROM giga_cloud.returns WHERE shop_id = $1 AND return_id = $2 FOR UPDATE`,
           [shopId, return_id],
         )).rows[0];
-        const retData = ret?.data ?? {};
+        if (!ret) throw new HttpError(404, 'Return not found.');
+        if (ret.status !== 'pending') throw new HttpError(409, 'Return has already been reviewed.');
+        const retData = ret.data ?? {};
         const approvedQty = ret?.quantity ?? retData.quantity ?? retData.approved_quantity ?? null;
         const refundAmt = ret?.requested_refund ?? retData.requested_refund ?? retData.refund_amount ?? null;
         const medId = ret?.medicine_id ?? retData.medicine_id ?? null;
@@ -899,7 +926,7 @@ export async function applyCommandDirect(
             await c.query(
               `INSERT INTO giga_cloud.stock_levels
                  (shop_id, medicine_id, batch_id, has_baseline, baseline_quantity, delta_since_baseline, last_movement_at)
-               VALUES ($1, $2, $3, true, 0, 0, now())
+               VALUES ($1, $2, $3, true, $4, 0, now())
                ON CONFLICT (shop_id, medicine_id, batch_id) DO UPDATE
                  SET delta_since_baseline = giga_cloud.stock_levels.delta_since_baseline + $4,
                      last_movement_at = now()`,
@@ -962,12 +989,18 @@ export async function applyCommandDirect(
       const { ...settings } = payload;
       // Remove known-non-settings fields
       delete settings.reason;
-      await withCloud((c) =>
-        c.query(
+      await withCloud(async (c) => {
+        await c.query(
           `UPDATE giga_cloud.shops SET data = data || $2::jsonb WHERE shop_id = $1`,
           [shopId, JSON.stringify(settings)],
-        ),
-      );
+        );
+        await c.query(
+          `INSERT INTO giga_cloud.shop_settings (shop_id, data, source_seq, updated_at)
+           VALUES ($1, $2::jsonb, $3, now()) ON CONFLICT (shop_id) DO UPDATE
+           SET data = giga_cloud.shop_settings.data || EXCLUDED.data, source_seq = EXCLUDED.source_seq, updated_at = now()`,
+          [shopId, JSON.stringify(settings), seq],
+        );
+      });
       return { applied: true };
     }
 
@@ -1048,8 +1081,8 @@ export async function applyCommandDirect(
         await c.query(
           `UPDATE giga_cloud.online_users
               SET token_version = token_version + 1, updated_at = now()
-            WHERE (id = $1 OR local_user_id = $1)`,
-          [user_id],
+            WHERE (id = $1 OR local_user_id = $1) AND (shop_id = $2 OR shop_id IS NULL)`,
+          [user_id, shopId],
         );
         await c.query(
           `UPDATE giga_cloud.users
@@ -1077,6 +1110,9 @@ export async function applyCommandDirect(
     }
 
     // ------------------------------------------------------------------ no-ops for online-only mode
+    // User admin routes create/update credentials in online_users before calling here.
+    case 'USER_CREATE':
+    case 'USER_CREDENTIAL_REFRESH':
     case 'APP_UPDATE_APPROVE':
     case 'SYNC_RETRY_FAILED': {
       return { applied: true };
