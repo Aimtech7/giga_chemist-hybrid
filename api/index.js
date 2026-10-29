@@ -2516,6 +2516,1138 @@ function commandExpectation(payload) {
   return Object.keys(out).length ? out : null;
 }
 
+// server/online/directAdmin.ts
+function computeExpiryStatus(expiryDate) {
+  if (!expiryDate) return "unknown";
+  const exp = /* @__PURE__ */ new Date(`${expiryDate}T00:00:00Z`);
+  const today2 = /* @__PURE__ */ new Date();
+  today2.setUTCHours(0, 0, 0, 0);
+  if (exp < today2) return "expired";
+  const soon = new Date(today2);
+  soon.setUTCDate(soon.getUTCDate() + 90);
+  if (exp < soon) return "expiring_soon";
+  return "valid";
+}
+function directSeq() {
+  return String(BigInt(Date.now()) * 1000n);
+}
+function orderNumber() {
+  return `ORD-${Date.now()}`;
+}
+async function applyCommandDirect(withCloud2, withShopId, shopId, type, payload, userId) {
+  const seq = directSeq();
+  switch (type) {
+    // ------------------------------------------------------------------ stock
+    case "STOCK_ADD":
+    case "STOCK_OVERRIDE_ADD": {
+      const { medicine_id, batch_id, batch_number, expiry_date, quantity } = payload;
+      let bId = batch_id;
+      if (!bId && batch_number) {
+        bId = await withCloud2(async (c) => {
+          const r = await c.query(
+            `SELECT batch_id FROM giga_cloud.medicine_batches WHERE shop_id = $1 AND medicine_id = $2 AND batch_number = $3 LIMIT 1`,
+            [shopId, medicine_id, batch_number]
+          );
+          if (r.rows[0]) return r.rows[0].batch_id;
+          const newId = (await c.query(
+            `INSERT INTO giga_cloud.medicine_batches
+               (shop_id, batch_id, medicine_id, batch_number, expiry_date, expiry_status, status, data, source_seq, updated_at)
+             VALUES ($1, gen_random_uuid(), $2, $3, $4, $5, 'active', '{}'::jsonb, $6, now())
+             RETURNING batch_id`,
+            [shopId, medicine_id, batch_number, expiry_date ?? null, computeExpiryStatus(expiry_date ?? null), seq]
+          )).rows[0].batch_id;
+          return newId;
+        });
+      }
+      if (!bId) throw new Error("batch_id or batch_number required for stock add");
+      await withCloud2(
+        (c) => c.query(
+          `INSERT INTO giga_cloud.stock_levels
+             (shop_id, medicine_id, batch_id, has_baseline, baseline_quantity, delta_since_baseline, last_movement_at)
+           VALUES ($1, $2, $3, true, $4, 0, now())
+           ON CONFLICT (shop_id, medicine_id, batch_id) DO UPDATE
+             SET delta_since_baseline = giga_cloud.stock_levels.delta_since_baseline + $4,
+                 last_movement_at = now()`,
+          [shopId, medicine_id, bId, quantity]
+        )
+      );
+      return { applied: true };
+    }
+    case "STOCK_REMOVE":
+    case "STOCK_OVERRIDE_REMOVE": {
+      const { medicine_id, batch_id, quantity } = payload;
+      await withCloud2(
+        (c) => c.query(
+          `INSERT INTO giga_cloud.stock_levels
+             (shop_id, medicine_id, batch_id, has_baseline, baseline_quantity, delta_since_baseline, last_movement_at)
+           VALUES ($1, $2, $3, true, 0, 0, now())
+           ON CONFLICT (shop_id, medicine_id, batch_id) DO UPDATE
+             SET delta_since_baseline = GREATEST(
+                   giga_cloud.stock_levels.delta_since_baseline - $4,
+                   -giga_cloud.stock_levels.baseline_quantity
+                 ),
+                 last_movement_at = now()`,
+          [shopId, medicine_id, batch_id, quantity]
+        )
+      );
+      return { applied: true };
+    }
+    case "STOCK_SET":
+    case "STOCK_OVERRIDE_SET": {
+      const { medicine_id, quantity, batch_counts, batch_id, batch_number } = payload;
+      if (Array.isArray(batch_counts) && batch_counts.length > 0) {
+        await withCloud2(async (c) => {
+          for (const bc of batch_counts) {
+            await c.query(
+              `INSERT INTO giga_cloud.stock_levels
+                 (shop_id, medicine_id, batch_id, has_baseline, baseline_quantity, delta_since_baseline, last_movement_at)
+               VALUES ($1, $2, $3, true, $4, 0, now())
+               ON CONFLICT (shop_id, medicine_id, batch_id) DO UPDATE
+                 SET has_baseline = true,
+                     baseline_quantity = $4,
+                     delta_since_baseline = 0,
+                     last_movement_at = now()`,
+              [shopId, medicine_id, bc.batch_id, bc.quantity]
+            );
+          }
+        });
+      } else {
+        let bId = batch_id;
+        if (!bId && batch_number) {
+          bId = await withCloud2(async (c) => {
+            const r = await c.query(
+              `SELECT batch_id FROM giga_cloud.medicine_batches WHERE shop_id = $1 AND medicine_id = $2 AND batch_number = $3 LIMIT 1`,
+              [shopId, medicine_id, batch_number]
+            );
+            if (r.rows[0]) return r.rows[0].batch_id;
+            const newId = (await c.query(
+              `INSERT INTO giga_cloud.medicine_batches
+                 (shop_id, batch_id, medicine_id, batch_number, expiry_date, expiry_status, status, data, source_seq, updated_at)
+               VALUES ($1, gen_random_uuid(), $2, $3, null, 'unknown', 'active', '{}'::jsonb, $4, now())
+               RETURNING batch_id`,
+              [shopId, medicine_id, batch_number, seq]
+            )).rows[0].batch_id;
+            return newId;
+          });
+        }
+        if (!bId) throw new Error("batch_id or batch_number required for STOCK_SET");
+        await withCloud2(
+          (c) => c.query(
+            `INSERT INTO giga_cloud.stock_levels
+               (shop_id, medicine_id, batch_id, has_baseline, baseline_quantity, delta_since_baseline, last_movement_at)
+             VALUES ($1, $2, $3, true, $4, 0, now())
+             ON CONFLICT (shop_id, medicine_id, batch_id) DO UPDATE
+               SET has_baseline = true,
+                   baseline_quantity = $4,
+                   delta_since_baseline = 0,
+                   last_movement_at = now()`,
+            [shopId, medicine_id, bId, quantity]
+          )
+        );
+      }
+      return { applied: true };
+    }
+    case "STOCK_SNAPSHOT_REQUEST": {
+      return { applied: true };
+    }
+    // ------------------------------------------------------------------ prices
+    case "PRICE_UPDATE": {
+      const { medicine_id, selling_price, wholesale_price, min_selling_price, purchase_price } = payload;
+      const sets = [];
+      const params = [shopId, medicine_id];
+      const addField = (col, val) => {
+        if (val !== void 0) {
+          params.push(val);
+          sets.push(`${col} = $${params.length}`);
+        }
+      };
+      addField("selling_price", selling_price);
+      addField("wholesale_price", wholesale_price);
+      addField("min_selling_price", min_selling_price);
+      addField("purchase_price", purchase_price);
+      const patch = {};
+      if (selling_price !== void 0) patch.selling_price = selling_price;
+      if (wholesale_price !== void 0) patch.wholesale_price = wholesale_price;
+      if (min_selling_price !== void 0) patch.min_selling_price = min_selling_price;
+      if (purchase_price !== void 0) patch.purchase_price = purchase_price;
+      if (sets.length > 0) {
+        params.push(JSON.stringify(patch));
+        params.push(seq);
+        await withCloud2(
+          (c) => c.query(
+            `UPDATE giga_cloud.medicines
+                SET ${sets.join(", ")},
+                    data = data || $${params.length - 1}::jsonb,
+                    source_seq = $${params.length},
+                    updated_at = now()
+              WHERE shop_id = $1 AND medicine_id = $2`,
+            params
+          )
+        );
+      }
+      return { applied: true };
+    }
+    // ------------------------------------------------------------------ medicine metadata
+    case "MEDICINE_METADATA_UPDATE": {
+      const { medicine_id, ...rest } = payload;
+      const directCols = ["name", "generic_name", "barcode", "sku", "category", "status", "reorder_level"];
+      const allowed = [
+        ...directCols,
+        "brand_name",
+        "manufacturer",
+        "description",
+        "dosage_form",
+        "dosage_strength",
+        "unit",
+        "prescription_required",
+        "medicine_type"
+      ];
+      const sets = [];
+      const params = [shopId, medicine_id];
+      const patch = {};
+      for (const key of allowed) {
+        if (rest[key] !== void 0) {
+          if (directCols.includes(key)) {
+            params.push(rest[key]);
+            sets.push(`${key} = $${params.length}`);
+          }
+          patch[key] = rest[key];
+        }
+      }
+      if (sets.length > 0 || Object.keys(patch).length > 0) {
+        params.push(JSON.stringify(patch));
+        params.push(seq);
+        const setSql = sets.length > 0 ? `${sets.join(", ")}, ` : "";
+        await withCloud2(
+          (c) => c.query(
+            `UPDATE giga_cloud.medicines
+                SET ${setSql}data = data || $${params.length - 1}::jsonb,
+                    source_seq = $${params.length},
+                    updated_at = now()
+              WHERE shop_id = $1 AND medicine_id = $2`,
+            params
+          )
+        );
+      }
+      return { applied: true };
+    }
+    // ------------------------------------------------------------------ medicine CRUD
+    case "MEDICINE_CREATE": {
+      const {
+        medicine_id,
+        name: name2,
+        generic_name,
+        barcode,
+        sku,
+        category,
+        reorder_level,
+        selling_price,
+        wholesale_price,
+        min_selling_price,
+        purchase_price,
+        brand_name,
+        manufacturer,
+        description,
+        dosage_form,
+        dosage_strength,
+        unit,
+        prescription_required,
+        medicine_type,
+        batch_number,
+        expiry_date,
+        quantity
+      } = payload;
+      const dataJson = {
+        name: name2,
+        generic_name,
+        barcode,
+        sku,
+        category,
+        brand_name,
+        manufacturer,
+        description,
+        dosage_form,
+        dosage_strength,
+        unit,
+        prescription_required,
+        medicine_type,
+        selling_price,
+        wholesale_price,
+        min_selling_price,
+        purchase_price,
+        reorder_level
+      };
+      await withCloud2(async (c) => {
+        await c.query(
+          `INSERT INTO giga_cloud.medicines
+             (shop_id, medicine_id, name, generic_name, barcode, sku, category, status,
+              selling_price, wholesale_price, min_selling_price, purchase_price,
+              reorder_level, local_version, data, source_seq, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, 'active',
+                   $8, $9, $10, $11,
+                   $12, 1, $13::jsonb, $14, now())
+           ON CONFLICT (shop_id, medicine_id) DO UPDATE
+             SET name = EXCLUDED.name,
+                 generic_name = EXCLUDED.generic_name,
+                 barcode = EXCLUDED.barcode,
+                 sku = EXCLUDED.sku,
+                 category = EXCLUDED.category,
+                 status = EXCLUDED.status,
+                 selling_price = EXCLUDED.selling_price,
+                 wholesale_price = EXCLUDED.wholesale_price,
+                 min_selling_price = EXCLUDED.min_selling_price,
+                 purchase_price = EXCLUDED.purchase_price,
+                 reorder_level = EXCLUDED.reorder_level,
+                 data = giga_cloud.medicines.data || EXCLUDED.data,
+                 source_seq = EXCLUDED.source_seq,
+                 updated_at = now()`,
+          [
+            shopId,
+            medicine_id,
+            name2 ?? null,
+            generic_name ?? null,
+            barcode ?? null,
+            sku ?? null,
+            category ?? null,
+            selling_price ?? null,
+            wholesale_price ?? null,
+            min_selling_price ?? null,
+            purchase_price ?? null,
+            reorder_level ?? 0,
+            JSON.stringify(dataJson),
+            seq
+          ]
+        );
+        if (batch_number) {
+          const bId = (await c.query(
+            `INSERT INTO giga_cloud.medicine_batches
+               (shop_id, batch_id, medicine_id, batch_number, expiry_date, expiry_status, status, data, source_seq, updated_at)
+             VALUES ($1, gen_random_uuid(), $2, $3, $4, $5, 'active', '{}'::jsonb, $6, now())
+             ON CONFLICT (shop_id, batch_id) DO NOTHING
+             RETURNING batch_id`,
+            [shopId, medicine_id, batch_number, expiry_date ?? null, computeExpiryStatus(expiry_date ?? null), seq]
+          )).rows[0]?.batch_id;
+          if (bId && quantity && quantity > 0) {
+            await c.query(
+              `INSERT INTO giga_cloud.stock_levels
+                 (shop_id, medicine_id, batch_id, has_baseline, baseline_quantity, delta_since_baseline, last_movement_at)
+               VALUES ($1, $2, $3, true, $4, 0, now())
+               ON CONFLICT (shop_id, medicine_id, batch_id) DO UPDATE
+                 SET baseline_quantity = $4, has_baseline = true, delta_since_baseline = 0, last_movement_at = now()`,
+              [shopId, medicine_id, bId, quantity]
+            );
+          }
+        }
+      });
+      return { applied: true, result: { medicine_id } };
+    }
+    case "MEDICINE_SET_ACTIVE": {
+      const { medicine_id, active } = payload;
+      const status = active ? "active" : "archived";
+      await withCloud2(
+        (c) => c.query(
+          `UPDATE giga_cloud.medicines
+              SET status = $3, data = data || $4::jsonb, source_seq = $5, updated_at = now()
+            WHERE shop_id = $1 AND medicine_id = $2`,
+          [shopId, medicine_id, status, JSON.stringify({ status }), seq]
+        )
+      );
+      return { applied: true };
+    }
+    case "MEDICINE_DELETE_PREFLIGHT": {
+      const { medicine_id } = payload;
+      const result = await withCloud2(async (c) => {
+        const r = await c.query(
+          `SELECT COALESCE(SUM(
+            CASE WHEN has_baseline THEN baseline_quantity + delta_since_baseline
+                 ELSE COALESCE(last_reported_quantity, 0)
+            END
+          ), 0)::int AS current_stock
+           FROM giga_cloud.stock_levels
+           WHERE shop_id = $1 AND medicine_id = $2`,
+          [shopId, medicine_id]
+        );
+        const current_stock = Number(r.rows[0]?.current_stock ?? 0);
+        return { current_stock, has_stock: current_stock > 0 };
+      });
+      return { applied: true, result };
+    }
+    case "MEDICINE_DELETE": {
+      const { medicine_id } = payload;
+      await withCloud2(async (c) => {
+        const stockRow = await c.query(
+          `SELECT COALESCE(SUM(
+            CASE WHEN has_baseline THEN baseline_quantity + delta_since_baseline
+                 ELSE COALESCE(last_reported_quantity, 0)
+            END
+          ), 0)::int AS current_stock
+           FROM giga_cloud.stock_levels
+           WHERE shop_id = $1 AND medicine_id = $2`,
+          [shopId, medicine_id]
+        );
+        const currentStock = Number(stockRow.rows[0]?.current_stock ?? 0);
+        if (currentStock > 0) {
+          throw new Error(`Cannot delete medicine: it still has ${currentStock} units of stock.`);
+        }
+        await c.query(`DELETE FROM giga_cloud.stock_levels WHERE shop_id = $1 AND medicine_id = $2`, [shopId, medicine_id]);
+        await c.query(`DELETE FROM giga_cloud.medicine_batches WHERE shop_id = $1 AND medicine_id = $2`, [shopId, medicine_id]);
+        await c.query(`DELETE FROM giga_cloud.medicines WHERE shop_id = $1 AND medicine_id = $2`, [shopId, medicine_id]);
+        await c.query(
+          `INSERT INTO giga_cloud.medicine_tombstones (shop_id, medicine_id, deleted_at, deletion_seq)
+           VALUES ($1, $2, now(), $3)
+           ON CONFLICT (shop_id, medicine_id) DO UPDATE SET deleted_at = now(), deletion_seq = EXCLUDED.deletion_seq`,
+          [shopId, medicine_id, seq]
+        );
+      });
+      return { applied: true };
+    }
+    // ------------------------------------------------------------------ batches
+    case "BATCH_CREATE": {
+      const { batch_id, medicine_id, batch_number, expiry_date, quantity, purchase_price, selling_price_override, supplier_id } = payload;
+      const expiryStatus = computeExpiryStatus(expiry_date ?? null);
+      const dataJson = {};
+      if (purchase_price !== void 0) dataJson.purchase_price = purchase_price;
+      if (selling_price_override !== void 0) dataJson.selling_price_override = selling_price_override;
+      if (supplier_id !== void 0) dataJson.supplier_id = supplier_id;
+      await withCloud2(async (c) => {
+        await c.query(
+          `INSERT INTO giga_cloud.medicine_batches
+             (shop_id, batch_id, medicine_id, batch_number, expiry_date, expiry_status, status, data, source_seq, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, 'active', $7::jsonb, $8, now())
+           ON CONFLICT (shop_id, batch_id) DO UPDATE
+             SET batch_number = EXCLUDED.batch_number,
+                 expiry_date = EXCLUDED.expiry_date,
+                 expiry_status = EXCLUDED.expiry_status,
+                 data = giga_cloud.medicine_batches.data || EXCLUDED.data,
+                 source_seq = EXCLUDED.source_seq,
+                 updated_at = now()`,
+          [shopId, batch_id, medicine_id, batch_number, expiry_date ?? null, expiryStatus, JSON.stringify(dataJson), seq]
+        );
+        if (quantity && quantity > 0) {
+          await c.query(
+            `INSERT INTO giga_cloud.stock_levels
+               (shop_id, medicine_id, batch_id, has_baseline, baseline_quantity, delta_since_baseline, last_movement_at)
+             VALUES ($1, $2, $3, true, $4, 0, now())
+             ON CONFLICT (shop_id, medicine_id, batch_id) DO UPDATE
+               SET delta_since_baseline = giga_cloud.stock_levels.delta_since_baseline + $4,
+                   last_movement_at = now()`,
+            [shopId, medicine_id, batch_id, quantity]
+          );
+        }
+      });
+      return { applied: true, result: { batch_id } };
+    }
+    case "BATCH_UPDATE": {
+      const { batch_id, medicine_id: _medId, batch_number, purchase_price, selling_price_override, notes, supplier_id } = payload;
+      const patch = {};
+      if (batch_number !== void 0) patch.batch_number = batch_number;
+      if (purchase_price !== void 0) patch.purchase_price = purchase_price;
+      if (selling_price_override !== void 0) patch.selling_price_override = selling_price_override;
+      if (notes !== void 0) patch.notes = notes;
+      if (supplier_id !== void 0) patch.supplier_id = supplier_id;
+      const sets = [];
+      const params = [shopId, batch_id];
+      if (batch_number !== void 0) {
+        params.push(batch_number);
+        sets.push(`batch_number = $${params.length}`);
+      }
+      params.push(JSON.stringify(patch));
+      params.push(seq);
+      sets.push(`data = data || $${params.length - 1}::jsonb`);
+      sets.push(`source_seq = $${params.length}`);
+      sets.push(`updated_at = now()`);
+      await withCloud2(
+        (c) => c.query(
+          `UPDATE giga_cloud.medicine_batches SET ${sets.join(", ")} WHERE shop_id = $1 AND batch_id = $2`,
+          params
+        )
+      );
+      return { applied: true };
+    }
+    case "BATCH_EXPIRY_UPDATE": {
+      const { batch_id, expiry_date } = payload;
+      const expiryStatus = computeExpiryStatus(expiry_date ?? null);
+      await withCloud2(
+        (c) => c.query(
+          `UPDATE giga_cloud.medicine_batches
+              SET expiry_date = $3, expiry_status = $4, data = data || $5::jsonb, source_seq = $6, updated_at = now()
+            WHERE shop_id = $1 AND batch_id = $2`,
+          [shopId, batch_id, expiry_date ?? null, expiryStatus, JSON.stringify({ expiry_date, expiry_status: expiryStatus }), seq]
+        )
+      );
+      return { applied: true };
+    }
+    case "BATCH_SET_ACTIVE": {
+      const { batch_id, active } = payload;
+      const status = active ? "active" : "archived";
+      await withCloud2(
+        (c) => c.query(
+          `UPDATE giga_cloud.medicine_batches
+              SET status = $3, data = data || $4::jsonb, source_seq = $5, updated_at = now()
+            WHERE shop_id = $1 AND batch_id = $2`,
+          [shopId, batch_id, status, JSON.stringify({ status }), seq]
+        )
+      );
+      return { applied: true };
+    }
+    // ------------------------------------------------------------------ suppliers
+    case "SUPPLIER_CREATE": {
+      const { supplier_id, name: name2, contact_person, phone, email: email3, address, tax_pin } = payload;
+      const dataJson = { contact_person, phone, email: email3, address, tax_pin };
+      await withCloud2(
+        (c) => c.query(
+          `INSERT INTO giga_cloud.suppliers
+             (shop_id, supplier_id, name, status, data, source_seq, updated_at)
+           VALUES ($1, $2, $3, 'active', $4::jsonb, $5, now())
+           ON CONFLICT (shop_id, supplier_id) DO UPDATE
+             SET name = EXCLUDED.name,
+                 status = EXCLUDED.status,
+                 data = giga_cloud.suppliers.data || EXCLUDED.data,
+                 source_seq = EXCLUDED.source_seq,
+                 updated_at = now()`,
+          [shopId, supplier_id, name2, JSON.stringify(dataJson), seq]
+        )
+      );
+      return { applied: true, result: { supplier_id } };
+    }
+    case "SUPPLIER_UPDATE": {
+      const { supplier_id, name: name2, contact_person, phone, email: email3, address, tax_pin } = payload;
+      const patch = {};
+      if (contact_person !== void 0) patch.contact_person = contact_person;
+      if (phone !== void 0) patch.phone = phone;
+      if (email3 !== void 0) patch.email = email3;
+      if (address !== void 0) patch.address = address;
+      if (tax_pin !== void 0) patch.tax_pin = tax_pin;
+      if (name2 !== void 0) patch.name = name2;
+      const sets = [];
+      const params = [shopId, supplier_id];
+      if (name2 !== void 0) {
+        params.push(name2);
+        sets.push(`name = $${params.length}`);
+      }
+      params.push(JSON.stringify(patch));
+      params.push(seq);
+      sets.push(`data = data || $${params.length - 1}::jsonb`);
+      sets.push(`source_seq = $${params.length}`);
+      sets.push(`updated_at = now()`);
+      await withCloud2(
+        (c) => c.query(
+          `UPDATE giga_cloud.suppliers SET ${sets.join(", ")} WHERE shop_id = $1 AND supplier_id = $2`,
+          params
+        )
+      );
+      return { applied: true };
+    }
+    case "SUPPLIER_SET_ACTIVE": {
+      const { supplier_id, active } = payload;
+      const status = active ? "active" : "inactive";
+      await withCloud2(
+        (c) => c.query(
+          `UPDATE giga_cloud.suppliers
+              SET status = $3, data = data || $4::jsonb, source_seq = $5, updated_at = now()
+            WHERE shop_id = $1 AND supplier_id = $2`,
+          [shopId, supplier_id, status, JSON.stringify({ status }), seq]
+        )
+      );
+      return { applied: true };
+    }
+    // ------------------------------------------------------------------ customers
+    case "CUSTOMER_CREATE": {
+      const { customer_id, name: name2, phone, email: email3, address, notes } = payload;
+      const dataJson = { phone, email: email3, address, notes, active: true, loyalty_points: 0 };
+      await withCloud2(
+        (c) => c.query(
+          `INSERT INTO giga_cloud.customers
+             (shop_id, customer_id, name, phone, data, source_seq, updated_at)
+           VALUES ($1, $2, $3, $4, $5::jsonb, $6, now())
+           ON CONFLICT (shop_id, customer_id) DO UPDATE
+             SET name = EXCLUDED.name,
+                 phone = EXCLUDED.phone,
+                 data = giga_cloud.customers.data || EXCLUDED.data,
+                 source_seq = EXCLUDED.source_seq,
+                 updated_at = now()`,
+          [shopId, customer_id, name2, phone ?? null, JSON.stringify(dataJson), seq]
+        )
+      );
+      return { applied: true, result: { customer_id } };
+    }
+    case "CUSTOMER_UPDATE": {
+      const { customer_id, name: name2, phone, email: email3, address, notes } = payload;
+      const patch = {};
+      if (name2 !== void 0) patch.name = name2;
+      if (phone !== void 0) patch.phone = phone;
+      if (email3 !== void 0) patch.email = email3;
+      if (address !== void 0) patch.address = address;
+      if (notes !== void 0) patch.notes = notes;
+      const sets = [];
+      const params = [shopId, customer_id];
+      if (name2 !== void 0) {
+        params.push(name2);
+        sets.push(`name = $${params.length}`);
+      }
+      if (phone !== void 0) {
+        params.push(phone);
+        sets.push(`phone = $${params.length}`);
+      }
+      params.push(JSON.stringify(patch));
+      params.push(seq);
+      sets.push(`data = data || $${params.length - 1}::jsonb`);
+      sets.push(`source_seq = $${params.length}`);
+      sets.push(`updated_at = now()`);
+      await withCloud2(
+        (c) => c.query(
+          `UPDATE giga_cloud.customers SET ${sets.join(", ")} WHERE shop_id = $1 AND customer_id = $2`,
+          params
+        )
+      );
+      return { applied: true };
+    }
+    case "CUSTOMER_SET_ACTIVE": {
+      const { customer_id, active } = payload;
+      await withCloud2(
+        (c) => c.query(
+          `UPDATE giga_cloud.customers
+              SET data = data || $3::jsonb, source_seq = $4, updated_at = now()
+            WHERE shop_id = $1 AND customer_id = $2`,
+          [shopId, customer_id, JSON.stringify({ active }), seq]
+        )
+      );
+      return { applied: true };
+    }
+    // ------------------------------------------------------------------ purchases
+    case "PURCHASE_CREATE": {
+      const { purchase_id, supplier_id, invoice_number, payment_status, notes, items } = payload;
+      const total = Array.isArray(items) ? Math.round(items.reduce((s, i) => s + i.quantity * i.purchase_price, 0) * 100) / 100 : 0;
+      const dataJson = { status: "pending", notes, items };
+      await withCloud2(async (c) => {
+        await c.query(
+          `INSERT INTO giga_cloud.purchases
+             (shop_id, purchase_id, order_number, invoice_number, supplier_id,
+              received_date, total_amount, payment_status, data, source_seq)
+           VALUES ($1, $2, $3, $4, $5, null, $6, $7, $8::jsonb, $9)
+           ON CONFLICT (shop_id, purchase_id) DO NOTHING`,
+          [
+            shopId,
+            purchase_id,
+            orderNumber(),
+            invoice_number ?? null,
+            supplier_id,
+            total,
+            payment_status ?? "unpaid",
+            JSON.stringify(dataJson),
+            seq
+          ]
+        );
+        if (Array.isArray(items)) {
+          for (const item of items) {
+            await c.query(
+              `INSERT INTO giga_cloud.purchase_items
+                 (shop_id, purchase_item_id, purchase_id, medicine_id, batch_number,
+                  quantity, purchase_price, total, data)
+               VALUES ($1, gen_random_uuid(), $2, $3, $4, $5, $6, $7, $8::jsonb)
+               ON CONFLICT (shop_id, purchase_item_id) DO NOTHING`,
+              [
+                shopId,
+                purchase_id,
+                item.medicine_id,
+                item.batch_number,
+                item.quantity,
+                item.purchase_price,
+                Math.round(item.quantity * item.purchase_price * 100) / 100,
+                JSON.stringify({ expiry_date: item.expiry_date, manufacturing_date: item.manufacturing_date })
+              ]
+            );
+          }
+        }
+      });
+      return { applied: true, result: { purchase_id } };
+    }
+    case "PURCHASE_UPDATE_DRAFT": {
+      const { purchase_id, supplier_id, invoice_number, payment_status, notes, items } = payload;
+      const sets = [];
+      const params = [shopId, purchase_id];
+      const patch = {};
+      if (supplier_id !== void 0) {
+        params.push(supplier_id);
+        sets.push(`supplier_id = $${params.length}`);
+      }
+      if (invoice_number !== void 0) {
+        params.push(invoice_number);
+        sets.push(`invoice_number = $${params.length}`);
+        patch.invoice_number = invoice_number;
+      }
+      if (payment_status !== void 0) {
+        params.push(payment_status);
+        sets.push(`payment_status = $${params.length}`);
+      }
+      if (notes !== void 0) patch.notes = notes;
+      if (items !== void 0) {
+        patch.items = items;
+        const total = Math.round(items.reduce((s, i) => s + i.quantity * i.purchase_price, 0) * 100) / 100;
+        params.push(total);
+        sets.push(`total_amount = $${params.length}`);
+      }
+      params.push(JSON.stringify(patch));
+      params.push(seq);
+      sets.push(`data = data || $${params.length - 1}::jsonb`);
+      sets.push(`source_seq = $${params.length}`);
+      await withCloud2(async (c) => {
+        await c.query(
+          `UPDATE giga_cloud.purchases SET ${sets.join(", ")} WHERE shop_id = $1 AND purchase_id = $2`,
+          params
+        );
+        if (Array.isArray(items)) {
+          await c.query(`DELETE FROM giga_cloud.purchase_items WHERE shop_id = $1 AND purchase_id = $2`, [shopId, purchase_id]);
+          for (const item of items) {
+            await c.query(
+              `INSERT INTO giga_cloud.purchase_items
+                 (shop_id, purchase_item_id, purchase_id, medicine_id, batch_number,
+                  quantity, purchase_price, total, data)
+               VALUES ($1, gen_random_uuid(), $2, $3, $4, $5, $6, $7, $8::jsonb)`,
+              [
+                shopId,
+                purchase_id,
+                item.medicine_id,
+                item.batch_number,
+                item.quantity,
+                item.purchase_price,
+                Math.round(item.quantity * item.purchase_price * 100) / 100,
+                JSON.stringify({ expiry_date: item.expiry_date, manufacturing_date: item.manufacturing_date })
+              ]
+            );
+          }
+        }
+      });
+      return { applied: true };
+    }
+    case "PURCHASE_RECEIVE": {
+      const { purchase_id, invoice_number, payment_status, supplier_id, items, notes } = payload;
+      await withCloud2(async (c) => {
+        let receiveItems = items;
+        if (!receiveItems) {
+          const pur = (await c.query(
+            `SELECT data FROM giga_cloud.purchases WHERE shop_id = $1 AND purchase_id = $2`,
+            [shopId, purchase_id]
+          )).rows[0];
+          receiveItems = pur?.data?.items;
+        }
+        const sets = [`received_date = CURRENT_DATE`, `source_seq = $3`];
+        const params = [shopId, purchase_id, seq];
+        const dataPayload = { status: "received" };
+        if (notes !== void 0) dataPayload.notes = notes;
+        if (items !== void 0) {
+          for (const item of items) {
+            await c.query(
+              `INSERT INTO giga_cloud.purchase_items
+                 (shop_id, purchase_item_id, purchase_id, medicine_id, batch_number,
+                  quantity, purchase_price, total, data)
+               VALUES ($1, gen_random_uuid(), $2, $3, $4, $5, $6, $7, $8::jsonb)
+               ON CONFLICT DO NOTHING`,
+              [
+                shopId,
+                purchase_id,
+                item.medicine_id,
+                item.batch_number,
+                item.quantity,
+                item.purchase_price,
+                Math.round(item.quantity * item.purchase_price * 100) / 100,
+                JSON.stringify({ expiry_date: item.expiry_date, manufacturing_date: item.manufacturing_date })
+              ]
+            );
+          }
+          if (supplier_id) {
+            params.push(supplier_id);
+            sets.push(`supplier_id = $${params.length}`);
+          }
+          if (invoice_number) {
+            params.push(invoice_number);
+            sets.push(`invoice_number = $${params.length}`);
+          }
+          const total = Math.round(items.reduce((s, i) => s + i.quantity * i.purchase_price, 0) * 100) / 100;
+          params.push(total);
+          sets.push(`total_amount = $${params.length}`);
+          dataPayload.items = items;
+        } else if (invoice_number) {
+          params.push(invoice_number);
+          sets.push(`invoice_number = $${params.length}`);
+        }
+        if (payment_status) {
+          params.push(payment_status);
+          sets.push(`payment_status = $${params.length}`);
+        }
+        params.push(JSON.stringify(dataPayload));
+        sets.push(`data = data || $${params.length}::jsonb`);
+        await c.query(
+          `UPDATE giga_cloud.purchases SET ${sets.join(", ")} WHERE shop_id = $1 AND purchase_id = $2`,
+          params
+        );
+        if (Array.isArray(receiveItems)) {
+          for (const item of receiveItems) {
+            if (!item.medicine_id || !item.quantity) continue;
+            let batchId = null;
+            if (item.batch_id) {
+              batchId = item.batch_id;
+            } else if (item.batch_number) {
+              const bRow = (await c.query(
+                `SELECT batch_id FROM giga_cloud.medicine_batches WHERE shop_id = $1 AND medicine_id = $2 AND batch_number = $3 LIMIT 1`,
+                [shopId, item.medicine_id, item.batch_number]
+              )).rows[0];
+              if (bRow) {
+                batchId = bRow.batch_id;
+              } else {
+                const expiryStatus = computeExpiryStatus(item.expiry_date ?? null);
+                batchId = (await c.query(
+                  `INSERT INTO giga_cloud.medicine_batches
+                     (shop_id, batch_id, medicine_id, batch_number, expiry_date, expiry_status, status, data, source_seq, updated_at)
+                   VALUES ($1, gen_random_uuid(), $2, $3, $4, $5, 'active', '{}'::jsonb, $6, now())
+                   RETURNING batch_id`,
+                  [shopId, item.medicine_id, item.batch_number, item.expiry_date ?? null, expiryStatus, seq]
+                )).rows[0].batch_id;
+              }
+            }
+            if (batchId) {
+              await c.query(
+                `INSERT INTO giga_cloud.stock_levels
+                   (shop_id, medicine_id, batch_id, has_baseline, baseline_quantity, delta_since_baseline, last_movement_at)
+                 VALUES ($1, $2, $3, true, $4, 0, now())
+                 ON CONFLICT (shop_id, medicine_id, batch_id) DO UPDATE
+                   SET delta_since_baseline = giga_cloud.stock_levels.delta_since_baseline + $4,
+                       last_movement_at = now()`,
+                [shopId, item.medicine_id, batchId, item.quantity]
+              );
+            }
+          }
+        }
+      });
+      return { applied: true };
+    }
+    case "PURCHASE_CANCEL": {
+      const { purchase_id, reason } = payload;
+      await withCloud2(
+        (c) => c.query(
+          `UPDATE giga_cloud.purchases
+              SET payment_status = 'cancelled',
+                  data = data || $3::jsonb,
+                  source_seq = $4
+            WHERE shop_id = $1 AND purchase_id = $2`,
+          [shopId, purchase_id, JSON.stringify({ status: "cancelled", cancel_reason: reason ?? null }), seq]
+        )
+      );
+      return { applied: true };
+    }
+    // ------------------------------------------------------------------ expenses
+    case "EXPENSE_CREATE": {
+      const { expense_id, category, description, amount, payment_method, reference, date: expDate } = payload;
+      const dataJson = { status: "posted", reference };
+      await withCloud2(
+        (c) => c.query(
+          `INSERT INTO giga_cloud.expenses
+             (shop_id, expense_id, category, description, amount, payment_method,
+              expense_date, user_id, data, source_seq)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10)
+           ON CONFLICT (shop_id, expense_id) DO NOTHING`,
+          [
+            shopId,
+            expense_id,
+            category,
+            description,
+            amount,
+            payment_method ?? "Cash",
+            expDate ?? (/* @__PURE__ */ new Date()).toISOString().slice(0, 10),
+            userId,
+            JSON.stringify(dataJson),
+            seq
+          ]
+        )
+      );
+      return { applied: true, result: { expense_id } };
+    }
+    case "EXPENSE_UPDATE": {
+      const { expense_id, category, description, amount, payment_method, reference, date: expDate } = payload;
+      const sets = [];
+      const params = [shopId, expense_id];
+      const patch = {};
+      if (category !== void 0) {
+        params.push(category);
+        sets.push(`category = $${params.length}`);
+      }
+      if (description !== void 0) {
+        params.push(description);
+        sets.push(`description = $${params.length}`);
+      }
+      if (amount !== void 0) {
+        params.push(amount);
+        sets.push(`amount = $${params.length}`);
+      }
+      if (payment_method !== void 0) {
+        params.push(payment_method);
+        sets.push(`payment_method = $${params.length}`);
+      }
+      if (expDate !== void 0) {
+        params.push(expDate);
+        sets.push(`expense_date = $${params.length}`);
+      }
+      if (reference !== void 0) patch.reference = reference;
+      params.push(JSON.stringify(patch));
+      params.push(seq);
+      sets.push(`data = data || $${params.length - 1}::jsonb`);
+      sets.push(`source_seq = $${params.length}`);
+      if (sets.length > 2) {
+        await withCloud2(
+          (c) => c.query(
+            `UPDATE giga_cloud.expenses SET ${sets.join(", ")} WHERE shop_id = $1 AND expense_id = $2`,
+            params
+          )
+        );
+      }
+      return { applied: true };
+    }
+    case "EXPENSE_VOID": {
+      const { expense_id, reason } = payload;
+      await withCloud2(
+        (c) => c.query(
+          `UPDATE giga_cloud.expenses
+              SET data = data || $3::jsonb, source_seq = $4
+            WHERE shop_id = $1 AND expense_id = $2`,
+          [shopId, expense_id, JSON.stringify({ status: "voided", void_reason: reason ?? null, voided_at: (/* @__PURE__ */ new Date()).toISOString(), voided_by: userId }), seq]
+        )
+      );
+      return { applied: true };
+    }
+    // ------------------------------------------------------------------ returns
+    case "RETURN_APPROVE": {
+      const { return_id, restock, disposition, notes, refund_method } = payload;
+      await withCloud2(async (c) => {
+        const ret = (await c.query(
+          `SELECT data, quantity, requested_refund, medicine_id, batch_id FROM giga_cloud.returns WHERE shop_id = $1 AND return_id = $2`,
+          [shopId, return_id]
+        )).rows[0];
+        const retData = ret?.data ?? {};
+        const approvedQty = ret?.quantity ?? retData.quantity ?? retData.approved_quantity ?? null;
+        const refundAmt = ret?.requested_refund ?? retData.requested_refund ?? retData.refund_amount ?? null;
+        const medId = ret?.medicine_id ?? retData.medicine_id ?? null;
+        const bId = ret?.batch_id ?? retData.batch_id ?? null;
+        const patchData = { notes, refund_method, disposition, reviewed_by_name: "Administrator" };
+        await c.query(
+          `UPDATE giga_cloud.returns
+              SET status = 'approved',
+                  approved_quantity = $3,
+                  refund_amount = $4,
+                  restocked = $5,
+                  reviewed_by = $6,
+                  reviewed_at = now(),
+                  data = data || $7::jsonb,
+                  source_seq = $8,
+                  updated_at = now()
+            WHERE shop_id = $1 AND return_id = $2`,
+          [shopId, return_id, approvedQty, refundAmt, restock, userId, JSON.stringify(patchData), seq]
+        );
+        if (restock && medId && bId) {
+          const qty = Number(approvedQty ?? 0);
+          if (qty > 0) {
+            await c.query(
+              `INSERT INTO giga_cloud.stock_levels
+                 (shop_id, medicine_id, batch_id, has_baseline, baseline_quantity, delta_since_baseline, last_movement_at)
+               VALUES ($1, $2, $3, true, 0, 0, now())
+               ON CONFLICT (shop_id, medicine_id, batch_id) DO UPDATE
+                 SET delta_since_baseline = giga_cloud.stock_levels.delta_since_baseline + $4,
+                     last_movement_at = now()`,
+              [shopId, medId, bId, qty]
+            );
+          }
+        }
+      });
+      return { applied: true };
+    }
+    case "RETURN_REJECT": {
+      const { return_id, reason } = payload;
+      await withCloud2(
+        (c) => c.query(
+          `UPDATE giga_cloud.returns
+              SET status = 'rejected', reviewed_by = $3, reviewed_at = now(),
+                  data = data || $4::jsonb, source_seq = $5, updated_at = now()
+            WHERE shop_id = $1 AND return_id = $2`,
+          [shopId, return_id, userId, JSON.stringify({ reject_reason: reason ?? null }), seq]
+        )
+      );
+      return { applied: true };
+    }
+    // ------------------------------------------------------------------ sales
+    case "SALE_VOID": {
+      const { sale_id, void_reason, reason } = payload;
+      const vReason = void_reason ?? reason ?? null;
+      await withCloud2(
+        (c) => c.query(
+          `UPDATE giga_cloud.sales
+              SET status = 'voided', void_reason = $3, voided_by = $4,
+                  data = data || $5::jsonb, source_seq = $6
+            WHERE shop_id = $1 AND sale_id = $2`,
+          [
+            shopId,
+            sale_id,
+            vReason,
+            userId,
+            JSON.stringify({ void_reason: vReason, voided_by: userId }),
+            seq
+          ]
+        )
+      );
+      return { applied: true };
+    }
+    // ------------------------------------------------------------------ categories (global, no shop_id)
+    case "CATEGORY_UPSERT": {
+      const { name: name2, description } = payload;
+      await withCloud2(
+        (c) => c.query(
+          `INSERT INTO giga_cloud.categories (id, name, description, updated_at)
+           VALUES (gen_random_uuid(), $1, $2, now())
+           ON CONFLICT (name) DO UPDATE
+             SET description = EXCLUDED.description, updated_at = now()`,
+          [name2, description ?? null]
+        )
+      );
+      return { applied: true };
+    }
+    // ------------------------------------------------------------------ shop settings
+    case "SETTINGS_UPDATE": {
+      const { ...settings } = payload;
+      delete settings.reason;
+      await withCloud2(
+        (c) => c.query(
+          `UPDATE giga_cloud.shops SET data = data || $2::jsonb WHERE shop_id = $1`,
+          [shopId, JSON.stringify(settings)]
+        )
+      );
+      return { applied: true };
+    }
+    // ------------------------------------------------------------------ users
+    case "USER_SET_ACTIVE": {
+      const { user_id, active } = payload;
+      await withCloud2(async (c) => {
+        await c.query(
+          `UPDATE giga_cloud.users
+              SET active = $2, source_seq = $4, updated_at = now()
+            WHERE user_id = $1 AND shop_id = $3`,
+          [user_id, active, shopId, seq]
+        );
+        await c.query(
+          `UPDATE giga_cloud.online_users
+              SET active = $2, token_version = token_version + CASE WHEN $2 THEN 0 ELSE 1 END, updated_at = now()
+            WHERE (id = $1 OR local_user_id = $1) AND (shop_id = $3 OR shop_id IS NULL)`,
+          [user_id, active, shopId]
+        );
+      });
+      return { applied: true };
+    }
+    case "USER_ROLE_UPDATE": {
+      const { user_id, role: role2 } = payload;
+      await withCloud2(async (c) => {
+        await c.query(
+          `UPDATE giga_cloud.users
+              SET role = $2, source_seq = $4, updated_at = now()
+            WHERE user_id = $1 AND shop_id = $3`,
+          [user_id, role2, shopId, seq]
+        );
+        await c.query(
+          `UPDATE giga_cloud.online_users
+              SET role = $2, token_version = token_version + CASE WHEN role = 'ADMIN' AND $2 <> 'ADMIN' THEN 1 ELSE 0 END, updated_at = now()
+            WHERE (id = $1 OR local_user_id = $1) AND (shop_id = $3 OR shop_id IS NULL)`,
+          [user_id, role2, shopId]
+        );
+      });
+      return { applied: true };
+    }
+    case "USER_PROFILE_UPDATE": {
+      const { user_id, name: name2, username: username2, email: email3 } = payload;
+      const sets = [];
+      const params = [shopId, user_id];
+      if (name2 !== void 0) {
+        params.push(name2);
+        sets.push(`name = $${params.length}`);
+      }
+      if (username2 !== void 0) {
+        params.push(username2);
+        sets.push(`username = $${params.length}`);
+      }
+      if (email3 !== void 0) {
+        params.push(email3);
+        sets.push(`email = $${params.length}`);
+      }
+      await withCloud2(async (c) => {
+        if (sets.length > 0) {
+          params.push(seq);
+          sets.push(`source_seq = $${params.length}`);
+          sets.push(`updated_at = now()`);
+          await c.query(
+            `UPDATE giga_cloud.users SET ${sets.join(", ")} WHERE shop_id = $1 AND user_id = $2`,
+            params
+          );
+        }
+        const oSets = ["updated_at = now()"];
+        const oParams = [user_id, shopId];
+        if (name2 !== void 0) {
+          oParams.push(name2);
+          oSets.push(`name = $${oParams.length}`);
+        }
+        if (username2 !== void 0) {
+          oParams.push(username2);
+          oSets.push(`username = $${oParams.length}`);
+        }
+        if (email3 !== void 0) {
+          oParams.push(email3);
+          oSets.push(`email = $${oParams.length}`);
+        }
+        await c.query(
+          `UPDATE giga_cloud.online_users SET ${oSets.join(", ")} WHERE (id = $1 OR local_user_id = $1) AND (shop_id = $2 OR shop_id IS NULL)`,
+          oParams
+        );
+      });
+      return { applied: true };
+    }
+    case "USER_SESSION_REVOKE": {
+      const { user_id } = payload;
+      const revokedAt = (/* @__PURE__ */ new Date()).toISOString();
+      await withCloud2(async (c) => {
+        await c.query(
+          `UPDATE giga_cloud.online_users
+              SET token_version = token_version + 1, updated_at = now()
+            WHERE (id = $1 OR local_user_id = $1)`,
+          [user_id]
+        );
+        await c.query(
+          `UPDATE giga_cloud.users
+              SET data = data || $2::jsonb, source_seq = $3, updated_at = now()
+            WHERE user_id = $1 AND shop_id = $4`,
+          [user_id, JSON.stringify({ session_revoked_at: revokedAt }), seq, shopId]
+        );
+      });
+      return { applied: true };
+    }
+    // ------------------------------------------------------------------ cashier shifts
+    case "SHIFT_REVIEW": {
+      const { shift_id, notes } = payload;
+      await withCloud2(
+        (c) => c.query(
+          `UPDATE giga_cloud.cashier_shifts
+              SET status = 'REVIEWED', reviewed_at = now(),
+                  data = data || $3::jsonb, source_seq = $4, updated_at = now()
+            WHERE shop_id = $1 AND shift_id = $2`,
+          [shopId, shift_id, JSON.stringify({ reviewed_by: userId, review_notes: notes ?? null }), seq]
+        )
+      );
+      return { applied: true };
+    }
+    // ------------------------------------------------------------------ no-ops for online-only mode
+    case "APP_UPDATE_APPROVE":
+    case "SYNC_RETRY_FAILED": {
+      return { applied: true };
+    }
+    default: {
+      throw new Error(`applyCommandDirect: unhandled command type "${type}"`);
+    }
+  }
+}
+
 // server/online/remoteAdmin.ts
 var ACTIONS = {
   "stock-add": "STOCK_ADD",
@@ -2626,7 +3758,7 @@ function toCommand(r) {
     result: r.result ?? null,
     error: safeError(r.error),
     // The shop's audit rows for this change carry the command id (CLOUD_COMMAND_APPLIED / _REJECTED).
-    audit_reference: r.status === "APPLIED" || r.status === "REJECTED" ? `shop audit_logs entity_id = ${r.command_id}` : null
+    audit_reference: typeof r.result === "object" && r.result?.applied_directly || typeof r.result === "string" && r.result.includes("applied_directly") ? "applied directly to cloud" : r.status === "APPLIED" || r.status === "REJECTED" ? `shop audit_logs entity_id = ${r.command_id}` : null
   };
 }
 function clientIp(req) {
@@ -2926,6 +4058,49 @@ function buildRemoteAdminRouter(deps) {
     }
     console.log(`[Online] ${u.email} queued ${type} ${row.command_id} for shop ${target?.shop_code || shopId}${row.duplicate ? " (replayed request)" : ""}`);
     const offlineWarning = isOverrideDirective ? "The shop computer is OFFLINE. This administrative stock directive will wait in queue (PENDING) and execute automatically against the shop live stock when the shop reconnects." : highConflict ? "The shop computer is OFFLINE. This stock/financial change waits as PENDING and is re-checked against the shop live data when it arrives; it may be REJECTED if anything changed meanwhile." : "The shop computer is offline: the change waits as PENDING and is applied when the shop reconnects.";
+    if (!row.duplicate) {
+      try {
+        const directResult = await applyCommandDirect(
+          deps.withCloud,
+          deps.withShopId,
+          shopId,
+          type,
+          payload,
+          u.id
+        );
+        try {
+          await deps.withCloud((c) => c.query(
+            `UPDATE giga_cloud.commands
+                SET status = 'APPLIED', acked_at = now(),
+                    result = $2::jsonb
+              WHERE command_id = $1`,
+            [row.command_id, JSON.stringify({ applied_directly: true, ...directResult.result ?? {} })]
+          ));
+        } catch (updateErr) {
+          console.warn(`[Online] Failed to mark command ${row.command_id} as APPLIED:`, updateErr);
+        }
+        console.log(`[Online] ${u.email} applied ${type} ${row.command_id} directly to cloud for shop ${target?.shop_code || shopId}`);
+        return {
+          command_id: row.command_id,
+          command_type: type,
+          shop_id: shopId,
+          shop_code: target?.shop_code ?? null,
+          shop_name: target?.name ?? null,
+          entity: entity?.entity ?? null,
+          entity_id: entity?.entity_id ?? null,
+          status: "APPLIED",
+          applied_directly: true,
+          created_at: row.created_at,
+          duplicate: false,
+          shop_online: online,
+          warning: null,
+          message: "Change applied immediately to the cloud database.",
+          result: directResult.result ?? null
+        };
+      } catch (directErr) {
+        console.warn(`[Online] applyCommandDirect failed for ${type} ${row.command_id} (falling back to PENDING):`, directErr);
+      }
+    }
     return {
       command_id: row.command_id,
       command_type: type,
@@ -3022,7 +4197,7 @@ function buildRemoteAdminRouter(deps) {
           if (Object.keys(exp).length) shopBody.expected = exp;
         }
         const q = await queueForShop(req, shop.shop_id, type, shopBody, seed, { fanout_group: seed, applied_to: "ALL_SHOPS" });
-        results.push({ ...one, status: "QUEUED", command_id: q.command_id, duplicate: q.duplicate, shop_online: q.shop_online, warning: q.warning });
+        results.push({ ...one, status: q.status === "APPLIED" ? "APPLIED" : "QUEUED", command_id: q.command_id, duplicate: q.duplicate, shop_online: q.shop_online, warning: q.warning, applied_directly: q.applied_directly ?? false });
       } catch (err) {
         results.push({ ...one, status: "SKIPPED", reason: err instanceof HttpError ? err.message : "cloud error" });
       }
@@ -3030,7 +4205,8 @@ function buildRemoteAdminRouter(deps) {
     await deps.securityEvent(req, "REMOTE_COMMAND_ALL_SHOPS", req.onlineUser.email, req.onlineUser.id, {
       command_type: type,
       fanout_group: seed,
-      queued: results.filter((x) => x.status === "QUEUED").length,
+      queued: results.filter((x) => x.status === "QUEUED" || x.status === "APPLIED").length,
+      applied: results.filter((x) => x.status === "APPLIED").length,
       skipped: results.filter((x) => x.status === "SKIPPED").length
     });
     res.status(202);

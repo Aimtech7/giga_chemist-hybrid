@@ -9,6 +9,8 @@ import {
   validateCommandPayload, commandEntity, commandExpectation, STOCK_REMOVE_REASONS, ASSIGNABLE_ROLES, HIGH_CONFLICT_TYPES, ALL_SHOPS_TYPES,
   EXPENSE_CATEGORIES, EXPENSE_PAYMENT_METHODS, RETURN_DISPOSITIONS, PRICE_FIELDS, METADATA_FIELDS, type CommandType,
 } from '../sync/commandSchema';
+import { applyCommandDirect } from './directAdmin';
+
 
 /**
  * Remote administration from the online app (ADMIN only).
@@ -182,7 +184,9 @@ function toCommand(r: any) {
     result: r.result ?? null,
     error: safeError(r.error),
     // The shop's audit rows for this change carry the command id (CLOUD_COMMAND_APPLIED / _REJECTED).
-    audit_reference: r.status === 'APPLIED' || r.status === 'REJECTED' ? `shop audit_logs entity_id = ${r.command_id}` : null,
+    audit_reference: ((typeof r.result === 'object' && r.result?.applied_directly) || (typeof r.result === 'string' && r.result.includes('applied_directly')))
+      ? 'applied directly to cloud'
+      : (r.status === 'APPLIED' || r.status === 'REJECTED' ? `shop audit_logs entity_id = ${r.command_id}` : null),
   };
 }
 
@@ -506,6 +510,52 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
       : (highConflict
           ? 'The shop computer is OFFLINE. This stock/financial change waits as PENDING and is re-checked against the shop live data when it arrives; it may be REJECTED if anything changed meanwhile.'
           : 'The shop computer is offline: the change waits as PENDING and is applied when the shop reconnects.');
+
+    // --- Direct write to giga_cloud.* tables (online-only mode) ---
+    // Try to apply the command immediately; on success update the command row to APPLIED so
+    // the activity log shows it as done right away. On failure fall back to PENDING (safe).
+    if (!row.duplicate) {
+      try {
+        const directResult = await applyCommandDirect(
+          deps.withCloud, deps.withShopId, shopId, type, payload, u.id,
+        );
+        // Mark the command as APPLIED immediately in the audit log
+        try {
+          await deps.withCloud((c) => c.query(
+            `UPDATE giga_cloud.commands
+                SET status = 'APPLIED', acked_at = now(),
+                    result = $2::jsonb
+              WHERE command_id = $1`,
+            [row.command_id, JSON.stringify({ applied_directly: true, ...(directResult.result ?? {}) })],
+          ));
+        } catch (updateErr) {
+          // Non-fatal: the change is already applied; only the audit log status is stale
+          console.warn(`[Online] Failed to mark command ${row.command_id} as APPLIED:`, updateErr);
+        }
+        console.log(`[Online] ${u.email} applied ${type} ${row.command_id} directly to cloud for shop ${target?.shop_code || shopId}`);
+        return {
+          command_id: row.command_id,
+          command_type: type,
+          shop_id: shopId,
+          shop_code: target?.shop_code ?? null,
+          shop_name: target?.name ?? null,
+          entity: entity?.entity ?? null,
+          entity_id: entity?.entity_id ?? null,
+          status: 'APPLIED',
+          applied_directly: true,
+          created_at: row.created_at,
+          duplicate: false,
+          shop_online: online,
+          warning: null,
+          message: 'Change applied immediately to the cloud database.',
+          result: directResult.result ?? null,
+        };
+      } catch (directErr) {
+        // Fall back to the PENDING queue path; log the error for observability
+        console.warn(`[Online] applyCommandDirect failed for ${type} ${row.command_id} (falling back to PENDING):`, directErr);
+      }
+    }
+
     return {
       command_id: row.command_id,
       command_type: type,
@@ -617,13 +667,13 @@ export function buildRemoteAdminRouter(deps: RemoteAdminDeps) {
           if (Object.keys(exp).length) shopBody.expected = exp;
         }
         const q = await queueForShop(req, shop.shop_id, type, shopBody, seed, { fanout_group: seed, applied_to: 'ALL_SHOPS' });
-        results.push({ ...one, status: 'QUEUED', command_id: q.command_id, duplicate: q.duplicate, shop_online: q.shop_online, warning: q.warning });
+        results.push({ ...one, status: q.status === 'APPLIED' ? 'APPLIED' : 'QUEUED', command_id: q.command_id, duplicate: q.duplicate, shop_online: q.shop_online, warning: q.warning, applied_directly: q.applied_directly ?? false });
       } catch (err: any) {
         results.push({ ...one, status: 'SKIPPED', reason: err instanceof HttpError ? err.message : 'cloud error' });
       }
     }
     await deps.securityEvent(req, 'REMOTE_COMMAND_ALL_SHOPS', req.onlineUser.email, req.onlineUser.id, {
-      command_type: type, fanout_group: seed, queued: results.filter((x) => x.status === 'QUEUED').length, skipped: results.filter((x) => x.status === 'SKIPPED').length,
+      command_type: type, fanout_group: seed, queued: results.filter((x) => x.status === 'QUEUED' || x.status === 'APPLIED').length, applied: results.filter((x) => x.status === 'APPLIED').length, skipped: results.filter((x) => x.status === 'SKIPPED').length,
     });
     res.status(202);
     return { command_type: type, fanout_group: seed, results };
