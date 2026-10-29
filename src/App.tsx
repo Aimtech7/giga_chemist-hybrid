@@ -38,6 +38,7 @@ import { OnlineAdminModule } from './components/remote/OnlineAdminModule';
 import { HistoryView, type HistoryFilters, type HistoryTab } from './components/history/HistoryView';
 import { NAVIGATE_EVENT } from './services/navigation';
 import { getServerMode } from './services/remoteAdmin';
+import { startRealtimeSync, stopRealtimeSync } from './services/realtimeSync';
 import type { PharmacySettings, User } from './types';
 
 // '#app' (or any unknown hash) is not a module and must never become the current one (blank screen).
@@ -199,6 +200,7 @@ export default function App() {
               setCurrentModule('pos');
             }
             syncFromLocalApiToDexie().catch((e) => console.warn('[App] Local sync failed:', e));
+            startRealtimeSync().catch((e) => console.warn('[App] Realtime sync error:', e));
           } else if (isMounted) {
             setCurrentUser(null);
           }
@@ -242,6 +244,7 @@ export default function App() {
   }, []);
 
   const handleLogout = async () => {
+    stopRealtimeSync();
     await logoutUser(currentUser || undefined);
     setCachedUser(null);
     setCurrentUser(null);
@@ -318,6 +321,7 @@ export default function App() {
         onSuccess={(user) => {
           setCurrentUser(user);
           syncFromLocalApiToDexie().catch((e) => console.warn('[App] Post-login sync notice:', e));
+          startRealtimeSync().catch((e) => console.warn('[App] Post-login realtime notice:', e));
           navigateToApp(user.role === 'CASHIER' ? 'pos' : 'dashboard');
         }}
         onBackToHome={navigateToLanding}
@@ -333,6 +337,7 @@ export default function App() {
         onSuccess={(user) => {
           setCurrentUser(user);
           syncFromLocalApiToDexie().catch((e) => console.warn('[App] Post-login sync notice:', e));
+          startRealtimeSync().catch((e) => console.warn('[App] Post-login realtime notice:', e));
           navigateToApp(user.role === 'CASHIER' ? 'pos' : 'dashboard');
         }}
         onBackToHome={navigateToLanding}

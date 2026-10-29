@@ -18,6 +18,7 @@ import { getAllPurchases } from '../db/purchases';
 import { getAllExpenses } from '../db/expenses';
 import { getPharmacySettings, toSettings } from '../db/settings';
 import { buildRemoteAdminRouter, isAllShopsScope } from './remoteAdmin';
+import { buildRestBridgeRouter } from './restBridge';
 import { buildUserAdminRouter } from './userAdmin';
 import { buildHistoryRouter } from '../http/historyRoutes';
 import { buildInventoryRouter } from '../http/inventoryRoutes';
@@ -798,13 +799,20 @@ export function buildOnlineRouter() {
   r.use(buildUserAdminRouter({ shopId: requestShop, withCloud, route, isGlobalAdmin, securityEvent }));
 
   // Remote administration (ADMIN only): queue commands for the shop; never a direct cloud write.
+  
+  // Direct REST API writes (online mode bridge): standard UI forms & modals write directly to Supabase
+  r.use(buildRestBridgeRouter({
+    withCloud, withShopId: withShop, requestShop, requireAuth, requirePermission, requireAdmin,
+    route, send: (res, err, label) => send(res, err, label),
+  }));
+
   r.use(buildRemoteAdminRouter({
     shopId: requestShop, withShop: (req, fn) => withShop(requestShop(req), fn), withShopId: withShop, withCloud, requireAdmin, route, getRemoteControl, clearRemoteControlCache, securityEvent,
     isGlobalAdmin,
   }));
 
   // Shop-only features: not available from the cloud copy (yet).
-  for (const p of ['/inventory/movements', '/audit', '/admin/health', '/email/settings', '/email/jobs', '/backups/status']) {
+  for (const p of ['/admin/health', '/email/settings', '/email/jobs', '/backups/status']) {
     r.get(p, requireAuth, (_req, res) => res.status(501).json({ error: 'Not available online: this information lives on the shop server.', code: 'SHOP_SERVER_ONLY' }));
   }
 

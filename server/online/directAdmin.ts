@@ -39,6 +39,37 @@ function directSeq(): string {
 function orderNumber(): string {
   return `ORD-${Date.now()}`;
 }
+async function recordMovement(
+  client: pg.PoolClient,
+  shopId: string,
+  medicineId: string,
+  batchId: string,
+  movementType: string,
+  delta: number,
+  prevQty: number | null,
+  newQty: number | null,
+  reason?: string | null,
+  notes?: string | null,
+  userId?: string | null,
+  refId?: string | null,
+) {
+  try {
+    const validUserId = userId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(userId) ? userId : null;
+    await client.query(
+      `INSERT INTO giga_cloud.inventory_movements (
+         shop_id, movement_id, event_id, local_seq, medicine_id, batch_id, movement_type, reason, delta,
+         previous_quantity, new_quantity, reference_id, notes, user_id, device_id, occurred_at
+       ) VALUES ($1, gen_random_uuid(), gen_random_uuid(), 0, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'ONLINE_CLOUD', now())`,
+      [
+        shopId, medicineId, batchId, movementType, reason ?? movementType, delta,
+        prevQty, newQty, refId ?? null, notes ?? null, validUserId,
+      ],
+    );
+  } catch (err: any) {
+    console.warn('[DirectAdmin] could not log inventory movement:', err.message);
+  }
+}
+
 
 export async function applyCommandDirect(
   withCloud: WithCloud,
@@ -103,8 +134,8 @@ async function dispatchDirect(
         });
       }
       if (!bId) throw new Error('batch_id or batch_number required for stock add');
-      await withCloud((c) =>
-        c.query(
+      await withCloud(async (c) => {
+        await c.query(
           `INSERT INTO giga_cloud.stock_levels
              (shop_id, medicine_id, batch_id, has_baseline, baseline_quantity, delta_since_baseline, last_movement_at)
            VALUES ($1, $2, $3, true, $4, 0, now())
@@ -112,16 +143,17 @@ async function dispatchDirect(
              SET delta_since_baseline = giga_cloud.stock_levels.delta_since_baseline + $4,
                  last_movement_at = now()`,
           [shopId, medicine_id, bId, quantity],
-        ),
-      );
-      return { applied: true };
+        );
+        await recordMovement(c, shopId, medicine_id, bId!, 'STOCK_ADD', quantity, null, null, payload.reason || 'Admin added stock', payload.notes, userId);
+      });
+      return { applied: true, result: { medicine_id, batch_id: bId } };
     }
 
     case 'STOCK_REMOVE':
     case 'STOCK_OVERRIDE_REMOVE': {
       const { medicine_id, batch_id, quantity } = payload;
-      await withCloud((c) =>
-        c.query(
+      await withCloud(async (c) => {
+        await c.query(
           `INSERT INTO giga_cloud.stock_levels
              (shop_id, medicine_id, batch_id, has_baseline, baseline_quantity, delta_since_baseline, last_movement_at)
            VALUES ($1, $2, $3, true, 0, 0, now())
@@ -132,9 +164,10 @@ async function dispatchDirect(
                  ),
                  last_movement_at = now()`,
           [shopId, medicine_id, batch_id, quantity],
-        ),
-      );
-      return { applied: true };
+        );
+        await recordMovement(c, shopId, medicine_id, batch_id, 'STOCK_REMOVE', -quantity, null, null, payload.reason || 'Admin removed stock', payload.notes, userId);
+      });
+      return { applied: true, result: { medicine_id, batch_id } };
     }
 
     case 'STOCK_SET':
@@ -176,8 +209,8 @@ async function dispatchDirect(
           });
         }
         if (!bId) throw new Error('batch_id or batch_number required for STOCK_SET');
-        await withCloud((c) =>
-          c.query(
+        await withCloud(async (c) => {
+          await c.query(
             `INSERT INTO giga_cloud.stock_levels
                (shop_id, medicine_id, batch_id, has_baseline, baseline_quantity, delta_since_baseline, last_movement_at)
              VALUES ($1, $2, $3, true, $4, 0, now())
@@ -187,10 +220,12 @@ async function dispatchDirect(
                    delta_since_baseline = 0,
                    last_movement_at = now()`,
             [shopId, medicine_id, bId, quantity],
-          ),
-        );
+          );
+          await recordMovement(c, shopId, medicine_id, bId!, 'STOCK_SET', 0, null, quantity, payload.reason || 'Physical stock count correction', payload.notes, userId);
+        });
+        return { applied: true, result: { medicine_id, batch_id: bId } };
       }
-      return { applied: true };
+      return { applied: true, result: { medicine_id } };
     }
 
     case 'STOCK_SNAPSHOT_REQUEST': {
@@ -807,6 +842,7 @@ async function dispatchDirect(
                        last_movement_at = now()`,
                 [shopId, item.medicine_id, batchId, item.quantity],
               );
+              await recordMovement(c, shopId, item.medicine_id, batchId, 'PURCHASE_RESTOCK', item.quantity, null, null, 'Supplier purchase received', `Invoice ${invoice_number || ''}`, userId);
             }
           }
         }
@@ -932,6 +968,7 @@ async function dispatchDirect(
                      last_movement_at = now()`,
               [shopId, medId, bId, qty],
             );
+            await recordMovement(c, shopId, medId, bId, 'RETURN', qty, null, null, 'Customer return restocked', `Return ${return_id}`, userId);
           }
         }
       });

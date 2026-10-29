@@ -75,7 +75,7 @@ export function deriveState(serverReachable: boolean, s: ServerSyncStatus | null
   if (!serverReachable) return 'SERVER_UNREACHABLE';
   if (!s) return 'UNKNOWN';
   if (s.local_database && !s.local_database.connected) return 'DATABASE_UNAVAILABLE';
-  if (s.mode === 'online') return 'ONLINE_READONLY';
+  if (s.mode === 'online') return 'ONLINE_SYNCED';
   if (s.mode !== 'hybrid') return 'LOCAL';
   if (!s.enabled) return 'LOCAL_SYNC_OFF';
   const pending = (s.counts?.pending || 0) + (s.counts?.processing || 0);
